@@ -168,6 +168,11 @@ class PromptArea(TextArea):
             event.stop()
             await app.action_cycle_mode()         # type: ignore[attr-defined]
             return
+        if event.key == "ctrl+c":                 # copy the selection — NEVER quit (quit = Ctrl+Q)
+            event.prevent_default()
+            event.stop()
+            app.action_copy_selection()           # type: ignore[attr-defined]
+            return
         await super()._on_key(event)
 
     async def on_paste(self, event: events.Paste) -> None:
@@ -215,7 +220,8 @@ class EngramApp(App):
     PromptArea:focus { border: round $accent; }
     """
     BINDINGS = [
-        ("ctrl+c", "quit", "quit"),
+        ("ctrl+c", "copy_selection", "copy"),
+        ("ctrl+q", "quit", "quit"),
         ("ctrl+n", "new_thread", "new"),
         ("ctrl+v", "paste_image", "paste image"),
         ("ctrl+y", "copy_reply", "copy reply"),
@@ -420,16 +426,37 @@ class EngramApp(App):
         else:
             self._status("no image in the clipboard (drop a file, or copy a screenshot first)")
 
+    def _copy_text(self, text: str) -> None:
+        """Put text on the system clipboard so it pastes OUTSIDE the terminal too:
+        OSC52 (works over SSH) plus a local clipboard tool (Wayland/X11/macOS)."""
+        self.copy_to_clipboard(text)                      # OSC52
+        for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"],
+                     ["xsel", "--clipboard", "--input"], ["pbcopy"]):
+            try:
+                if subprocess.run(tool, input=text.encode(), timeout=5).returncode == 0:
+                    break
+            except (FileNotFoundError, OSError, subprocess.SubprocessError):
+                continue
+
+    def action_copy_selection(self) -> None:
+        """Ctrl+C — copy the current text selection (drag anywhere in the app to select)
+        to the system clipboard. Never quits (quit is Ctrl+Q; Ctrl+Y copies the last reply)."""
+        try:
+            sel = self.screen.get_selected_text()
+        except Exception:   # noqa: BLE001 — selection is best-effort
+            sel = None
+        if sel:
+            self._copy_text(sel)
+            self._status(f"📋 copied {len(sel)} chars to the clipboard")
+        else:
+            self._status("nothing selected — drag to select, then Ctrl+C  ·  "
+                         "Ctrl+Y = last reply  ·  Ctrl+Q = quit")
+
     def action_copy_reply(self) -> None:
         if not self._last_reply:
             self._status("nothing to copy yet")
             return
-        self.copy_to_clipboard(self._last_reply)          # OSC52 (works over SSH)
-        try:                                              # local Wayland reliability
-            subprocess.run(["wl-copy"], input=self._last_reply.encode(),
-                           timeout=5, check=False)
-        except (FileNotFoundError, OSError, subprocess.SubprocessError):
-            pass
+        self._copy_text(self._last_reply)
         self._status("📋 copied Engram's last reply")
 
     async def action_interrupt(self) -> None:
