@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Engram — terminal harness launcher. Runs on your Claude Pro/Max subscription
+# (the core strips ANTHROPIC_API_KEY). Symlink onto PATH:
+#   ln -sf "$PWD/infra/engram/engram" ~/.local/bin/engram      # → `engram`
+#   ln -sf "$PWD/infra/engram/engram" ~/.local/bin/engram-p    # → `engram-p` (vision)
+#
+#   engram              → the full Textual TUI (app.py) — the home
+#   engram-p            → the SAME TUI with VISION (camera + face senses on) — alias for `engram -p`
+#   engram -p           → vision on (also: --perceive) — sets ENGRAM_PERCEIVE=1
+#   engram --simple     → the lightweight rich REPL (tui.py)
+#   engram --once "…"   → single-shot, print reply, exit (scripting/tests)
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+PY="$DIR/../../.venv/bin/python"
+
+# Invoked as `engram-p` (the symlink)? Turn perception on. One script, two names — so the
+# perceive mode is its own command, not a flag you have to remember.
+case "$(basename -- "$0")" in
+  *-p) export ENGRAM_PERCEIVE=1 ;;
+esac
+
+case "${1:-}" in
+  -p|--perceive) shift; export ENGRAM_PERCEIVE=1; exec "$PY" "$DIR/app.py" "$@" ;;
+  --simple)      shift; exec "$PY" "$DIR/tui.py" "$@" ;;
+  --once)        exec "$PY" "$DIR/tui.py" "$@" ;;
+  *)             exec "$PY" "$DIR/app.py" "$@" ;;
+esac

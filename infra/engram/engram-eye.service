@@ -1,0 +1,30 @@
+# Engram eye — local SmolVLM vision server (llama.cpp, CPU), for scene-aware perception.
+# Bound to 127.0.0.1:8080; the perceiving loop queries it only while engaged.
+#
+# This is a TEMPLATE: fill the placeholders below and RENDER it into
+# ~/.config/systemd/user/ before enabling.
+#   __ENGRAM_HOME__  = the repo root (the dir containing infra/, scripts/, ...)
+#   __LLAMA_SERVER__ = the absolute path to your llama.cpp `llama-server` binary
+# Install (run from the repo root):
+#   ENGRAM_HOME="$PWD"; LLAMA_SERVER=/path/to/llama.cpp/llama-server
+#   sed -e "s|__ENGRAM_HOME__|$ENGRAM_HOME|g" -e "s|__LLAMA_SERVER__|$LLAMA_SERVER|g" \
+#       infra/engram/engram-eye.service > ~/.config/systemd/user/engram-eye.service
+#   systemctl --user daemon-reload && systemctl --user enable --now engram-eye
+# Control:  systemctl --user status|restart|stop engram-eye
+# Logs:     journalctl --user -u engram-eye -f   ·   health: curl -s 127.0.0.1:8080/health
+[Unit]
+Description=Engram eye — SmolVLM vision server (llama.cpp, local CPU) on 127.0.0.1:8080
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=__ENGRAM_HOME__
+ExecStart=__LLAMA_SERVER__ -hf ggml-org/SmolVLM-500M-Instruct-GGUF --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=engram-eye
+
+[Install]
+WantedBy=default.target

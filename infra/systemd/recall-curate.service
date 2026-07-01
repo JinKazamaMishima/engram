@@ -1,0 +1,35 @@
+# recall nightly conversation curator — systemd --user oneshot.
+# Runs, in sequence (the whole nightly memory cycle):
+#   1. `recall curate-all --commit`  — for every registered project, distill the
+#      day's Claude Code conversations into the project corpus + the global soul,
+#      rebuild indices, and scoped-commit ([curator], no push).
+#   2. `recall consolidate-all --commit` — fold the day's recall *activations*
+#      (the hippocampal log the recall hook appends to) into note stability:
+#      reinforce what was used, GPU-free, and scoped-commit ([consolidate]).
+#   3. `recall dream-all --commit` — the dream pass: recombine the day's memories
+#      into quarantined hypotheses, mature yesterday's, and bleed corroborated
+#      ones into the soul ([dream]). Writes a morning digest under subconscious/.
+# Earlier lines are prefixed `-` so a per-scope failure (each self-alerts) never
+# skips the next stage. Paired with recall-curate.timer (23:15 local).
+#
+# This is a TEMPLATE: the placeholders below (__ENGRAM_HOME__, __USER__) are
+# substituted by scripts/install_systemd.sh, which RENDERS the result into
+# ~/.config/systemd/user/. Install (as your own user, NOT root):
+#   bash scripts/install_systemd.sh   # renders + enables the timers
+# The installer runs `systemctl --user daemon-reload`, enables the timer, and
+# `loginctl enable-linger __USER__` so it runs while logged out.
+# Optional Telegram alert-on-failure: put RECALL_TELEGRAM_TOKEN + _CHAT_ID in
+#   ~/.config/recall/telegram.env (KEY=VALUE per line).
+[Unit]
+Description=recall nightly memory cycle (curate + consolidate + dream)
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__ENGRAM_HOME__
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+EnvironmentFile=-%h/.config/recall/telegram.env
+ExecStart=-__ENGRAM_HOME__/.venv/bin/recall curate-all --commit
+ExecStart=-__ENGRAM_HOME__/.venv/bin/recall consolidate-all --commit
+ExecStart=__ENGRAM_HOME__/.venv/bin/recall dream-all --commit

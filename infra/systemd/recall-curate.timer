@@ -1,0 +1,12 @@
+# Fires the nightly curator at 23:15 local time (whatever the machine's timezone
+# is). Persistent=true catches up a missed run (machine asleep) on next boot.
+# DAILY: dev conversations happen any day. Adjust OnCalendar to taste.
+[Unit]
+Description=recall nightly conversation curator timer (23:15 local)
+
+[Timer]
+OnCalendar=*-*-* 23:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

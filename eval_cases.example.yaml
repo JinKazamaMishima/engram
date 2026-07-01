@@ -1,0 +1,81 @@
+# recall eval cases — target MYPROJECT's corpus. Run from the myproject repo
+# (or with --project /home/user/repos/myproject):
+#
+#   recall eval eval_cases.example.yaml --project /home/user/repos/myproject --compare --verbose
+#
+# Each case: a natural `query`, the `expect`ed slug(s), and a `category`:
+#   paraphrase      — reworded but shares vocabulary with the note
+#   vocab-mismatch  — describes the idea in words the note does NOT use (the dense arm's job)
+#   multi-hop       — answer spans a note AND a note it [[links]] to (tests link expansion)
+#   temporal        — "latest/current" phrasing; the freshest note on a topic should win (tests recency)
+#   use-recency     — two notes tie on relevance; the one ACTUALLY USED more/recently should win (tests retention)
+#   abstention      — out-of-domain; `expect: []` means recall should surface NOTHING confident
+#
+# Positive cases (non-empty expect) drive recall@k / recall@1 / MRR / nDCG@k;
+# abstention cases (`expect: []`) are scored separately as abstain_rate and never
+# inflate the positive metrics. Abstention is most meaningful with --rerank +
+# --abstain-threshold (cross-encoder scores are calibrated; raw RRF scores are not).
+#
+# EARNING the retention term (Phase II, dynamic memory — docs/dynamic-memory.md):
+# retention = FSRS R(t,S) keyed on each note's `last_used` + `stability`, which
+# only accrue once `recall consolidate` has folded real activations. It ships OFF
+# (`RECALL_W_RETENTION=0`), exactly like recency/salience, until the eval earns it.
+# Once a few weeks of activations exist, add `use-recency` cases (a heavily-used
+# note should beat a stale near-twin) and sweep the weight on the real corpus:
+#   recall eval eval_cases.yaml --project ... --sweep retention_w=0,0.25,0.5,1.0
+# Turn it on (set RECALL_W_RETENTION) ONLY if recall@k / nDCG hold or improve —
+# a ranking change must never regress retrieval to chase a freshness signal.
+cases:
+  # --- paraphrase (shares vocabulary with the target note) ---
+  - query: why did ZS crater after earnings despite an EPS beat?
+    expect: [zs-q3-fy26-guide-down-crater]
+    category: paraphrase
+  - query: does the G1 strategy need to hold overnight or can it flatten EOD?
+    expect: [g1-edge-requires-overnight-hold]
+    category: paraphrase
+  - query: is the daily vol-targeting overlay a validated, deployable edge?
+    expect: [g1-vol-targeting-validated-edge]
+    category: paraphrase
+  - query: how do I register as an investment adviser in Florida?
+    expect: [florida-investment-adviser-registration, florida-investment-adviser-de-minimis-exemption]
+    category: paraphrase
+  - query: is shorting gapped-down names intraday profitable?
+    expect: [intraday-gap-down-short-is-negative-expectancy]
+    category: paraphrase
+  - query: what is the right benchmark for the RL allocator's reward?
+    expect: [momentum-as-benchmark-not-buy-and-hold]
+    category: paraphrase
+  - query: does cap-weighting the book beat equal-weight?
+    expect: [cap-weight-vs-equal-weight-lookahead]
+    category: paraphrase
+  - query: a software name beat on EPS but the multiple re-rated on cash flow
+    expect: [beat-on-income-statement-cut-on-cashflow]
+    category: paraphrase
+  # --- vocab-mismatch (deliberately avoids the note's wording) ---
+  - query: if I square up my whole book by the closing bell, do I keep the strategy's advantage?
+    expect: [g1-edge-requires-overnight-hold]
+    category: vocab-mismatch
+  - query: is betting against names that opened sharply lower a profitable day trade?
+    expect: [intraday-gap-down-short-is-negative-expectancy]
+    category: vocab-mismatch
+  # --- multi-hop (answer spans a note AND a note it [[links]] to) ---
+  - query: what backtest construction artifacts have fooled us into seeing an edge that wasn't real?
+    expect: [cap-weight-vs-equal-weight-lookahead, baseline-mismatch-masquerades-as-skill]
+    category: multi-hop
+  - query: when a stock's earnings reaction contradicts the headline print, what actually drives the move?
+    expect: [beat-on-income-statement-cut-on-cashflow, earnings-event-intelligence-layer]
+    category: multi-hop
+  # --- temporal (the freshest note on the topic should win) ---
+  - query: what is our current stance on whether to run shorts as a program?
+    expect: [shorts-are-an-exception-not-a-program]
+    category: temporal
+  - query: what is the most recent problem we hit with equal-weight vol-target position sizing?
+    expect: [fresh-ipo-breaks-equal-weight-vol-target-sizing]
+    category: temporal
+  # --- abstention (out of domain → recall should surface nothing) ---
+  - query: how do I deploy a Kubernetes ingress controller with TLS termination?
+    expect: []
+    category: abstention
+  - query: what is the capital of France?
+    expect: []
+    category: abstention

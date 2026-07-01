@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  leak-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Privacy / secret hygiene scan
+        run: bash scripts/leak_scan.sh
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+      - name: Install (lean — ML trio loads lazily, tests use fakes)
+        run: |
+          uv venv
+          uv pip install -e . --no-deps
+          uv pip install pyyaml "sqlite-vec>=0.1.6" numpy pytest pytest-asyncio ruff \
+            textual rich "claude-agent-sdk>=0.2,<0.3" \
+            opencv-python-headless "onnxruntime>=1.18,<2" kaldi-native-fbank "faster-whisper>=1.0,<2"
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Tests
+        run: uv run pytest -q

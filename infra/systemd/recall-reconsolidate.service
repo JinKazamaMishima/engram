@@ -1,0 +1,21 @@
+# recall weekly corpus reconsolidation — systemd --user oneshot.
+# Runs `recall reconsolidate-all --commit`: for the global soul corpus + every
+# registered project, merge near-duplicate notes (supersede-in-place), add
+# missing [[links]], flag stale, rebuild indices, and scoped-commit
+# ([reconsolidate], no push). Paired with recall-reconsolidate.timer (Mon 02:00).
+#
+# This is a TEMPLATE: the placeholder below (__ENGRAM_HOME__) is substituted by
+# scripts/install_systemd.sh, which RENDERS the result into
+# ~/.config/systemd/user/. Install (as your own user, NOT root):
+#   bash scripts/install_systemd.sh     # renders + enables the timer
+[Unit]
+Description=recall weekly corpus reconsolidation (reconsolidate-all --commit)
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__ENGRAM_HOME__
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+EnvironmentFile=-%h/.config/recall/telegram.env
+ExecStart=__ENGRAM_HOME__/.venv/bin/recall reconsolidate-all --commit

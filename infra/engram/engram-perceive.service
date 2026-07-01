@@ -1,0 +1,40 @@
+# Engram perceiving loop — eyes (face + SmolVLM) waking the mind, always-on.
+#
+# AUTONOMY IS GATED, NOT SANDBOXED (a chosen boundary): Engram only ACTS (greets) when the
+# harness TUI (infra/engram/app.py) is open in a terminal AND it currently sees the enrolled
+# user's face. So it never fires a turn unattended, while keeping full tools.
+# Runs on the Claude subscription (UnsetEnvironment strips any API key, as core.py also does).
+#
+# Devices: needs camera /dev/video0 — granted by the active login session's device ACL (if the
+# running user isn't in the video group). Before login the service simply restarts until the
+# session grants access; for guaranteed headless access add: usermod -aG video __USER__.
+#
+# This is a TEMPLATE: fill the placeholders below and RENDER it into
+# ~/.config/systemd/user/ before enabling.
+#   __ENGRAM_HOME__ = the repo root ·  __PYTHON__ = __ENGRAM_HOME__/.venv/bin/python
+# Install (run from the repo root, as your own user, NOT root):
+#   ENGRAM_HOME="$PWD"; PYTHON="$ENGRAM_HOME/.venv/bin/python"
+#   sed -e "s|__ENGRAM_HOME__|$ENGRAM_HOME|g" -e "s|__PYTHON__|$PYTHON|g" \
+#       infra/engram/engram-perceive.service > ~/.config/systemd/user/engram-perceive.service
+#   systemctl --user daemon-reload && systemctl --user enable --now engram-perceive
+# Control:  systemctl --user status|restart|stop engram-perceive   (stop = Engram stops perceiving)
+# Logs:     journalctl --user -u engram-perceive -f
+[Unit]
+Description=Engram perceiving loop (eyes -> mind; gated to harness-open AND face-present)
+After=default.target engram-eye.service
+Wants=engram-eye.service
+
+[Service]
+Type=simple
+WorkingDirectory=__ENGRAM_HOME__
+UnsetEnvironment=ANTHROPIC_API_KEY
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__PYTHON__ __ENGRAM_HOME__/infra/engram/perceive/awake.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=engram-perceive
+
+[Install]
+WantedBy=default.target

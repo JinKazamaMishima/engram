@@ -1,0 +1,53 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Derived indices / databases (never commit generated memory state)
+*.sqlite
+*.sqlite.building
+*.sqlite-journal
+*.db
+
+# Secrets & local config — MUST never be committed
+*.env
+.env
+.env.*
+*.pem
+*.key
+credentials.*
+secrets.*
+
+# Model weights & biometric data (large, and biometric data is personal)
+*.gguf
+*.onnx
+*.pt
+*.pth
+*.npz
+*.safetensors
+faces/
+gallery.*
+calibrate.log
+
+# Local data root, if a user points it inside the repo
+data/
+.local/
+
+# Logs & scratch
+*.log
+*.tmp
+tmp/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

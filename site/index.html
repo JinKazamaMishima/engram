@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Engram — a persistent memory for your AI</title>
+<meta name="description" content="Engram is a persistent-memory AI assistant. It remembers across every session, curated from your own conversations and kept entirely on your machine. Open source, built on the recall engine.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;1,400&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --cream:#FAF6EF; --ink:#17130D; --muted:#6E6455; --line:#E2D9C9;
+    --amber:#B7551F; --midnight:#0A0E1A; --star:#E8ECF8; --cyan:#67E8F9;
+    --serif:'Playfair Display',Georgia,serif; --sans:'Inter',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--cream);color:var(--ink);font-family:var(--sans);
+    font-weight:400;line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:1120px;margin:0 auto;padding:0 clamp(1.5rem,5vw,4rem)}
+  section{padding:clamp(5rem,11vw,9rem) 0}
+  .eyebrow{font-size:.72rem;letter-spacing:.28em;text-transform:uppercase;
+    color:var(--amber);font-weight:600;margin-bottom:1.4rem}
+  h1,h2{font-family:var(--serif);font-weight:500;line-height:1.04;letter-spacing:-.01em}
+  h2{font-size:clamp(2.1rem,5vw,3.4rem);margin-bottom:1.4rem}
+  .lead{font-size:clamp(1.15rem,2vw,1.4rem);color:var(--muted);max-width:46ch}
+  p{max-width:60ch}
+  .hair{height:1px;background:var(--line);border:0}
+
+  /* nav */
+  nav{position:sticky;top:0;z-index:20;background:rgba(250,246,239,.82);
+    backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:64px}
+  .brand{font-family:var(--serif);font-size:1.15rem;letter-spacing:.42em;padding-left:.42em}
+  .navlinks{display:flex;gap:2.2rem;font-size:.82rem;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--muted)}
+  .navlinks a:hover{color:var(--ink)}
+  @media(max-width:680px){.navlinks{display:none}}
+
+  /* hero */
+  .hero{text-align:center;padding-top:clamp(4rem,9vw,7rem)}
+  .hero h1{font-size:clamp(4.5rem,19vw,13rem);letter-spacing:.02em;font-weight:500}
+  .hero .tag{font-family:var(--serif);font-style:italic;font-size:clamp(1.3rem,3vw,2rem);
+    color:var(--ink);margin-top:.4rem}
+  .hero .sub{margin:2rem auto 0;color:var(--muted);font-size:1.12rem;max-width:52ch}
+  .cta{display:flex;gap:1rem;justify-content:center;margin-top:2.6rem;flex-wrap:wrap}
+  .btn{font-size:.9rem;letter-spacing:.05em;padding:.85rem 1.6rem;border:1px solid var(--ink);
+    border-radius:2px;transition:.25s;font-weight:500}
+  .btn.solid{background:var(--ink);color:var(--cream)}
+  .btn.solid:hover{background:var(--amber);border-color:var(--amber)}
+  .btn.ghost:hover{background:var(--ink);color:var(--cream)}
+  .epigraph{margin-top:4.5rem;font-family:var(--serif);font-style:italic;
+    color:var(--muted);font-size:1.05rem}
+
+  /* memory grid */
+  .cols{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(1.5rem,4vw,3.4rem);
+    margin-top:3.5rem}
+  @media(max-width:760px){.cols{grid-template-columns:1fr;gap:2.6rem}}
+  .col h3{font-family:var(--serif);font-size:1.5rem;font-weight:500;margin-bottom:.7rem}
+  .col .num{font-size:.72rem;letter-spacing:.2em;color:var(--amber);
+    display:block;margin-bottom:1rem}
+  .col p{color:var(--muted);font-size:1rem}
+
+  /* dark band */
+  .dark{background:var(--midnight);color:var(--star);position:relative;overflow:hidden}
+  .dark .eyebrow{color:var(--cyan)}
+  .dark .lead,.dark p{color:#AEB6CC}
+  .dark h2{color:var(--star)}
+  #stars{position:absolute;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
+  .dark .wrap{position:relative;z-index:1}
+  .glint{color:var(--cyan)}
+  .preview-badge{display:inline-block;font-size:.68rem;letter-spacing:.2em;
+    text-transform:uppercase;border:1px solid var(--cyan);color:var(--cyan);
+    padding:.3rem .7rem;border-radius:2px;margin-left:1rem;vertical-align:middle}
+  .caveat{margin-top:1.6rem;font-size:.9rem;color:var(--muted)}
+  .dark .caveat{color:#8590A8}
+
+  /* install */
+  .code{background:#15110B;color:#F2ECDF;border-radius:6px;padding:1.6rem 1.8rem;
+    font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:.95rem;line-height:2;
+    margin:2.4rem 0;overflow-x:auto;max-width:640px}
+  .code .p{color:#C8642B;user-select:none}
+  .code .c{color:#7f8ea3}
+  .tiers{display:grid;grid-template-columns:repeat(4,1fr);gap:1.4rem;margin-top:2.4rem}
+  @media(max-width:760px){.tiers{grid-template-columns:repeat(2,1fr)}}
+  .tier{border:1px solid var(--line);border-radius:4px;padding:1.2rem}
+  .tier b{font-family:var(--serif);font-weight:500;font-size:1.1rem}
+  .tier span{display:block;color:var(--muted);font-size:.88rem;margin-top:.3rem}
+
+  /* footer */
+  footer{border-top:1px solid var(--line);padding:3.5rem 0;color:var(--muted);font-size:.9rem}
+  footer .wrap{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1.2rem}
+  footer .flinks{display:flex;gap:1.8rem}
+  footer a:hover{color:var(--ink)}
+
+  /* reveal */
+  .reveal{opacity:0;transform:translateY(22px);transition:opacity .9s ease,transform .9s ease}
+  .reveal.in{opacity:1;transform:none}
+  @media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <div class="brand">ENGRAM</div>
+  <div class="navlinks">
+    <a href="#memory">Memory</a>
+    <a href="#perception">Perception</a>
+    <a href="#install">Install</a>
+    <a href="https://github.com/JinKazamaMishima/engram">GitHub ↗</a>
+  </div>
+</div></nav>
+
+<header class="hero"><div class="wrap reveal">
+  <div class="eyebrow">Persistent-memory AI</div>
+  <h1>Engram</h1>
+  <div class="tag">The assistant that remembers.</div>
+  <p class="sub">A long-term memory for your AI — curated from your own conversations,
+    recalled when it matters, and kept entirely on your machine.</p>
+  <div class="cta">
+    <a class="btn solid" href="#install">Get started</a>
+    <a class="btn ghost" href="https://github.com/JinKazamaMishima/engram">View source ↗</a>
+  </div>
+  <div class="epigraph">“an engram — the physical trace a memory leaves behind.”</div>
+</div></header>
+
+<hr class="hair">
+
+<section id="memory"><div class="wrap">
+  <div class="reveal">
+    <div class="eyebrow">01 — Memory</div>
+    <h2>The mark that outlasts the moment.</h2>
+    <p class="lead">Most assistants forget you the moment the window closes. Engram
+      keeps a durable memory — and, unlike a transcript, it curates it.</p>
+  </div>
+  <div class="cols">
+    <div class="col reveal">
+      <span class="num">i</span>
+      <h3>Curated, not logged</h3>
+      <p>Each night Engram distils your conversations into notes — one insight per
+        file, in plain markdown you can read, edit, and trust.</p>
+    </div>
+    <div class="col reveal">
+      <span class="num">ii</span>
+      <h3>Hybrid recall</h3>
+      <p>Keyword and semantic search, fused. The few memories that matter rise into
+        each turn; everything else stays out of the way.</p>
+    </div>
+    <div class="col reveal">
+      <span class="num">iii</span>
+      <h3>It forgets, on purpose</h3>
+      <p>Notes carry a stability that strengthens with use and fades without — so what
+        you rely on stays sharp, and the noise decays.</p>
+    </div>
+  </div>
+</div></section>
+
+<section id="perception" class="dark">
+  <canvas id="stars"></canvas>
+  <div class="wrap reveal">
+    <div class="eyebrow">02 — Perception <span class="preview-badge">Research preview</span></div>
+    <h2>Give it <span class="glint">eyes</span>.</h2>
+    <p class="lead">An optional perceiving loop turns Engram from a tool into a presence.
+      A webcam eye recognises who is there and a local vision model lets it see — so it
+      knows you've arrived and what's in front of it.</p>
+    <p class="caveat">Experimental. Requires a GPU and a webcam. Off by default, and
+      entirely local — no frame ever leaves the machine.</p>
+  </div>
+</section>
+
+<section id="local" class="dark">
+  <div class="wrap reveal">
+    <div class="eyebrow">03 — Local</div>
+    <h2>Yours, and only yours.</h2>
+    <p class="lead">Your corpus, your models, your face data — none of it leaves
+      this computer. No telemetry. The only calls out are to the model you choose,
+      billed to your own subscription or key. Built to run, one day, on a model of
+      your own.</p>
+  </div>
+</section>
+
+<section id="install"><div class="wrap">
+  <div class="reveal">
+    <div class="eyebrow">Get started</div>
+    <h2>One command.</h2>
+    <div class="code">
+<span class="p">$</span> git clone https://github.com/JinKazamaMishima/engram.git<br>
+<span class="p">$</span> cd engram<br>
+<span class="p">$</span> ./install.sh
+    </div>
+    <p>A guided installer walks you through logging in to Anthropic, choosing where
+      your data lives, and picking which tiers to enable. Everything is explained;
+      everything is optional.</p>
+  </div>
+  <div class="tiers">
+    <div class="tier reveal"><b>Memory</b><span>The recall engine, skills, and the retrieval hook. Runs anywhere.</span></div>
+    <div class="tier reveal"><b>Assistant</b><span>A standalone terminal chat with the memory wired in.</span></div>
+    <div class="tier reveal"><b>Sensorium</b><span>Webcam eye + face-ID + perceiving loop. Experimental.</span></div>
+    <div class="tier reveal"><b>Telegram</b><span>Reach your Engram from your phone.</span></div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <div>
+    <span style="font-family:var(--serif);letter-spacing:.3em">ENGRAM</span>
+    &nbsp;— a persistent memory for your AI.
+  </div>
+  <div class="flinks">
+    <a href="https://github.com/JinKazamaMishima/engram">GitHub</a>
+    <a href="https://github.com/JinKazamaMishima/engram/blob/main/LICENSE">MIT License</a>
+    <a href="https://github.com/JinKazamaMishima/engram#readme">Docs</a>
+  </div>
+</div></footer>
+
+<script>
+  // Reveal on scroll
+  const io = new IntersectionObserver((es)=>{
+    es.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }});
+  },{threshold:.14});
+  document.querySelectorAll('.reveal').forEach(el=>io.observe(el));
+
+  // Starfield in the first dark band
+  const reduce = window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+  const cv = document.getElementById('stars');
+  if(cv && !reduce){
+    const ctx = cv.getContext('2d');
+    let stars=[], w, h;
+    const band = cv.closest('section');
+    function size(){ w=cv.width=band.offsetWidth; h=cv.height=band.offsetHeight;
+      stars = Array.from({length: Math.round(w*h/9000)}, ()=>({
+        x:Math.random()*w, y:Math.random()*h, r:Math.random()*1.3+.2,
+        a:Math.random(), s:Math.random()*.02+.004 })); }
+    function tick(){
+      ctx.clearRect(0,0,w,h);
+      for(const st of stars){
+        st.a+=st.s; const tw=(Math.sin(st.a)+1)/2;
+        ctx.globalAlpha=.15+tw*.7;
+        ctx.fillStyle= tw>.85 ? '#67E8F9' : '#C7D6FF';
+        ctx.beginPath(); ctx.arc(st.x,st.y,st.r,0,7); ctx.fill();
+      }
+      requestAnimationFrame(tick);
+    }
+    size(); tick(); window.addEventListener('resize',size);
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+# Fires the weekly reconsolidation Monday 02:00 local — well clear of the nightly
+# 23:15 curate so the GPU isn't contended. Persistent=true catches up a missed
+# run (machine asleep) on next boot.
+[Unit]
+Description=recall weekly reconsolidation timer (Mon 02:00 local)
+
+[Timer]
+OnCalendar=Mon *-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

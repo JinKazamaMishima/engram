@@ -1,0 +1,40 @@
+# recall Telegram conversational bridge — "Engram" (Claude Agent SDK, subscription).
+# Lets you talk to Engram about the recall repo from your phone. Long-polls Telegram
+# and drives a persistent ClaudeSDKClient with the full recall project brain.
+#
+# This is a TEMPLATE: the placeholder below (__ENGRAM_HOME__) is substituted by
+# scripts/install_telegram_bridge.sh, which RENDERS the result into
+# ~/.config/systemd/user/ and starts the service.
+# Install (idempotent): bash scripts/install_telegram_bridge.sh
+#   First run creates ~/.config/recall/telegram-agent.env (mode 600) and tells you
+#   to create a bot via @BotFather and paste its token; second run validates the
+#   token, renders this unit, and starts the service.
+#
+# Control:  systemctl --user status|restart|stop recall-telegram-engram
+# Logs:     journalctl --user -u recall-telegram-engram -f
+#           tail -F ~/.local/share/recall/telegram-agent/messages.log   (IN/OUT/REJECT audit)
+[Unit]
+Description=recall Telegram conversational bridge (Engram — Claude Agent SDK, subscription auth)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/recall/telegram-agent.env
+# Bill this bot to the Claude subscription, never a business API key: the SDK would
+# prefer ANTHROPIC_API_KEY over the subscription login if present (agent_bridge.py
+# also strips it at startup as a second guard).
+UnsetEnvironment=ANTHROPIC_API_KEY
+ExecStart=__PYTHON__ __ENGRAM_HOME__/infra/telegram/agent_bridge.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=recall-telegram-engram
+NoNewPrivileges=true
+# Default KillMode (control-group) cleans up the SDK-spawned `claude` child on
+# stop/restart. The conversation is persisted (session_id) and auto-resumes, so
+# this is lossless.
+
+[Install]
+WantedBy=default.target

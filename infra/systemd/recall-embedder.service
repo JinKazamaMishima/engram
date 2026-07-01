@@ -1,0 +1,28 @@
+# recall knowledge embedder daemon — systemd --user unit.
+# Keeps Qwen3-Embedding-0.6B (bf16) warm on the GPU so the recall hook gets query vectors fast.
+# Optional: if it's down, the recall hook falls back to keyword-only (FTS5).
+# One daemon serves every project on the machine.
+#
+# This is a TEMPLATE: the placeholders below (__ENGRAM_HOME__, __PYTHON__) are
+# substituted by scripts/install_systemd.sh, which RENDERS the result into
+# ~/.config/systemd/user/. Install (as your own user, NOT root):
+#   bash scripts/install_systemd.sh     # renders + enables the daemon
+# The installer runs `systemctl --user daemon-reload`, enables the unit, and
+# `loginctl enable-linger __USER__` so it survives logout / runs headless.
+# Check:  systemctl --user status recall-embedder
+#         curl -s 127.0.0.1:8973/healthz
+[Unit]
+Description=recall knowledge embedder (Qwen3-Embedding-0.6B bf16, warm GPU model)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=__ENGRAM_HOME__
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ExecStart=__PYTHON__ __ENGRAM_HOME__/scripts/recall_embedder_daemon.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

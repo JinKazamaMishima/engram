@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "recall"
+version = "0.1.0"
+description = "Machine-local hybrid recall + nightly conversation curation across Claude Code projects (FTS5 keyword + sqlite-vec semantic over a markdown knowledge corpus)."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+
+dependencies = [
+    "pyyaml>=6.0",
+    "sqlite-vec>=0.1.6",
+    "numpy>=1.26",
+    # --- The proven ML embedding/rerank combo — HARD-PINNED -----------------------
+    # Qwen3-Embedding-0.6B + Qwen3-Reranker-0.6B (bf16 on the ~10GB GPU), loaded
+    # lazily; the FTS5/vec/RRF plumbing is unit-tested with an injected fake.
+    # These three move TOGETHER — re-resolving one (e.g. an unrelated `uv add`) can
+    # drag the others — so they're pinned exactly and uv.lock is COMMITTED to freeze
+    # the whole graph. Combo verified 2026-06-29 via `recall query` + 42-case
+    # `recall eval`. Bump deliberately, together, and re-run eval before committing.
+    "torch==2.12.1",                 # cu130 wheel from PyPI (pulls cuda-toolkit deps)
+    "sentence-transformers==5.6.0",
+    "transformers==5.9.0",           # 5.10+ needs newer torch APIs; stay on verified
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+# The conversational Telegram bridge (Engram) — infra/telegram/agent_bridge.py.
+# Optional: only the bridge needs it; recall's core (index/curate/dream) does not.
+telegram = [
+    "claude-agent-sdk>=0.2,<0.3",
+]
+# Engram's own terminal harness — infra/engram/ (core.py + the Textual TUI app.py).
+# Runs on the Claude subscription via the Agent SDK; Textual (MIT) is the TUI
+# framework. Optional: recall's core does not need it.
+engram = [
+    "claude-agent-sdk>=0.2,<0.3",
+    "textual>=8,<9",
+    "rich>=13",
+    "opencv-python>=4.13,<5",   # the eye: webcam capture + bench window (infra/engram/eye)
+    "onnxruntime>=1.18,<2",     # face-ID: YuNet detect + ArcFace w600k_mbf embed (ONNX)
+]
+
+[project.scripts]
+recall = "recall.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/recall"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+# line length and one-line semicolons are style choices, not CI-gated bugs.
+ignore = ["E501", "E702"]
+
+[tool.ruff.lint.per-file-ignores]
+# These strip ANTHROPIC_API_KEY *before* importing the Agent SDK, so their SDK
+# imports are intentionally below module-level code (E402) and can't be isort-sorted.
+"infra/engram/core.py" = ["E402", "I001"]
+"infra/telegram/agent_bridge.py" = ["E402", "I001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "infra/engram/tests"]
+asyncio_mode = "auto"
