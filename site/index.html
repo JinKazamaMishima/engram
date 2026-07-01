@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Engram — a persistent memory for your AI</title>
-<meta name="description" content="Engram is a persistent-memory AI assistant. It remembers across every session, curated from your own conversations and kept entirely on your machine. Open source, built on the recall engine.">
+<title>Engram — let your agent remember and dream</title>
+<meta name="description" content="Engram gives your AI a living memory. It writes its own memories from your conversations, dreams over them each night — pruning the dead, recombining the living — and grows a personality that stays entirely on your machine. Open source, built on the recall engine.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;1,400&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -21,8 +21,8 @@
     -webkit-font-smoothing:antialiased;
     /* one continuous sky: dawn cream at the ground, midnight at the zenith */
     background:linear-gradient(to bottom,
-      #FAF6EF 0%, #F5F0E5 22%, #E4E6E0 36%, #B7C0D0 43%,
-      #6E7C9C 49%, #3E4B68 62%, #202B44 78%, #0F1626 90%, #0A0E1A 100%);
+      #FAF6EF 0%, #F4EFE4 15%, #DDE1E1 25%, #A9B2C4 31%,
+      #6E7C9C 37%, #414E6C 48%, #26314C 64%, #131B2C 82%, #0A0E1A 100%);
     background-repeat:no-repeat;
   }
   a{color:inherit;text-decoration:none}
@@ -124,18 +124,20 @@
   <div class="brand">ENGRAM</div>
   <div class="navlinks">
     <a href="#memory">Memory</a>
-    <a href="#perception">Perception</a>
+    <a href="#dream">Dream</a>
+    <a href="#personality">Personality</a>
     <a href="#install">Install</a>
     <a href="https://github.com/JinKazamaMishima/engram">GitHub ↗</a>
   </div>
 </div></nav>
 
 <header class="hero"><div class="wrap reveal">
-  <div class="eyebrow">Persistent-memory AI</div>
+  <div class="eyebrow">Living-memory AI</div>
   <h1>Engram</h1>
-  <div class="tag">The assistant that remembers.</div>
-  <p class="sub">A long-term memory for your AI — curated from your own conversations,
-    recalled when it matters, and kept entirely on your machine.</p>
+  <div class="tag">It remembers. It dreams.</div>
+  <p class="sub">Let your agent write its own memories from your conversations, dream
+    over them each night, and grow — memory by memory — into a personality that is
+    entirely, and only, yours.</p>
   <div class="cta">
     <a class="btn solid" href="#install">Get started</a>
     <a class="btn ghost" href="https://github.com/JinKazamaMishima/engram">View source ↗</a>
@@ -148,16 +150,17 @@
 <section id="memory"><div class="wrap">
   <div class="reveal">
     <div class="eyebrow">01 — Memory</div>
-    <h2>The mark that outlasts the moment.</h2>
+    <h2>It writes its own memory.</h2>
     <p class="lead">Most assistants forget you the moment the window closes. Engram
-      keeps a durable memory — and, unlike a transcript, it curates it.</p>
+      doesn't keep the transcript — each night it distils the day into memory, one
+      insight at a time, and keeps that memory alive.</p>
   </div>
   <div class="cols">
     <div class="col reveal">
       <span class="num">i</span>
-      <h3>Curated, not logged</h3>
-      <p>Each night Engram distils your conversations into notes — one insight per
-        file, in plain markdown you can read, edit, and trust.</p>
+      <h3>Written, not logged</h3>
+      <p>Your conversations become notes — one insight per file, in plain markdown you
+        can read, edit, and trust. The agent is the author of its own memory.</p>
     </div>
     <div class="col reveal">
       <span class="num">ii</span>
@@ -167,15 +170,44 @@
     </div>
     <div class="col reveal">
       <span class="num">iii</span>
-      <h3>It forgets, on purpose</h3>
-      <p>Notes carry a stability that strengthens with use and fades without — so what
-        you rely on stays sharp, and the noise decays.</p>
+      <h3>Alive, not archived</h3>
+      <p>Every trace strengthens when it does real work and fades when it doesn't — so
+        the memory keeps reweighting itself around what actually helps you.</p>
     </div>
   </div>
 </div></section>
 
+<section id="dream" class="on-dark"><div class="wrap reveal">
+  <div class="eyebrow">02 — Dream</div>
+  <h2>And every night, it <span class="glint">dreams</span>.</h2>
+  <p class="lead">After it curates the day, Engram sleeps on it — because sleep does two
+    opposite jobs, and a living memory needs both.</p>
+  <p>First it <b>forgets</b>. Most memory systems only ever accumulate; they rot into
+    graveyards — duplicates, contradictions, dead over-generalisations that drown the
+    signal. Engram marks the dead for pruning, so what remains stays sharp. It never
+    gets stuck rereading a corpus of its own cruft.</p>
+  <p>Then it <b>imagines</b>. It pairs the day's memories with older ones at just the
+    right distance — near enough to relate, far enough that any link is non-obvious —
+    and writes the few real connections down as conjectures. Insight lives between the
+    trivial and the absurd; most nights yield nothing, and that is the point. It
+    overproduces, then selects. This is where the machine gets to be creative.</p>
+</div></section>
+
+<section id="personality" class="on-dark"><div class="wrap reveal">
+  <div class="eyebrow">03 — Personality</div>
+  <h2>The making of a <span class="glint">self</span>.</h2>
+  <p class="lead">Beneath the memory sits a soul — Engram's model of you, and of itself.
+    Every night a little of what it learned bleeds in. This is the foundation of an
+    artificial personality.</p>
+  <p>Not through a wall, but a valve: rate-limited, corroboration-gated, reversible. One
+    dream never rewrites who it is — only what recurs across days, and what you confirm,
+    hardens into identity. Dreams tint; corroborated reality sets. And because it always
+    adds to its memory instead of overwriting it, it grows into someone on your terms —
+    without ever collapsing into a hollow echo of itself.</p>
+</div></section>
+
 <section id="perception" class="on-dark"><div class="wrap reveal">
-  <div class="eyebrow">02 — Perception <span class="preview-badge">Research preview</span></div>
+  <div class="eyebrow">04 — Perception <span class="preview-badge">Research preview</span></div>
   <h2>Give it <span class="glint">eyes</span>.</h2>
   <p class="lead">An optional perceiving loop turns Engram from a tool into a presence.
     A webcam eye recognises who is there and a local vision model lets it see — so it
@@ -185,7 +217,7 @@
 </div></section>
 
 <section id="local" class="on-dark"><div class="wrap reveal">
-  <div class="eyebrow">03 — Local</div>
+  <div class="eyebrow">05 — Local</div>
   <h2>Yours, and only yours.</h2>
   <p class="lead">Your corpus, your models, your face data — none of it leaves this
     computer. No telemetry. The only calls out are to the model you choose, billed to
@@ -216,7 +248,7 @@
 </div></section>
 
 <footer><div class="wrap">
-  <div><span class="brand-sm">ENGRAM</span>&nbsp;— a persistent memory for your AI.</div>
+  <div><span class="brand-sm">ENGRAM</span>&nbsp;— a living memory for your AI.</div>
   <div class="flinks">
     <a href="https://github.com/JinKazamaMishima/engram">GitHub</a>
     <a href="https://github.com/JinKazamaMishima/engram/blob/main/LICENSE">MIT License</a>
