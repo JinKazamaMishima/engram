@@ -207,18 +207,23 @@ def write_config(env: dict) -> None:
     os.chmod(ENV_FILE, 0o600)  # may hold an API key
     c.print(f"  [green]✓[/green] {ENV_FILE}")
     snippet = f"[ -f {ENV_FILE} ] && set -a && . {ENV_FILE} && set +a"
-    rc = Path(os.path.expanduser("~/.bashrc"))
-    if Confirm.ask(f"Add a line to {rc} so these load in new shells?", default=True):
+    shell = os.environ.get("SHELL", "")
+    rc = None
+    if shell.endswith("zsh"):            # macOS default + many Linux setups
+        rc = Path(os.path.expanduser("~/.zshrc"))
+    elif shell.endswith("bash"):
+        rc = Path(os.path.expanduser("~/.bashrc"))
+    if rc is not None and Confirm.ask(f"Add a line to {rc.name} so these load in new shells?", default=True):
         try:
             existing = rc.read_text() if rc.exists() else ""
             if str(ENV_FILE) not in existing:
                 with rc.open("a") as f:
                     f.write(f"\n# Engram\n{snippet}\n")
-            c.print("  [green]✓[/green] added — open a new shell or `source` it")
+            c.print(f"  [green]✓[/green] added to {rc.name} — open a new shell or `source` it")
         except OSError as e:
             c.print(f"[yellow]  couldn't edit {rc} ({e}); add this line yourself:[/yellow]\n  {snippet}")
     else:
-        c.print(f"[dim]  add this to your shell profile:  {snippet}[/dim]")
+        c.print(f"[dim]  add this to your shell profile ({shell or 'your shell'}):  {snippet}[/dim]")
 
 
 def smoke_test(env: dict) -> None:

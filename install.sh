@@ -3,7 +3,7 @@
 # base package, then hands off to the interactive setup wizard which walks you
 # through login, your data folder, and which tiers to install.
 set -euo pipefail
-cd "$(dirname "$(readlink -f "$0")")"
+cd "$(dirname "$0")"   # portable: no GNU-only `readlink -f` (run from the repo root)
 
 b()  { printf '\033[1m%s\033[0m\n' "$*"; }        # bold
 dim(){ printf '\033[2m%s\033[0m\n' "$*"; }        # dim

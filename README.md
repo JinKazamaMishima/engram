@@ -90,10 +90,26 @@ engram -p                    # …with the Sensorium (camera) on
 - **A Claude Pro/Max subscription** (recommended — Engram bills to it, never an
   API key, by default) **or** an `ANTHROPIC_API_KEY`.
 - **Python 3.12+.**
-- **Linux + systemd** for the background timers (nightly curation, warm embedder).
-  The core library and the assistant run on macOS too; the systemd units are Linux-only.
+- **Linux** is the primary platform; the memory brain and assistant also run on
+  **WSL2** and **macOS** (see [Platform support](#platform-support) below).
 - **Optional:** an NVIDIA GPU (semantic embeddings + the vision model) and a
   USB webcam (Sensorium).
+
+## Platform support
+
+| | Linux | WSL2 | macOS |
+|---|:-:|:-:|:-:|
+| Memory brain + assistant | ✓ | ✓ | ✓ |
+| Background services (systemd) | ✓ | ✓ *(`systemd=true`)* | ✗ *(use launchd/cron)* |
+| Sensorium (webcam) | ✓ | ✗ | ✗ |
+
+**Linux** is first-class. The memory engine and the terminal assistant run
+anywhere Python 3.12+ does — macOS included (clipboard uses `pbcopy`; keyword
+search works with no GPU). The **systemd** timers are Linux-only; on macOS the
+installer detects that and skips them, so schedule `recall curate-all` via
+`launchd`/`cron` instead. The **Sensorium**'s camera capture uses V4L2 (Linux) —
+macOS and WSL2 aren't supported yet (macOS needs an AVFoundation backend; WSL2
+doesn't expose USB webcams without `usbipd`).
 
 ## Privacy
 
