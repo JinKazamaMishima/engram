@@ -226,29 +226,87 @@ def write_config(env: dict) -> None:
         c.print(f"[dim]  add this to your shell profile ({shell or 'your shell'}):  {snippet}[/dim]")
 
 
-def smoke_test(env: dict) -> None:
-    rule("10 · Smoke test")
+def install_launcher() -> bool:
+    """Put a `recall` command on PATH by symlinking the repo venv's console-script
+    into ~/.local/bin — otherwise `recall` only exists inside .venv and a bare
+    `recall` in a fresh shell is "command not found". Returns True if a bare
+    `recall` should now resolve in new shells."""
+    rule("10 · Command-line launcher")
+    explain(
+        "The [bold]recall[/bold] command lives inside this repo's virtualenv. Link it into\n"
+        "[bold]~/.local/bin[/bold] so you can run [bold]recall[/bold] from any shell.\n"
+        "[dim](Otherwise run it as [bold]uv run recall …[/bold] from this folder.)[/dim]")
+    if not Confirm.ask("Install the `recall` launcher on your PATH?", default=True):
+        return False
+    src = REPO / ".venv" / "bin" / "recall"
+    bin_dir = Path(os.path.expanduser("~/.local/bin"))
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    link = bin_dir / "recall"
+    try:
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(src)
+        c.print(f"  [green]✓[/green] {link} -> {src}")
+    except OSError as e:
+        c.print(f"[yellow]  couldn't create the launcher ({e}); use `uv run recall …`[/yellow]")
+        return False
+    # Make sure ~/.local/bin is on PATH for new shells.
+    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+        line = 'export PATH="$HOME/.local/bin:$PATH"'
+        shell = os.environ.get("SHELL", "")
+        rc = (Path(os.path.expanduser("~/.zshrc")) if shell.endswith("zsh")
+              else Path(os.path.expanduser("~/.bashrc")) if shell.endswith("bash")
+              else None)
+        if rc is not None:
+            try:
+                existing = rc.read_text() if rc.exists() else ""
+                if ".local/bin" not in existing:
+                    with rc.open("a") as f:
+                        f.write(f"\n# Engram — recall launcher on PATH\n{line}\n")
+                c.print(f"  [green]✓[/green] added ~/.local/bin to PATH in {rc.name} "
+                        "[dim](open a new shell)[/dim]")
+            except OSError:
+                c.print(f"[yellow]  add this to your shell profile:[/yellow]  {line}")
+        else:
+            c.print(f"[dim]  add this to your shell profile:  {line}[/dim]")
+    return True
+
+
+def build_first_index(env: dict) -> None:
+    rule("11 · Build the memory index")
+    explain(
+        "Building the searchable index over your soul corpus. It starts empty and\n"
+        "fills in as the nightly curator distills your conversations into memory.")
     envp = {**os.environ, **env}
     recall = REPO / ".venv" / "bin" / "recall"
-    c.print("[dim]$ recall paths[/dim]")
-    subprocess.run([str(recall), "paths"], env=envp, check=False)
+    c.print("[dim]$ recall build --global[/dim]")
+    proc = subprocess.run([str(recall), "build", "--global"], env=envp, check=False)
+    if proc.returncode != 0:
+        c.print("[yellow]  build didn't complete — re-run it later with "
+                "`recall build --global`.[/yellow]")
 
 
-def summary(tiers: set[str], env: dict) -> None:
+def summary(tiers: set[str], env: dict, on_path: bool) -> None:
     rule("Done")
+    recall = "recall" if on_path else "uv run recall"
     lines = ["[bold green]Engram is set up.[/bold green]\n"]
     lines.append(f"[dim]data:[/dim] {env.get('RECALL_DATA_ROOT', DEFAULT_DATA_ROOT)}    "
                  f"[dim]tiers:[/dim] {', '.join(sorted(tiers))}\n")
-    lines.append("Next:")
-    lines.append("  • [bold]recall build --global[/bold]    build the memory index")
-    lines.append("  • open [bold]Claude Code[/bold]         memory now auto-injects each turn")
+    lines.append("Your memory index is built, and Claude Code auto-injects memory each turn.")
+    if not on_path:
+        lines.append("[dim]The `recall` command lives in this repo's venv — run it as "
+                     "`uv run recall …` from here, or re-run ./install.sh to add it to PATH.[/dim]")
+    lines.append("\nNext:")
+    lines.append(f"  • [bold]{recall} query \"…\"[/bold]   search your memory")
+    lines.append("  • open [bold]Claude Code[/bold]   memory now auto-injects each turn")
     if "assistant" in tiers:
         lines.append("  • [bold].venv/bin/python infra/engram/app.py[/bold]   launch the assistant")
     if "sensorium" in tiers:
         lines.append("  • add [bold]-p[/bold] to the assistant for camera perception")
     if "telegram" in tiers:
         lines.append("  • configure the bridge: [bold]bash scripts/install_telegram_bridge.sh[/bold]")
-    lines.append("\n[dim]Re-run ./install.sh anytime to change your setup.[/dim]")
+    lines.append("\n[dim]Open a new shell (or `source` your profile) so PATH/env changes take "
+                 "effect. Re-run ./install.sh anytime to change your setup.[/dim]")
     c.print(Panel("\n".join(lines), border_style="green"))
 
 
@@ -265,8 +323,9 @@ def main() -> None:
         maybe_services(tiers, facts)
         maybe_enroll_face(tiers, facts)
         write_config(env)
-        smoke_test(env)
-        summary(tiers, env)
+        on_path = install_launcher()
+        build_first_index(env)
+        summary(tiers, env, on_path)
     except (KeyboardInterrupt, EOFError):
         c.print("\n[yellow]Setup interrupted — re-run ./install.sh to continue.[/yellow]")
         sys.exit(1)

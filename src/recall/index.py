@@ -84,6 +84,12 @@ _STOPWORDS = frozenset({
 
 # ---- embedding -----------------------------------------------------------
 
+# Dimension of the sqlite-vec embedding column, and the fallback the keyword-only
+# build uses to create a valid (empty) vec table when no ML stack is installed —
+# a later rebuild WITH models then needs no schema change.
+EMBED_DIM = 512
+
+
 class Embedder(Protocol):
     dim: int
     def embed(self, texts: list[str], *, is_query: bool = False) -> list[list[float]]: ...
@@ -96,7 +102,7 @@ class SentenceTransformerEmbedder:
     importing this module stays cheap."""
 
     MODEL = "Qwen/Qwen3-Embedding-0.6B"
-    TRUNCATE_DIM = 512        # Matryoshka 1024 -> 512: keeps the sqlite-vec index lean
+    TRUNCATE_DIM = EMBED_DIM  # Matryoshka 1024 -> 512: keeps the sqlite-vec index lean
     QUERY_PROMPT = "query"    # the model's built-in query-instruction prompt
 
     def __init__(self, model_name: str = MODEL, device: str | None = None):
@@ -223,9 +229,12 @@ def _load_notes(knowledge_dir: Path) -> list[tuple[KnowledgeNote, str]]:
     return out
 
 
-def build_index(knowledge_dir: Path, db_path: Path, embedder: Embedder) -> int:
+def build_index(knowledge_dir: Path, db_path: Path,
+                embedder: Embedder | None) -> int:
     """Full rebuild into a temp DB, then atomic-swap into place. Returns the
-    number of notes indexed."""
+    number of notes indexed. ``embedder=None`` builds a keyword-only index (FTS5
+    + link graph + an empty vec table) — for machines without the local ML stack;
+    semantic search then needs a later rebuild WITH an embedder."""
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = db_path.with_name(db_path.name + ".building")
@@ -235,11 +244,12 @@ def build_index(knowledge_dir: Path, db_path: Path, embedder: Embedder) -> int:
     notes = _load_notes(knowledge_dir)
     conn = _connect(tmp)
     try:
-        _create_schema(conn, embedder.dim)
+        _create_schema(conn, embedder.dim if embedder is not None else EMBED_DIM)
         if notes:
             known = {n.slug for n, _ in notes}
-            vecs = embedder.embed([f"{n.description}\n\n{n.body}"
-                                   for n, _ in notes])
+            vecs = (embedder.embed([f"{n.description}\n\n{n.body}"
+                                    for n, _ in notes])
+                    if embedder is not None else [None] * len(notes))
             for i, ((note, sha), vec) in enumerate(zip(notes, vecs), start=1):
                 tags = " ".join(note.tags)
                 conn.execute(
@@ -254,9 +264,10 @@ def build_index(knowledge_dir: Path, db_path: Path, embedder: Embedder) -> int:
                     "INSERT INTO notes_fts(rowid,slug,description,body,tags)"
                     " VALUES (?,?,?,?,?)",
                     (i, note.slug, note.description, note.body, tags))
-                conn.execute(
-                    "INSERT INTO vec_notes(note_id,embedding) VALUES (?,?)",
-                    (i, sqlite_vec.serialize_float32(vec)))
+                if vec is not None:
+                    conn.execute(
+                        "INSERT INTO vec_notes(note_id,embedding) VALUES (?,?)",
+                        (i, sqlite_vec.serialize_float32(vec)))
                 for tgt in _extract_links(note.body, known, exclude=note.slug):
                     conn.execute("INSERT INTO links(from_slug,to_slug) "
                                  "VALUES (?,?)", (note.slug, tgt))

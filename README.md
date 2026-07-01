@@ -85,6 +85,25 @@ engram                       # launch the terminal assistant (needs the ,engram 
 engram -p                    # …with the Sensorium (camera) on
 ```
 
+> `recall` is a console command inside the repo's virtualenv. The installer can
+> link it onto your `PATH` (`~/.local/bin`); otherwise run it as `uv run recall …`
+> from the repo, or call `.venv/bin/recall` directly.
+
+## Uninstall
+
+```sh
+./uninstall.sh              # remove Engram — KEEPS your memory corpus
+./uninstall.sh --dry-run    # preview exactly what would be removed
+./uninstall.sh --purge-data # also delete your corpus (RECALL_DATA_ROOT) — irreversible
+```
+
+Reverses the install footprint — the `.venv`, skills, the Claude Code hook,
+systemd user units, the `recall` launcher, the shell-rc lines, and config. It
+runs on the system Python (no venv needed), shows a plan and confirms first, and
+**never deletes your memory corpus** unless you pass `--purge-data`. `uv`, the
+`claude` CLI, and Python are left installed; delete the repo folder by hand to
+finish.
+
 ## Requirements
 
 - **A Claude Pro/Max subscription** (recommended — Engram bills to it, never an

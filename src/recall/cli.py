@@ -68,13 +68,33 @@ def _resolve_scope(args) -> tuple[str, Path, Path]:
 
 
 def _cmd_build(args) -> int:
-    from recall.index import SentenceTransformerEmbedder, build_index
+    from recall.index import build_index
     label, corpus, db = _resolve_scope(args)
     if not corpus.is_dir():
-        print(f"[recall] corpus dir does not exist: {corpus}", file=sys.stderr)
-        return 1
-    n = build_index(corpus, db, SentenceTransformerEmbedder())
-    print(f"[recall] indexed {n} notes from {corpus} -> {db}  (scope: {label})")
+        # The shared soul corpus legitimately starts empty on a fresh install;
+        # create it so the first `recall build --global` succeeds (0 notes).
+        if getattr(args, "global_scope", False):
+            corpus.mkdir(parents=True, exist_ok=True)
+        else:
+            print(f"[recall] corpus dir does not exist: {corpus}", file=sys.stderr)
+            return 1
+    # Only load the (heavy) embedding model when there's something to embed AND the
+    # local ML stack is present — otherwise build a keyword-only index so recall
+    # works with zero external deps (semantic needs a later rebuild with models).
+    has_notes = any(p.name.lower() != "readme.md" for p in corpus.glob("*.md"))
+    embedder = None
+    if has_notes:
+        try:
+            from recall.index import SentenceTransformerEmbedder
+            embedder = SentenceTransformerEmbedder()
+        except ImportError:
+            print("[recall] semantic models not installed — building a keyword-only "
+                  "index (FTS5). Install the ML extras for semantic search.",
+                  file=sys.stderr)
+    n = build_index(corpus, db, embedder)
+    mode = "keyword+semantic" if embedder is not None else "keyword-only"
+    print(f"[recall] indexed {n} notes from {corpus} -> {db}  "
+          f"(scope: {label}, {mode})")
     return 0
 
 
@@ -105,8 +125,12 @@ def _cmd_query(args) -> int:
         return 1
     qvec = None
     if not args.no_vec:
-        from recall.index import SentenceTransformerEmbedder
-        qvec = SentenceTransformerEmbedder().embed([args.text], is_query=True)[0]
+        try:
+            from recall.index import SentenceTransformerEmbedder
+            qvec = SentenceTransformerEmbedder().embed([args.text], is_query=True)[0]
+        except ImportError:
+            print("[recall] semantic models not installed — keyword-only search "
+                  "(pass --no-vec to silence this).", file=sys.stderr)
     rerank = getattr(args, "rerank", False)
     pool = max(args.k, 40) if rerank else args.k
     hits = index.search_corpora(scopes, args.text, query_vector=qvec, k=pool)
