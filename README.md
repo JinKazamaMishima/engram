@@ -48,6 +48,58 @@ runs anywhere; the rest is optional.
   only graduates into the durable corpus once later days corroborate it (a
   counterfactual on a single confirming match; a wrong prediction retires it).
 
+## Intended use
+
+Engram is built to run on a machine that **stays on** — a home server, a
+workstation you leave running, a NAS. Its memory work runs on a schedule, not on
+demand, so the machine needs to be awake when the timers fire (on a headless box,
+set `loginctl enable-linger <user>` so the `--user` timers run while you're logged
+out). If the machine is off at the scheduled hour the run is simply deferred, not
+lost — but the more it's on, the fresher its memory.
+
+### When curation runs
+
+There are two paths, and together they guarantee every conversation is eventually
+distilled into memory:
+
+- **Live, per-conversation — Telegram bridge only.** When you `/end` a chat (or
+  `/new` to start a fresh one), that just-ended conversation is curated in the
+  background right away — fire-and-forget, so you're never blocked — and its memory
+  is fresh the same day.
+- **Nightly sweep — everything else.** A systemd `--user` timer fires at **23:15
+  local** and runs the whole nightly cycle: `curate-sessions-all` walks every one of
+  the day's conversations across every registered project and curates each that
+  wasn't already curated live; then `consolidate-all` folds what you actually used
+  into memory strength; then `dream-all` recombines the day and imagines its
+  what-ifs. A second timer runs weekly reconsolidation **Monday 02:00**. Both are
+  `Persistent=true`, so a run missed while the machine slept is caught up on next
+  boot.
+
+Terminal and Claude Code sessions are **not** curated the instant you close them —
+they're picked up by the nightly sweep. Only the Telegram bridge curates live.
+
+### Multiple conversations at once
+
+The unit of curation is a single conversation — one session transcript, tracked by
+its own id — so you can run as many in parallel as you like (several terminals, the
+bridge, the TUI) and each becomes an independent memory unit:
+
+- **Idempotent per session.** Each session id is recorded once it's curated (a
+  `sessions` ledger in `curated.json`). A session curated live is skipped by the
+  nightly sweep, and vice-versa — no conversation is curated twice on a later pass.
+- **Serialized in normal use.** The nightly sweep curates sessions **one at a time
+  in a single process**, and the bridge's one authorized chat ends conversations one
+  at a time — so curation runs don't write the corpus concurrently. You don't
+  coordinate anything.
+- **Collisions self-heal.** In the one narrow window where a live curation is still
+  finishing exactly as the nightly sweep begins, the worst case is a single
+  conversation curated twice — which the curator's dedup and the weekly
+  reconsolidation collapse. Nothing is lost or corrupted.
+- **One rule:** let the timers and the bridge drive curation. Don't hand-run
+  `recall curate` / `curate-all` / `curate-sessions-all` on top of a run already in
+  flight — concurrent writers to the same corpus aren't mutex-guarded. If you script
+  your own curation, serialize it.
+
 ## Quickstart
 
 ```sh
