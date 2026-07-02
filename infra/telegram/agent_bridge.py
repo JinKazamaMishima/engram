@@ -101,7 +101,7 @@ POLL_TIMEOUT = 50          # seconds for Telegram long-poll
 HTTP_BUDGET = POLL_TIMEOUT + 15
 MAX_MSG_LEN = 4096
 AUDIT_SNIPPET_LEN = 240
-TURN_TIMEOUT = 600         # hard cap on a single model turn
+TURN_TIMEOUT = 1200        # hard cap on a single model turn (20 min)
 COALESCE_WINDOW = 1.0      # debounce: batch a burst of msgs into ONE turn
 
 PERSONA = (
