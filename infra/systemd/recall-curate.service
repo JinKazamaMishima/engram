@@ -6,8 +6,9 @@
 #   2. `recall consolidate-all --commit` — fold the day's recall *activations*
 #      (the hippocampal log the recall hook appends to) into note stability:
 #      reinforce what was used, GPU-free, and scoped-commit ([consolidate]).
-#   3. `recall dream-all --commit` — the dream pass: recombine the day's memories
-#      into quarantined hypotheses, mature yesterday's, and bleed corroborated
+#   3. `recall dream-all --counterfactual --commit` — the dream pass: recombine the
+#      day's memories into quarantined hypotheses, imagine one-change counterfactual
+#      "what-ifs" over the day's decisions, mature yesterday's, and bleed corroborated
 #      ones into the soul ([dream]). Writes a morning digest under subconscious/.
 # Earlier lines are prefixed `-` so a per-scope failure (each self-alerts) never
 # skips the next stage. Paired with recall-curate.timer (23:15 local).
@@ -32,4 +33,4 @@ Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 EnvironmentFile=-%h/.config/recall/telegram.env
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall curate-all --commit
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall consolidate-all --commit
-ExecStart=__ENGRAM_HOME__/.venv/bin/recall dream-all --commit
+ExecStart=__ENGRAM_HOME__/.venv/bin/recall dream-all --counterfactual --commit

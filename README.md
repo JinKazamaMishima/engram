@@ -25,7 +25,7 @@ runs anywhere; the rest is optional.
 
 | Tier | What it is | Needs |
 |------|-----------|-------|
-| **Memory brain** (`recall`) | The core engine. A hybrid keyword + vector corpus, nightly curation that distills your Claude Code conversations into notes, FSRS-based memory dynamics (reinforce/decay), a nightly "dream" pass that surfaces connections, and weekly reconsolidation. Installs as skills + a retrieval hook into Claude Code. | Python 3.12+ (CPU is fine) |
+| **Memory brain** (`recall`) | The core engine. A hybrid keyword + vector corpus, nightly curation that distills your Claude Code conversations into notes, FSRS-based memory dynamics (reinforce/decay), a nightly "dream" pass that surfaces connections and imagines what-ifs, and weekly reconsolidation. Installs as skills + a retrieval hook into Claude Code. | Python 3.12+ (CPU is fine) |
 | **Engram assistant** | A standalone terminal chat app on the Claude Agent SDK, with the memory wired in — plus `/context`, sub-agent delegation, and a plan ↔ act mode toggle. | + a subscription/API key |
 | **Sensorium** *(experimental)* | A perceiving loop: a webcam "eye" (face recognition + a local vision model) that recognizes the operator and lets the assistant *see*. | + an NVIDIA GPU + a webcam |
 | **Telegram bridge** *(optional)* | Talk to your Engram from your phone; one bot, one authorized chat. | + a bot token |
@@ -42,6 +42,11 @@ runs anywhere; the rest is optional.
   falls back to keyword-only if no model/daemon is present.
 - **Memory is dynamic.** Notes carry an FSRS stability that is reinforced on use
   and decays otherwise, so what you actually rely on stays sharp and the rest fades.
+- **Memory dreams.** A nightly offline pass recombines the day's notes into
+  quarantined conjectures and imagines *counterfactuals* — single-change "what-ifs"
+  over the day's decisions. Nothing a dream invents is treated as fact: a conjecture
+  only graduates into the durable corpus once later days corroborate it (a
+  counterfactual on a single confirming match; a wrong prediction retires it).
 
 ## Quickstart
 

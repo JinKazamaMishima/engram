@@ -125,6 +125,8 @@ def dream_all(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--commit", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--counterfactual", action="store_true",
+                    help="run the L1 counterfactual (what-if) operator on the global soul")
     a = ap.parse_args(argv)
 
     def _flags(base: list[str]) -> list[str]:
@@ -139,8 +141,13 @@ def dream_all(argv: list[str] | None = None) -> int:
         return base
 
     rc = 0
+    # Counterfactual (L1 "what-if") dreaming is scoped to the global SOUL — that's where
+    # charged episodes/decisions live; project corpora are mostly reference facts the
+    # forkability + charge gates would skip anyway. Widen into the project loop below if
+    # that ever changes.
+    cf = ["--counterfactual"] if a.counterfactual else []
     print("\n=== dream global ===", flush=True)
-    if dream.run(_flags(["--scope", "global"])).exit_code != 0:
+    if dream.run(_flags(["--scope", "global"]) + cf).exit_code != 0:
         rc = 1
     for d in list_projects():
         print(f"\n=== dream {d.name} ({d}) ===", flush=True)

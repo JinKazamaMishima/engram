@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -67,6 +68,24 @@ DREAM_PROMOTE_N = int(os.environ.get("RECALL_DREAM_PROMOTE_N", "2"))   # corrobo
 DREAM_BLEED_MAX = int(os.environ.get("RECALL_DREAM_BLEED_MAX", "1"))   # max promotions/night/scope
 DREAM_TTL_DAYS = int(os.environ.get("RECALL_DREAM_TTL_DAYS", "30"))    # uncorroborated lifetime
 DREAM_S0 = float(os.environ.get("RECALL_DREAM_S0", "1.0"))            # hypotheses are born fragile
+# Counterfactual (L1) seeds — a single charged, forkable episode from today's
+# experience (not a pair). "Forkable" = the note names a decision / cause / outcome
+# to intervene on; "charged" = surprising enough to be worth re-processing. A KNOWN-low
+# surprise is a measured-dull memory and is skipped; an UNSET surprise (-1) falls THROUGH
+# the gate (unmeasured ≠ boring — see KnowledgeNote.surprise). The pivot itself is chosen
+# downstream by the skill; this only decides WHICH episodes deserve a 'what-if'.
+CF_CHARGE_MIN = float(os.environ.get("RECALL_DREAM_CF_CHARGE_MIN", "0.30"))
+CF_MAX_SEEDS = int(os.environ.get("RECALL_DREAM_CF_MAX_SEEDS", "3"))
+# Counterfactual corroboration (the "bleed" for what-ifs). We do NOT scan the corpus: each
+# night we match today's episodes against the small set of OPEN counterfactuals (capped per
+# night, gone in TTL days), so cost is bounded by open-bets × today — never by corpus size.
+# A coarse cosine funnel (CF_CORROB_LO) narrows which of today's episodes are even in a
+# what-if's neighbourhood; the skill (stage 2) makes the confirm/refute call. The bar is ONE
+# clean match — a causal rule confirmed once outranks an association seen twice — and because
+# the note's `Predicts:` line is falsifiable, a refuting match RETIRES it (faster than TTL).
+# Confirmations share tonight's DREAM_BLEED_MAX cap.
+CF_CORROB_LO = float(os.environ.get("RECALL_DREAM_CF_CORROB_LO", "0.45"))
+CF_CORROB_MAX_CAND = int(os.environ.get("RECALL_DREAM_CF_CORROB_MAX_CAND", "3"))
 
 
 @dataclass(frozen=True)
@@ -80,6 +99,7 @@ class DreamContext:
     subconscious_dir: Path
     worklist_path: Path
     manifest_path: Path
+    verdicts_path: Path
     digest_path: Path
     session_log_path: Path
     state_file: Path
@@ -97,6 +117,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="on success, scoped-commit promoted soul notes ([dream])")
     p.add_argument("--dry-run", action="store_true",
                    help="compute seeds+pairs+promotions; do not invoke the skill")
+    p.add_argument("--counterfactual", action="store_true",
+                   help="also run the L1 counterfactual operator on today's charged, "
+                        "forkable seeds (opt-in; blend recombination runs regardless)")
     return p.parse_args(argv)
 
 
@@ -118,6 +141,7 @@ def _resolve(args: argparse.Namespace, target: date) -> DreamContext:
         subconscious_dir=config.subconscious_dir(label),
         worklist_path=ddir / "worklists" / f"{target.isoformat()}.json",
         manifest_path=ddir / "manifests" / f"{target.isoformat()}.json",
+        verdicts_path=ddir / "verdicts" / f"{target.isoformat()}.json",
         digest_path=config.subconscious_dir(label) / "digest" / f"{target.isoformat()}.md",
         session_log_path=ddir / "sessions" / f"{target.isoformat()}.md",
         state_file=ddir / "done.json")
@@ -254,10 +278,140 @@ def _recombination_pairs(ctx: DreamContext,
     return picked
 
 
-def _materialize_worklist(ctx: DreamContext, pairs: list[dict],
+# ---- L1: counterfactual seeds (model-free selection) ---------------------
+
+# A note is "forkable" if its prose names a decision, a cause, or an outcome —
+# something a single ``do()`` can intervene on. Lexical prefilter ONLY: the skill
+# makes the final call (and yields nothing for a seed that turns out unforkable).
+# Over-including here is cheap (the skill drops it); under-including loses a dream.
+_FORK_MARKERS = re.compile(
+    r"\b(decid\w*|chos\w*|choos\w*|opt(?:ed|ing)?|instead|rather than|because|"
+    r"so we|turned out|ended up|should(?:n't| not)? have|could have|would have|"
+    r"regret\w*|mistake|failed?|fix(?:ed|es)?|broke|avoid\w*|prevent\w*)\b", re.I)
+
+
+def _is_forkable(note: KnowledgeNote) -> bool:
+    return bool(_FORK_MARKERS.search(f"{note.description}\n{note.body}"))
+
+
+def _charge(note: KnowledgeNote) -> float | None:
+    """The seed's affective charge = its encoding surprise, or None when unmeasured
+    (``surprise == -1``). None falls THROUGH the charge gate (unknown ≠ boring); a real
+    low σ is a measured-dull note and is filtered out."""
+    return note.surprise if note.surprise >= 0.0 else None
+
+
+def _counterfactual_seeds(ctx: DreamContext,
+                          corpus: dict[str, tuple[KnowledgeNote, Path]]) -> list[dict]:
+    """Pick today's charged, forkable episodes to run the L1 counterfactual on — the
+    single-note analog of ``_recombination_pairs``. Gate: the note is part of today's
+    experience (``_partition`` seeds), NAMES a decision/cause/outcome (``_is_forkable``),
+    and is not a measured-dull memory (``_charge`` ≥ CF_CHARGE_MIN when measured). Rank by
+    charge (most worth re-processing first), deterministic, capped at CF_MAX_SEEDS. No
+    model, no torch — pure selection, so it is hermetic and unit-testable."""
+    seeds, _older = _partition(corpus, ctx.target)
+    scored: list[dict] = []
+    for s in seeds:
+        note = corpus[s][0]
+        if not _is_forkable(note):
+            continue
+        charge = _charge(note)
+        if charge is not None and charge < CF_CHARGE_MIN:
+            continue
+        scored.append({"seed": s,
+                       "charge": round(charge, 3) if charge is not None else None})
+    # Most charged first; an unmeasured (None) charge sinks below any measured one but
+    # stays eligible. Slug tiebreak keeps it deterministic (tests + idempotent re-runs).
+    scored.sort(key=lambda c: (-(c["charge"] if c["charge"] is not None else -1.0),
+                               c["seed"]))
+    return scored[:CF_MAX_SEEDS]
+
+
+# ---- L1: counterfactual corroboration — stage 1, the coarse funnel -------
+
+def _open_counterfactuals(subconscious_dir: Path) -> list[tuple[dict, str, Path]]:
+    """The open bets — kind:counterfactual notes still unverified (not promoted, not
+    discarded) and not blessed. Blessed ones ride the manual fast-path in ``bleed``; these
+    await reality's verdict via prospective match."""
+    out: list[tuple[dict, str, Path]] = []
+    for fm, body, path in _load_hypotheses(subconscious_dir):
+        if str(fm.get("kind") or "").strip().lower() != "counterfactual":
+            continue
+        if str(fm.get("status") or "unverified").strip() in ("promoted", "discarded"):
+            continue
+        if _as_bool(fm.get("blessed")):
+            continue
+        out.append((fm, body, path))
+    return out
+
+
+def _cf_parents(fm: dict) -> list[str]:
+    parents = fm.get("parents") or []
+    if not isinstance(parents, list):
+        parents = [parents]
+    return [str(p).strip() for p in parents if str(p).strip()]
+
+
+def _predicts_line(body: str) -> str:
+    """The what-if's falsifiable claim — the ``Predicts:`` line the skill staked."""
+    for line in body.splitlines():
+        if line.strip().lower().startswith("predicts:"):
+            return line.strip()[len("predicts:"):].strip()
+    return ""
+
+
+def _cf_corroboration_worklist(ctx: DreamContext,
+                               corpus: dict[str, tuple[KnowledgeNote, Path]]) -> list[dict]:
+    """Stage 1 — the coarse funnel. Do NOT scan the corpus: for each OPEN counterfactual, keep
+    the few of TODAY's episodes (``_partition`` seeds, minus the what-if's own parents) whose
+    cosine to it clears CF_CORROB_LO. Cost is bounded by open-bets × today, never by corpus
+    size — the whole point of matching arrivals against open bets instead of scanning. The
+    skill (stage 2) makes the confirm/refute call on what survives. Best-effort: no open bets /
+    no today-episodes / no model -> [] (lazy torch, after the trivial guards)."""
+    open_cfs = _open_counterfactuals(ctx.subconscious_dir)
+    if not open_cfs:
+        return []
+    seeds, _older = _partition(corpus, ctx.target)
+    if not seeds:
+        return []
+    try:
+        import numpy as np
+
+        from recall.index import SentenceTransformerEmbedder
+        emb = SentenceTransformerEmbedder()
+        cf_vecs = np.asarray(
+            emb.embed([f"{fm.get('description', '')}\n{fm.get('pivot', '')}\n{body}"
+                       for fm, body, _ in open_cfs]), dtype="float32")
+        seed_notes = [corpus[s][0] for s in seeds]
+        seed_vecs = np.asarray(
+            emb.embed([f"{n.description}\n\n{n.body}" for n in seed_notes]), dtype="float32")
+    except Exception as e:  # noqa: BLE001 — corroboration is optional; never fail the run
+        print(f"[dream] WARN cf-corroboration funnel failed: {e}", flush=True)
+        return []
+    work: list[dict] = []
+    for i, (fm, body, _path) in enumerate(open_cfs):
+        slug = str(fm.get("name") or "")
+        parents = set(_cf_parents(fm))
+        scored = [(float(cf_vecs[i] @ seed_vecs[j]), s)
+                  for j, s in enumerate(seeds) if s != slug and s not in parents]
+        cands = [s for cos, s in sorted(scored, key=lambda c: -c[0])
+                 if cos >= CF_CORROB_LO][:CF_CORROB_MAX_CAND]
+        if not cands:
+            continue
+        work.append({
+            "cf": {"slug": slug, "description": str(fm.get("description") or ""),
+                   "pivot": str(fm.get("pivot") or ""), "predicts": _predicts_line(body),
+                   "parents": sorted(parents), "body": body},
+            "candidates": [{"slug": s, "description": corpus[s][0].description,
+                            "body": corpus[s][0].body} for s in cands]})
+    return work
+
+
+def _materialize_worklist(ctx: DreamContext, pairs: list[dict], cf_seeds: list[dict],
+                          cf_corrob: list[dict],
                           corpus: dict[str, tuple[KnowledgeNote, Path]]) -> None:
     config.ensure_dirs(ctx.subconscious_dir, ctx.worklist_path.parent,
-                       ctx.manifest_path.parent)
+                       ctx.manifest_path.parent, ctx.verdicts_path.parent)
 
     def _card(slug: str) -> dict:
         n = corpus[slug][0]
@@ -266,8 +420,10 @@ def _materialize_worklist(ctx: DreamContext, pairs: list[dict],
 
     work = [{"seed": _card(p["seed"]), "older": _card(p["older"]), "cos": p["cos"]}
             for p in pairs]
+    cf = [{"seed": _card(c["seed"]), "charge": c.get("charge")} for c in cf_seeds]
     ctx.worklist_path.write_text(json.dumps(
-        {"date": ctx.target.isoformat(), "scope": ctx.scope, "pairs": work},
+        {"date": ctx.target.isoformat(), "scope": ctx.scope,
+         "pairs": work, "counterfactuals": cf, "corroborate": cf_corrob},
         indent=2))
 
 
@@ -277,6 +433,7 @@ def _build_env(ctx: DreamContext) -> dict[str, str]:
         "RECALL_DREAM_WORKLIST": str(ctx.worklist_path),
         "RECALL_DREAM_SUBCONSCIOUS": str(ctx.subconscious_dir),
         "RECALL_DREAM_MANIFEST": str(ctx.manifest_path),
+        "RECALL_DREAM_VERDICTS": str(ctx.verdicts_path),
         "RECALL_DREAM_DATE": ctx.target.isoformat(),
         "RECALL_DREAM_SCOPE": ctx.scope,
     }
@@ -417,6 +574,66 @@ def _promote_to_soul(ctx: DreamContext, hyp: dict, _raw: str) -> str | None:
     return slug
 
 
+# ---- L1: counterfactual corroboration — stage 3, act on the verdict ------
+
+def _read_verdicts(path: Path) -> list[dict]:
+    """The skill's confirm/refute rulings on the corroboration worklist. Best-effort: a
+    missing or garbled file is a quiet no-op — corroboration never fails the run."""
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    return [v for v in data if isinstance(v, dict)] if isinstance(data, list) else []
+
+
+def apply_cf_verdicts(ctx: DreamContext,
+                      corpus: dict[str, tuple[KnowledgeNote, Path]],
+                      verdicts: list[dict], *,
+                      promote: Callable[[DreamContext, dict, str], str | None],
+                      cap_used: int) -> dict:
+    """Stage 3 — act on the ruling. ONE clean ``confirm`` graduates the what-if into the soul
+    (reusing ``_promote_to_soul``; single-parent link), sharing tonight's DREAM_BLEED_MAX cap;
+    a ``refute`` RETIRES it now (``status: discarded`` + ``refuted_by``), faster than TTL; any
+    other verdict leaves it open. We do NOT take the skill's word that reality moved: the cited
+    ``evidence`` must be one of TODAY's episodes, else the ruling is ignored. ``promote`` is
+    injected so tests never write the corpus."""
+    today = set(_partition(corpus, ctx.target)[0])
+    promoted: list[str] = []
+    retired = 0
+    for v in verdicts:
+        cf_slug = str(v.get("cf") or "").strip()
+        verdict = str(v.get("verdict") or "").strip().lower()
+        evidence = str(v.get("evidence") or "").strip()
+        if not cf_slug or verdict not in ("confirm", "refute"):
+            continue
+        path = ctx.subconscious_dir / f"{cf_slug}.md"
+        if not path.exists():
+            continue
+        try:
+            fm, body = _split_fm(path.read_text())
+        except CurationSchemaError:
+            continue
+        if str(fm.get("status") or "unverified").strip() in ("promoted", "discarded"):
+            continue
+        if not evidence or evidence not in today:   # reality must actually have surfaced it
+            continue
+        if verdict == "confirm" and (cap_used + len(promoted)) < DREAM_BLEED_MAX:
+            c = promote(ctx, {"slug": cf_slug, "fm": fm, "body": body,
+                              "parents": _cf_parents(fm)}, path.read_text())
+            if c:
+                promoted.append(c)
+                _set_keys(path, {"status": "promoted", "corroborations": 1,
+                                 "corroborated_by": evidence,
+                                 "last_updated": ctx.target.isoformat()})
+        elif verdict == "refute":
+            _set_keys(path, {"status": "discarded", "refuted_by": evidence,
+                             "last_updated": ctx.target.isoformat()})
+            retired += 1
+    return {"promoted": promoted, "retired": retired}
+
+
 # ---- small frontmatter scalar helpers ------------------------------------
 
 def _set_keys(path: Path, updates: dict) -> None:
@@ -451,11 +668,12 @@ def _age_days(ref_iso: str, target: date) -> int:
 def _write_digest(ctx: DreamContext, new_hyps: list, bleed_summary: dict) -> None:
     ctx.digest_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"# dream digest ({ctx.label}) — {ctx.target.isoformat()}\n",
-             "\n_Overnight recombinations — conjectures, not facts. Each bleeds into "
-             "the soul on its own once reality corroborates it twice (both parent "
-             "memories resurface together on two separate days); no blessing needed. "
-             "Setting `blessed: true` in a subconscious note is just an optional "
-             "manual fast-path. An uncorroborated hypothesis fades after 30 days._\n"]
+             "\n_Overnight recombinations — conjectures, not facts. A recombination "
+             "hypothesis bleeds into the soul once reality corroborates it twice (both "
+             "parent memories resurface together on two separate days); a counterfactual "
+             "what-if graduates on a single prospective match — a later day proves (or "
+             "refutes) its prediction. Setting `blessed: true` is an optional manual "
+             "fast-path. An uncorroborated conjecture fades after 30 days._\n"]
     if bleed_summary.get("promoted"):
         lines.append("\n## Bled into the soul (corroborated)\n")
         for s in bleed_summary["promoted"]:
@@ -495,6 +713,8 @@ def _print(o: Outcome) -> None:
 def run(argv: list[str] | None = None, *,
         invoke_claude: Callable[..., subprocess.CompletedProcess[bytes]] | None = None,
         compute_pairs: Callable[[DreamContext, dict], list[dict]] | None = None,
+        compute_cf_seeds: Callable[[DreamContext, dict], list[dict]] | None = None,
+        compute_cf_corrob: Callable[[DreamContext, dict], list[dict]] | None = None,
         promote: Callable[[DreamContext, dict, str], str | None] | None = None,
         rebuild_index: Callable[[DreamContext], int] | None = None,
         autocommit: Callable[[DreamContext, list], str | None] | None = None,
@@ -504,6 +724,8 @@ def run(argv: list[str] | None = None, *,
     run hermetic; ``today_et`` drives the date."""
     invoke_claude = invoke_claude or _invoke_claude
     compute_pairs = compute_pairs or _recombination_pairs
+    compute_cf_seeds = compute_cf_seeds or _counterfactual_seeds
+    compute_cf_corrob = compute_cf_corrob or _cf_corroboration_worklist
     promote = promote or _promote_to_soul
     rebuild_index = rebuild_index or _rebuild_index
     autocommit = autocommit or _autocommit
@@ -546,8 +768,11 @@ def run(argv: list[str] | None = None, *,
                 or bleed_summary["retired"])
 
     pairs = compute_pairs(ctx, corpus)
+    cf_seeds = compute_cf_seeds(ctx, corpus) if args.counterfactual else []
+    cf_corrob = compute_cf_corrob(ctx, corpus) if args.counterfactual else []
     if args.dry_run:
         print(f"[dream] DRY-RUN {ctx.label} {target}: {len(pairs)} pair(s), "
+              f"{len(cf_seeds)} counterfactual(s), {len(cf_corrob)} to-corroborate, "
               f"{len(bleed_summary['promoted'])} would-promote", flush=True)
         return Outcome(kind="skipped", reason="dry_run",
                        detail="dry-run only; no skill call", exit_code=0)
@@ -569,10 +794,11 @@ def run(argv: list[str] | None = None, *,
         return o
 
     manifest = None
-    if pairs:
-        _materialize_worklist(ctx, pairs, corpus)
+    if pairs or cf_seeds or cf_corrob:
+        _materialize_worklist(ctx, pairs, cf_seeds, cf_corrob, corpus)
         print(f"[dream] invoking claude for {ctx.label} {target} "
-              f"({len(pairs)} recombination pair(s))", flush=True)
+              f"({len(pairs)} recombination pair(s), {len(cf_seeds)} counterfactual(s), "
+              f"{len(cf_corrob)} to-corroborate)", flush=True)
         try:
             cp = invoke_claude(ctx, _build_env(ctx), CLAUDE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
@@ -598,6 +824,15 @@ def run(argv: list[str] | None = None, *,
             _print(fail); _append_session_block(ctx, fail, 0, bleed_summary)
             return fail
         _stamp_hypothesis_defaults(ctx, manifest)
+        # Stage 3 of corroboration: consume the skill's confirm/refute rulings on open
+        # what-ifs. Promotions share tonight's bleed cap (bleed ran first, above), so we
+        # fold them into bleed_summary for the digest, index rebuild, notify and commit.
+        verdicts = _read_verdicts(ctx.verdicts_path)
+        if verdicts:
+            cf_apply = apply_cf_verdicts(ctx, corpus, verdicts, promote=promote,
+                                         cap_used=len(bleed_summary["promoted"]))
+            bleed_summary["promoted"] += cf_apply["promoted"]
+            bleed_summary["retired"] += cf_apply["retired"]
 
     new_notes = manifest.notes if manifest else []
     # Only an *authoritative* run — one that had today's experience to recombine, or an
