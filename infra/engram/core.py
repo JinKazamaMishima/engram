@@ -44,6 +44,8 @@ from claude_agent_sdk import (  # noqa: E402 — after the env strip, on purpose
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     SystemMessage,
     TaskNotificationMessage,
@@ -82,6 +84,15 @@ REGULAR_MODE = "bypassPermissions"
 PLAN_MODE = "plan"
 PERMISSION_MODES = (
     "default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto")
+
+# The two CLI-native tools that need the operator IN the loop: ExitPlanMode (present a
+# plan, wait for approval) and AskUserQuestion (offer options, wait for a pick). They are
+# invisible to the SDK except through the `can_use_tool` permission channel — the CLI
+# routes BOTH through it even under bypassPermissions (verified), while ordinary tools
+# auto-allow without a round-trip. So the driver intercepts exactly these, hands them to a
+# front-end `on_interaction` handler, and renders them richly instead of as a bare status
+# blip (we also suppress their tool-use markers in the stream, since the card IS the render).
+_INTERACTIVE_TOOLS = {"ExitPlanMode", "AskUserQuestion"}
 
 # When the model auto-delegates, the CLI's Agent tool runs the sub-agent ASYNC: its
 # progress/completion arrive as Task* messages AFTER the parent turn's ResultMessage.
@@ -238,6 +249,13 @@ class ModelDriver:
     compatible, for the self-hosted endgame) implements this same surface, so no
     front-end changes when the backend swaps."""
 
+    # Optional front-end seam for interactive tools (plan approval, option questions):
+    # ``async on_interaction(request: dict) -> dict``. The front-end (the TUI) sets it;
+    # left None the driver falls back to safe headless defaults (the perceiving loop,
+    # the --simple REPL, tests). Model-agnostic: a LocalModelDriver would drive the same
+    # handler from its own tool-call surface.
+    on_interaction = None
+
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
     def reset(self) -> None: ...
@@ -338,6 +356,9 @@ class AgentSDKDriver(ModelDriver):
         self.resumed: bool = self.session_id is not None  # for the front-end to announce
         self.actual_model: Optional[str] = None   # what the SDK reports it's REALLY using
         self._stderr: list[str] = []
+        # Set by the front-end (app.py) to render plan-approval / option-question UI; see
+        # ModelDriver.on_interaction. None → headless defaults in _can_use_tool.
+        self.on_interaction = None
 
     def _options(self) -> ClaudeAgentOptions:
         opts = dict(
@@ -349,6 +370,7 @@ class AgentSDKDriver(ModelDriver):
             cli_path=self.cli_path,
             resume=self.session_id,
             agents=self.agents,            # sub-agent roster → Task-tool delegation
+            can_use_tool=self._can_use_tool,   # interactive-tool interception (plan / questions)
             stderr=self._stderr.append,
         )
         if self.effort:
@@ -405,6 +427,42 @@ class AgentSDKDriver(ModelDriver):
             raise ValueError(f"permission_mode must be one of {PERMISSION_MODES}")
         self.permission_mode = mode
         await self.disconnect()
+
+    async def _can_use_tool(self, name: str, tool_input: dict, ctx) -> object:
+        """Permission callback — the only channel the CLI-native interactive tools reach.
+        Ordinary tools never arrive here under bypassPermissions (auto-allowed), so this
+        fires only for ExitPlanMode / AskUserQuestion (verified empirically). We hand each
+        to the front-end ``on_interaction`` handler and translate its verdict into the wire
+        result: PermissionResultAllow = run the tool (plan approved → the turn proceeds to
+        implement, and the CLI persistently leaves plan mode); PermissionResultDeny(message)
+        feeds ``message`` back to the model as the tool result — which is how BOTH a rejected
+        plan (revise, keep planning) and an answered question (the chosen option / typed
+        answer) are delivered. With no handler wired we fall back to safe headless defaults
+        so the perceiving loop / --simple REPL / tests never wedge."""
+        tool_input = tool_input or {}
+        handler = self.on_interaction
+        if name == "ExitPlanMode":
+            if handler is None:
+                return PermissionResultAllow()          # headless: accept the plan, proceed
+            decision = await handler({"kind": "plan", "plan": tool_input.get("plan") or ""})
+            if decision.get("approved"):
+                # Approving persistently exits plan mode at the CLI level (verified), so just
+                # sync our stored field — the indicator follows and no reconnect is needed.
+                self.permission_mode = REGULAR_MODE
+                return PermissionResultAllow()
+            return PermissionResultDeny(
+                message=decision.get("message") or "Keep planning — don't implement yet.")
+        if name == "AskUserQuestion":
+            if handler is None:
+                return PermissionResultDeny(message=(
+                    "No interactive UI is available here; proceed with your best judgment "
+                    "and state the assumption you made."))
+            decision = await handler({"kind": "question",
+                                      "questions": tool_input.get("questions") or []})
+            return PermissionResultDeny(
+                message=decision.get("message")
+                or "The user didn't choose; proceed with your best judgment.")
+        return PermissionResultAllow()   # any other tool that reaches here → allow
 
     async def interrupt(self) -> None:
         """Stop the in-flight turn now: ask the live CLI to stop generating (the SDK
@@ -508,6 +566,8 @@ class AgentSDKDriver(ModelDriver):
                     if isinstance(block, TextBlock):
                         yield Event("text", block.text)
                     elif getattr(block, "name", None):   # ToolUseBlock-ish
+                        if block.name in _INTERACTIVE_TOOLS:
+                            continue                     # rendered as a card via _can_use_tool
                         yield Event("tool", _tool_label(block))
             elif isinstance(msg, TaskStartedMessage):
                 name = (getattr(msg, "data", {}) or {}).get("subagent_type") or "sub-agent"

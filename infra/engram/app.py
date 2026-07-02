@@ -11,6 +11,7 @@ the local model lands we swap the driver and this whole TUI is unchanged.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import re
@@ -148,6 +149,29 @@ class PromptArea(TextArea):
                 event.stop()
                 handler()
                 return
+        # An interaction card is open (plan approval / option question): ↑/↓ move the
+        # highlight; Enter with an EMPTY prompt picks it; Enter with text submits that text
+        # as the free-text answer/feedback; Esc cancels. Every OTHER key falls through to
+        # normal editing, so "type your own answer / just chat" works without leaving the card.
+        if getattr(app, "_interact_open", False):
+            if event.key in ("down", "up"):
+                event.prevent_default()
+                event.stop()
+                app._interact_move(1 if event.key == "down" else -1)   # type: ignore[attr-defined]
+                return
+            if event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                if self.text.strip():
+                    self.post_message(self.Submitted(self.text))       # → free-text answer
+                else:
+                    app._interact_accept_highlight()                   # type: ignore[attr-defined]
+                return
+            if event.key == "escape":
+                event.prevent_default()
+                event.stop()
+                app._interact_cancel()                                 # type: ignore[attr-defined]
+                return
         if event.key == "escape" and getattr(app, "_busy", False):
             event.prevent_default()                # ESC mid-reply → stop Engram now
             event.stop()
@@ -208,6 +232,16 @@ class EngramApp(App):
     #cmdmenu > .option-list--option-highlighted {
         background: $accent 25%; color: $foreground; text-style: bold;
     }
+    .interact {
+        height: auto; max-height: 12; margin: 0 0 1 0;
+        background: $panel; border: round $accent 60%;
+    }
+    .interact > .option-list--option { padding: 0 1; color: $foreground; }
+    .interact > .option-list--option-highlighted {
+        background: $accent 25%; color: $foreground; text-style: bold;
+    }
+    .plancard { border: round $secondary 50%; margin: 0 0 1 0; padding: 0 1; }
+    .interact-hint { color: $secondary; text-style: italic; padding: 0 1; margin: 0 0 1 0; }
     #perception {
         display: none;                 /* shown only when ENGRAM_PERCEIVE is on */
         height: auto; margin: 0 2; padding: 0 1;
@@ -237,6 +271,19 @@ class EngramApp(App):
         self._queue: list[tuple[str, list]] = []   # type-ahead: msgs typed while busy
         self._pending_mode: str | None = None      # plan/regular armed via shift+tab mid-reply
         self._perception = None                     # PerceptionBridge (opt-in: ENGRAM_PERCEIVE=1)
+        # Interactive tools (plan approval · option questions). The driver calls
+        # self._handle_interaction through its on_interaction seam; a live card parks the
+        # turn until you pick or type. _cur_* hold the active streaming Markdown so an
+        # interaction can BREAK it — text after the card renders below it, never glued above.
+        self._interact: dict | None = None          # {future, list} while a card is open
+        self._interact_open = False
+        self._cur_md = None
+        self._cur_stream = None
+        self._cur_last = ""
+        try:
+            self.driver.on_interaction = self._handle_interaction
+        except Exception:  # noqa: BLE001 — a driver may forbid the attr set; degrade to no-UI
+            pass
 
     def compose(self) -> ComposeResult:
         yield Static(id="vhead")
@@ -505,6 +552,9 @@ class EngramApp(App):
         return [(cmd, f"{cmd}   {desc}") for cmd, desc in SLASH_CMDS if cmd.startswith(token)]
 
     def _refresh_menu(self, text: str) -> None:
+        if self._interact_open:            # a card owns the prompt — don't pop the slash menu
+            self._hide_menu()
+            return
         menu = self.query_one("#cmdmenu", OptionList)
         items = self._menu_items(text)
         if not items:
@@ -536,6 +586,11 @@ class EngramApp(App):
             self._choose_command(opt.id)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if (self._interact is not None and event.option_list is self._interact.get("list")
+                and event.option.id):                    # mouse-click on an interaction choice
+            event.stop()
+            self._resolve_interact({"kind": "option", "id": event.option.id})
+            return
         if event.option_list.id == "cmdmenu" and event.option.id:
             event.stop()
             self._choose_command(event.option.id)
@@ -684,6 +739,11 @@ class EngramApp(App):
         # Always safe, even mid-reply.
         if text in ("/exit", "/quit", "/q"):
             self.exit()
+            return
+        # A plan/question card is open → this submit IS the free-text answer / plan feedback
+        # (the "add my own / just chat" path), not a new turn. Resolve the card and stop.
+        if self._interact_open and self._interact is not None:
+            self._resolve_interact({"kind": "text", "text": text})
             return
         if text == "/status":
             self._status(self._status_line())
@@ -845,29 +905,183 @@ class EngramApp(App):
         self._render_queue()
         await self._dispatch(text, attachments)
 
+    # ---- interactive tools: plan approval + option questions (driver.on_interaction) ----
+    async def _handle_interaction(self, req: dict) -> dict:
+        """Driver seam (core.AgentSDKDriver._can_use_tool): render a plan or an option
+        question inline and BLOCK the turn until you decide, returning the verdict the
+        driver maps onto the SDK wire result. Runs on the app's event loop (the SDK spawns
+        the permission callback there), so it mounts widgets and awaits a Future the UI
+        resolves. Never raises — a broken card must not wedge the turn; it degrades to a
+        sensible default (approve nothing / no preference)."""
+        try:
+            await self._break_stream()      # finalize pre-card text so the card lands below it
+            if req.get("kind") == "plan":
+                return await self._interact_plan(req.get("plan") or "")
+            return await self._interact_question(req.get("questions") or [])
+        except Exception:  # noqa: BLE001 — identity of the failure doesn't matter; don't wedge
+            return {"approved": False, "message": "(the interaction UI failed; use your judgment)"}
+        finally:
+            self._status("✦ thinking…")
+
+    async def _interact_plan(self, plan_md: str) -> dict:
+        """Render the proposed plan as real Markdown (the rendering fix) and offer
+        approve / keep-planning. Approve → leave plan mode and let the turn implement;
+        typed feedback → keep planning with that steer."""
+        await self._add(Static("[b]▌ Engram proposes a plan[/b]"))
+        await self._add(Markdown(plan_md or "*(empty plan)*", classes="plancard"))
+        choice = await self._await_choice(
+            [("approve", "✅  Approve — leave plan mode and implement this now"),
+             ("keep",    "✎  Keep planning — refine it (or type feedback below)")],
+            hint="↑/↓ + Enter to choose  ·  or type feedback + Enter to keep planning")
+        if choice.get("kind") == "option" and choice.get("id") == "approve":
+            # Approving persistently exits plan mode (the driver synced its field); mirror it
+            # here for the indicator and drop any armed pending mode so nothing re-enters plan.
+            self.driver.permission_mode = REGULAR_MODE
+            self._pending_mode = None
+            self._render_header()
+            await self._add(Static("[#86EFAC]✓ approved — leaving plan mode, implementing…[/]"))
+            return {"approved": True}
+        feedback = choice.get("text", "").strip() if choice.get("kind") == "text" else ""
+        await self._add(Static(
+            f"[#C4B5FD]✎ keep planning{': ' + escape(feedback) if feedback else ''}[/]"))
+        return {"approved": False,
+                "message": feedback or "Keep planning — don't implement yet; refine the plan."}
+
+    async def _interact_question(self, questions: list) -> dict:
+        """Ask each question in turn (usually one), collecting a picked option or a typed
+        answer, then hand the combined answer to the model. 'Add my own' and 'just chat' are
+        the free-text path — you type instead of picking."""
+        records: list[str] = []
+        for q in (questions or [{}]):
+            header = (q.get("header") or "").strip()
+            qtext = (q.get("question") or "").strip()
+            opts = q.get("options") or []
+            title = (f"**{escape(header)}** — {escape(qtext)}" if header
+                     else f"**{escape(qtext) or 'Engram asks:'}**")
+            await self._add(Markdown(title, classes="plancard"))
+            choices = []
+            for i, o in enumerate(opts):
+                label = str(o.get("label", "")).strip() or f"option {i + 1}"
+                desc = str(o.get("description", "")).strip()
+                choices.append((f"opt{i}", label + (f"   —   {desc}" if desc else "")))
+            choice = await self._await_choice(
+                choices, hint="↑/↓ + Enter to pick  ·  or type your own answer / chat + Enter")
+            if choice.get("kind") == "option" and str(choice.get("id", "")).startswith("opt"):
+                idx = int(choice["id"][3:])
+                ans = str(opts[idx].get("label", "")).strip() or f"option {idx + 1}"
+            else:
+                ans = choice.get("text", "").strip() or "(no preference — you decide)"
+            records.append(f"{header or qtext or 'answer'}: {ans}")
+            await self._add(Static(f"[#67E8F9]❯ {escape(ans)}[/]"))
+        return {"message": "The user answered your question(s):\n" + "\n".join(records)}
+
+    async def _await_choice(self, choices: list, hint: str = "") -> dict:
+        """Mount an inline chooser and await your decision: a picked option
+        ({'kind':'option','id':...}), free text ({'kind':'text','text':...}), or a cancel
+        ({'kind':'cancel'}). The prompt keeps focus so typing works instead of picking."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        ol = OptionList(classes="interact")
+        await self._add(ol)
+        if choices:
+            ol.add_options([Option(label, id=cid) for cid, label in choices])
+            ol.highlighted = 0
+        if hint:
+            await self._add(Static(hint, classes="interact-hint"))
+            self._status(hint)
+        # Keep the prompt focused so ↑/↓/Enter route through PromptArea._on_key AND typing
+        # a free-text answer works — the chooser is driven from there, never focused itself.
+        try:
+            self.query_one("#prompt", PromptArea).focus()
+        except Exception:  # noqa: BLE001
+            pass
+        self._interact = {"future": fut, "list": ol}
+        self._interact_open = True
+        try:
+            return await fut
+        finally:
+            self._interact_open = False
+            self._interact = None
+            try:
+                ol.disabled = True             # freeze it in the transcript as a record
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _resolve_interact(self, result: dict) -> None:
+        st = self._interact
+        if st is not None and not st["future"].done():
+            st["future"].set_result(result)
+
+    def _interact_move(self, delta: int) -> None:
+        st = self._interact
+        if st is None:
+            return
+        ol = st["list"]
+        if ol.option_count:
+            ol.highlighted = ((ol.highlighted or 0) + delta) % ol.option_count
+
+    def _interact_accept_highlight(self) -> None:
+        st = self._interact
+        if st is None:
+            return
+        ol = st["list"]
+        if not ol.option_count or ol.highlighted is None:
+            return                             # no options → the operator must type an answer
+        opt = ol.get_option_at_index(ol.highlighted)
+        if opt.id:
+            self._resolve_interact({"kind": "option", "id": opt.id})
+
+    def _interact_cancel(self) -> None:
+        self._resolve_interact({"kind": "cancel"})
+
+    # ---- streaming Markdown, segmentable so a mid-turn card renders in order ----
+    async def _ensure_stream(self) -> None:
+        """Open a fresh streaming Markdown block if none is active (lazy — so a turn that
+        opens with a tool or a card doesn't leave an empty bubble above it)."""
+        if self._cur_stream is None:
+            md = Markdown()
+            await self._add(md)
+            self._cur_md = md
+            self._cur_stream = Markdown.get_stream(md)
+            self._cur_last = ""
+
+    async def _break_stream(self) -> None:
+        """Finalize the active streaming block so whatever mounts next — an interaction
+        card, then more text — lands BELOW it in order rather than glued into it."""
+        if self._cur_stream is not None:
+            try:
+                await self._cur_stream.stop()
+            except Exception:  # noqa: BLE001 — stopping a spent stream must never crash a turn
+                pass
+            self._cur_stream = None
+            self._cur_md = None
+            self._cur_last = ""
+
     # ---- the turn (background worker; incremental Markdown streaming) ----
     @work(exclusive=True)
     async def _run_turn(self, text: str, agent: "tuple | None" = None) -> None:
         self._busy = True
-        md = Markdown()
-        await self._add(md)
-        stream = Markdown.get_stream(md)        # incremental — no full re-render/chunk
+        self._cur_md = None
+        self._cur_stream = None
+        self._cur_last = ""
         acc: list[str] = []
         tools: list[str] = []
+        wrote_any = False
         self._status(f"✦ {agent[0]} working…" if agent else "✦ thinking…")
-        last = ""                                   # last text block written (for the seam)
         try:
             source = (self.driver.run_subagent(*agent) if agent
                       else self.driver.query(text))
             async for ev in source:
                 if ev.kind == "text":
-                    sep = _seam(last, ev.text)      # paragraph break so blocks don't glue
+                    await self._ensure_stream()     # (re)open a block; a card may have broken it
+                    sep = _seam(self._cur_last, ev.text)   # paragraph break so blocks don't glue
                     if sep:
                         acc.append(sep)
-                        await stream.write(sep)
+                        await self._cur_stream.write(sep)
                     acc.append(ev.text)
-                    await stream.write(ev.text)
-                    last = ev.text
+                    await self._cur_stream.write(ev.text)
+                    self._cur_last = ev.text
+                    wrote_any = True
                 elif ev.kind == "tool":
                     if ev.text not in tools:
                         tools.append(ev.text)
@@ -876,12 +1090,13 @@ class EngramApp(App):
                     self._status(f"⚙ {ev.text}…")
                 self._scroll()
         except Exception as exc:  # noqa: BLE001 — surface, never crash the home
-            await stream.write(f"\n\n**error:** `{type(exc).__name__}: {exc}`")
+            await self._ensure_stream()
+            await self._cur_stream.write(f"\n\n**error:** `{type(exc).__name__}: {exc}`")
             tail = getattr(self.driver, "stderr_tail", "")
             if tail:
                 await self._add(Static(f"[red dim]{escape(tail)}[/red dim]"))
         finally:
-            await stream.stop()
+            await self._break_stream()
             self._busy = False
             # A mode armed via shift+tab mid-reply applies now, governing the next turn.
             if self._pending_mode is not None:
@@ -892,10 +1107,13 @@ class EngramApp(App):
                     pass
                 self._render_header()
             self._last_reply = "".join(acc).strip()
-            if not self._last_reply:
-                await md.update("*(no text in reply)*")
-            self._status("ready" + (f"   ·   ⚙ {', '.join(tools)}" if tools else ""))
-            self._scroll()
+            try:                                   # all best-effort: a quit/teardown mid-turn
+                if not wrote_any and not self._last_reply:   # removes #convo before this runs
+                    await self._add(Static("[dim]*(no text in reply)*[/dim]"))
+                self._status("ready" + (f"   ·   ⚙ {', '.join(tools)}" if tools else ""))
+                self._scroll()
+            except Exception:  # noqa: BLE001 — convo/status gone (app closing); nothing to show
+                pass
             # Type-ahead: if messages were queued mid-reply, send the next one now.
             # Deferred to after-refresh so this (exclusive) worker fully exits first.
             if self._queue:
