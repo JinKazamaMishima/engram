@@ -108,10 +108,12 @@ def _parse_ts(ev: dict) -> datetime | None:
         return None
 
 
-def iter_exchanges(path: Path, target: date, tz: ZoneInfo = ET
+def iter_exchanges(path: Path, target: date | None, tz: ZoneInfo = ET
                    ) -> Iterator[Exchange]:
-    """Yield denoised user/assistant exchanges from one transcript whose event
-    timestamp falls on ``target`` (in ``tz``). Malformed lines and events are
+    """Yield denoised user/assistant exchanges from one transcript. With a
+    ``target`` date, keep only events on that day (in ``tz``); with
+    ``target is None``, keep every properly-dated exchange — the whole session
+    end to end, for session-scoped curation. Malformed lines and events are
     skipped defensively rather than raising."""
     try:
         raw_lines = path.read_text(errors="replace").splitlines()
@@ -130,7 +132,9 @@ def iter_exchanges(path: Path, target: date, tz: ZoneInfo = ET
                                                                "assistant"):
             continue
         ts = _parse_ts(ev)
-        if ts is None or ts.astimezone(tz).date() != target:
+        if ts is None:
+            continue
+        if target is not None and ts.astimezone(tz).date() != target:
             continue
         msg = ev.get("message")
         if not isinstance(msg, dict):
@@ -165,13 +169,32 @@ def discover_transcripts(transcript_dir: str | Path, target: date,
     return out
 
 
-def build_bundle(paths: list[Path], target: date, tz: ZoneInfo = ET, *,
+def session_transcript_path(transcript_dir: str | Path, session_id: str) -> Path:
+    """Path to one session's transcript (``<dir>/<session_id>.jsonl``). The file
+    may not exist (an unknown / not-yet-flushed session); callers check."""
+    return Path(transcript_dir) / f"{session_id}.jsonl"
+
+
+def session_date(path: Path, tz: ZoneInfo = ET) -> date | None:
+    """The ``tz`` date of a session's last real exchange — the day it should be
+    filed under (manifest date + dynamics ``last_used``). ``None`` if the file
+    has no surviving human/assistant turn."""
+    last: datetime | None = None
+    for ex in iter_exchanges(path, None, tz):
+        if last is None or ex.ts > last:
+            last = ex.ts
+    return last.astimezone(tz).date() if last is not None else None
+
+
+def build_bundle(paths: list[Path], target: date | None, tz: ZoneInfo = ET, *,
                  max_chars_per_msg: int = 6000) -> tuple[str, BundleStats]:
     """Group surviving exchanges by session, drop sessions with no genuine user
-    turn (headless skill runs), and render a readable markdown bundle.
+    turn (headless skill runs), and render a readable markdown bundle. ``target``
+    scopes the exchanges by day; ``target is None`` keeps every dated exchange in
+    ``paths`` (used to curate a single session end to end).
 
     Returns ``(bundle_text, stats)``; ``stats.exchanges == 0`` means there was
-    nothing worth curating today."""
+    nothing worth curating."""
     by_session: dict[str, list[Exchange]] = {}
     order: list[str] = []
     for p in paths:

@@ -184,3 +184,64 @@ def test_curate_birth_stability_does_not_clobber_seed(tmp_path, monkeypatch):
     assert out.kind == "curated"
     note = KnowledgeNote.parse((tmp_path / "data" / "global" / "engram.md").read_text())
     assert note.stability == 400.0     # preserved; NOT reset to S_PERM by birth-stability
+
+
+# ---- brick 1: session-scoped curation ------------------------------------
+
+def _run_session(tmp_path, monkeypatch, session_id="s", invoke_claude=None):
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.delenv("RECALL_GLOBAL_DIR", raising=False)
+    proj = tmp_path / "proj"
+    (proj / "docs" / "knowledge").mkdir(parents=True, exist_ok=True)
+    tdir = _transcript(tmp_path / "transcripts", name=f"{session_id}.jsonl")
+    argv = ["--project-dir", str(proj), "--session", session_id,
+            "--transcript-dir", str(tdir)]
+    out = curate.run(argv, invoke_claude=invoke_claude or _fake_claude(),
+                     rebuild_indices=lambda ctx: {ctx.slug: 1, "global": 1},
+                     autocommit=lambda ctx, m: [],
+                     compute_neighbors=lambda ctx: [],
+                     compute_surprise=lambda ctx, created: {},
+                     today_et=TARGET)
+    return proj, out
+
+
+def test_curate_session_scoped(tmp_path, monkeypatch):
+    proj, out = _run_session(tmp_path, monkeypatch)
+    assert out.kind == "curated", out
+    assert (proj / "docs" / "knowledge" / "proj-insight.md").exists()
+    state = json.loads(
+        (tmp_path / "data" / "curation" / "proj" / "curated.json").read_text())
+    assert "s" in state.get("sessions", [])     # tracked in the sessions bucket …
+    assert state.get("dates", []) == []         # … NOT the dates bucket
+    assert (tmp_path / "data" / "curation" / "proj" / "bundles"
+            / "session-s.md").exists()          # artifacts under a session stem
+
+
+def test_curate_session_idempotent(tmp_path, monkeypatch):
+    _run_session(tmp_path, monkeypatch)
+    _proj, out = _run_session(tmp_path, monkeypatch)
+    assert out.kind == "skipped" and out.reason == "already_curated"
+
+
+def test_curate_session_missing_is_clean_skip(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    proj = tmp_path / "proj"
+    (proj / "docs" / "knowledge").mkdir(parents=True)
+    tdir = tmp_path / "transcripts"
+    tdir.mkdir()
+    out = curate.run(["--project-dir", str(proj), "--session", "ghost",
+                      "--transcript-dir", str(tdir)],
+                     invoke_claude=_fake_claude(), rebuild_indices=lambda c: {},
+                     autocommit=lambda c, m: [], today_et=TARGET)
+    assert out.kind == "skipped" and out.reason == "session_missing"
+
+
+def test_curate_date_and_session_buckets_independent(tmp_path, monkeypatch):
+    # A day-sweep and a session curation on the same project keep separate state,
+    # so neither clobbers the other's idempotency (the nightly<->live guarantee).
+    _run(tmp_path, monkeypatch)                        # date-scoped
+    _proj, out = _run_session(tmp_path, monkeypatch)   # session-scoped, same proj
+    assert out.kind == "curated", out
+    state = json.loads(
+        (tmp_path / "data" / "curation" / "proj" / "curated.json").read_text())
+    assert TARGET.isoformat() in state["dates"] and "s" in state["sessions"]

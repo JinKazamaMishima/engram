@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from recall import transcripts as T
@@ -162,3 +163,42 @@ def test_bundle_empty_when_nothing(tmp_path):
     text, stats = T.build_bundle([p], TARGET, ET)
     assert text == ""
     assert stats.exchanges == 0 and stats.sessions == 0
+
+
+# ---- session-scoped helpers (brick 1) ------------------------------------
+
+def test_iter_all_dates_when_target_none(tmp_path):
+    p = _jsonl(tmp_path, "s.jsonl", [
+        _user("day one", ts="2026-06-01T16:00:00Z"),
+        _user("day two", ts="2026-06-02T16:00:00Z"),
+    ])
+    assert [e.text for e in T.iter_exchanges(p, None, ET)] == ["day one", "day two"]
+
+
+def test_build_bundle_all_dates_when_target_none(tmp_path):
+    p = _jsonl(tmp_path, "s.jsonl", [
+        _user("q1", ts="2026-06-01T16:00:00Z"),
+        _assistant([_text("a1")], ts="2026-06-01T16:01:00Z"),
+        _user("q2", ts="2026-06-02T16:00:00Z"),
+    ])
+    text, stats = T.build_bundle([p], None, ET)
+    assert stats.sessions == 1 and stats.exchanges == 3
+    assert "q1" in text and "q2" in text
+
+
+def test_session_transcript_path():
+    assert (T.session_transcript_path("/x/dir", "abc-123")
+            == Path("/x/dir/abc-123.jsonl"))
+
+
+def test_session_date_is_last_activity(tmp_path):
+    p = _jsonl(tmp_path, "s.jsonl", [
+        _user("first", ts="2026-06-01T16:00:00Z"),
+        _assistant([_text("reply")], ts="2026-06-02T18:00:00Z"),  # 14:00 EDT 06-02
+    ])
+    assert T.session_date(p, ET) == date(2026, 6, 2)
+
+
+def test_session_date_none_when_no_human_turn(tmp_path):
+    p = _jsonl(tmp_path, "s.jsonl", [_user("/clear")])   # noise only
+    assert T.session_date(p, ET) is None

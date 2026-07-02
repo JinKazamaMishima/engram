@@ -72,6 +72,8 @@ class FireContext:
     global_index_path: Path
     session_log_path: Path
     state_file: Path
+    state_bucket: str          # "dates" (nightly sweep) | "sessions" (--session)
+    state_key: str             # idempotency key within that bucket
     today_et: date
 
 
@@ -93,6 +95,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="project to curate (default: cwd)")
     p.add_argument("--date", type=str, default=None,
                    help="ISO date to curate (default: today ET)")
+    p.add_argument("--session", type=str, default=None,
+                   help="curate ONE session by id (<id>.jsonl) instead of a whole "
+                        "day; idempotency tracked per-session (ignores --date)")
     p.add_argument("--force", action="store_true",
                    help="re-curate even if this date is already curated")
     p.add_argument("--dry-run", action="store_true",
@@ -106,20 +111,30 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 # ---- idempotency state (per project) --------------------------------------
 
-def _curated_dates(state_file: Path) -> set[str]:
+def _curated_keys(state_file: Path, bucket: str = "dates") -> set[str]:
+    """Keys already curated in ``bucket``: "dates" for the nightly day-sweep,
+    "sessions" for per-session curation. The buckets are independent so live and
+    nightly curation never clobber each other's idempotency state."""
     if not state_file.exists():
         return set()
     try:
-        return set(json.loads(state_file.read_text()).get("dates", []))
+        return set(json.loads(state_file.read_text()).get(bucket, []))
     except (json.JSONDecodeError, OSError):
         return set()
 
 
-def _mark_curated(state_file: Path, target: date) -> None:
-    dates = _curated_dates(state_file)
-    dates.add(target.isoformat())
+def _mark_curated(state_file: Path, bucket: str, key: str) -> None:
+    """Record ``key`` in ``bucket``, preserving every other bucket already on
+    disk (so marking a session never drops the recorded dates, and vice versa)."""
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps({"dates": sorted(dates)}, indent=2))
+    try:
+        data = json.loads(state_file.read_text()) if state_file.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    data[bucket] = sorted(set(data.get(bucket, [])) | {key})
+    state_file.write_text(json.dumps(data, indent=2))
 
 
 # ---- context resolution --------------------------------------------------
@@ -134,17 +149,35 @@ def _resolve_context(args: argparse.Namespace, today_et: date,
     cdir = config.curation_dir() / slug
     state_file = cdir / "curated.json"
 
-    if target.isoformat() in _curated_dates(state_file) and not args.force:
+    # Unit of work: a whole day (nightly sweep) or one session (live --session).
+    # Independent idempotency buckets so the two never clobber each other's state.
+    if args.session:
+        bucket, state_key, stem = "sessions", args.session, f"session-{args.session}"
+    else:
+        bucket, state_key, stem = "dates", target.isoformat(), target.isoformat()
+
+    if state_key in _curated_keys(state_file, bucket) and not args.force:
         return Outcome(kind="skipped", reason="already_curated",
-                       detail=f"{target.isoformat()} already curated for {slug} "
+                       detail=f"{state_key} already curated for {slug} "
                               f"(use --force to redo)", exit_code=0)
 
-    paths = T.discover_transcripts(transcript_dir, target)
-    bundle_text, stats = T.build_bundle(paths, target)
+    if args.session:
+        path = T.session_transcript_path(transcript_dir, args.session)
+        if not path.exists():
+            return Outcome(kind="skipped", reason="session_missing",
+                           detail=f"no transcript {path.name} for {slug} "
+                                  f"in {transcript_dir}", exit_code=0)
+        target = T.session_date(path) or today_et   # file it under the session's day
+        paths = [path]
+        bundle_text, stats = T.build_bundle(paths, None)
+    else:
+        paths = T.discover_transcripts(transcript_dir, target)
+        bundle_text, stats = T.build_bundle(paths, target)
+
     if stats.exchanges == 0:
         return Outcome(kind="skipped", reason="no_conversations",
-                       detail=f"no human conversation on {target.isoformat()} "
-                              f"for {slug} ({len(paths)} transcript(s) scanned)",
+                       detail=f"no human conversation for {slug} "
+                              f"({state_key}; {len(paths)} transcript(s) scanned)",
                        exit_code=0)
 
     return FireContext(
@@ -153,13 +186,14 @@ def _resolve_context(args: argparse.Namespace, today_et: date,
         project_knowledge_dir=config.project_corpus_dir(project_dir),
         global_dir=config.global_corpus_dir(),
         bundle_text=bundle_text, bundle_stats=stats,
-        bundle_path=cdir / "bundles" / f"{target.isoformat()}.md",
-        manifest_path=cdir / "manifests" / f"{target.isoformat()}.json",
-        neighbors_path=cdir / "neighbors" / f"{target.isoformat()}.json",
+        bundle_path=cdir / "bundles" / f"{stem}.md",
+        manifest_path=cdir / "manifests" / f"{stem}.json",
+        neighbors_path=cdir / "neighbors" / f"{stem}.json",
         project_index_path=config.index_path(slug),
         global_index_path=config.index_path(config.GLOBAL_SCOPE),
         session_log_path=cdir / "sessions" / f"{target.isoformat()}.md",
-        state_file=state_file, today_et=today_et)
+        state_file=state_file, state_bucket=bucket, state_key=state_key,
+        today_et=today_et)
 
 
 # ---- env contract + input materialization ---------------------------------
@@ -169,6 +203,7 @@ def _build_env(ctx: FireContext) -> dict[str, str]:
         **os.environ,
         "RECALL_CURATE_INPUT": str(ctx.bundle_path),
         "RECALL_CURATE_DATE": ctx.target.isoformat(),
+        "RECALL_CURATE_SESSION": ctx.state_key if ctx.state_bucket == "sessions" else "",
         "RECALL_CURATE_MANIFEST": str(ctx.manifest_path),
         "RECALL_CURATE_NEIGHBORS": str(ctx.neighbors_path),
         "RECALL_PROJECT_KNOWLEDGE_DIR": str(ctx.project_knowledge_dir),
@@ -458,7 +493,9 @@ def _append_session_block(path: Path, target: date, slug: str, outcome: Outcome,
         n_new = sum(1 for n in manifest.notes if n.action == "created")
         n_upd = sum(1 for n in manifest.notes if n.action == "updated")
         n_glob = sum(1 for n in manifest.notes if n.scope == "global")
-        lines.append(f"## {when} — curated {target.isoformat()}: "
+        scope_tag = (f" [session {ctx.state_key[:8]}]"
+                     if ctx.state_bucket == "sessions" else "")
+        lines.append(f"## {when} — curated {target.isoformat()}{scope_tag}: "
                      f"+{n_new} new / ~{n_upd} updated ({n_glob} global) "
                      f"({ctx.bundle_stats.sessions} sessions, "
                      f"{ctx.bundle_stats.exchanges} turns)\n")
@@ -583,7 +620,7 @@ def run(argv: list[str] | None = None, *,
     except Exception as e:  # noqa: BLE001 — corpus already written, never fatal
         print(f"[curate] WARN birth-stability failed (corpus intact): {e}", flush=True)
 
-    _mark_curated(ctx.state_file, target)
+    _mark_curated(ctx.state_file, ctx.state_bucket, ctx.state_key)
     try:
         counts = rebuild_indices(ctx)
         print(f"[curate] indices rebuilt: {counts}", flush=True)
