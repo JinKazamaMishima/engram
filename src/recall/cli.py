@@ -403,6 +403,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "curate-all":
         from recall import registry
         return registry.curate_all(argv[1:])
+    if argv and argv[0] == "curate-sessions-all":
+        from recall import registry
+        return registry.curate_sessions_all(argv[1:])
     if argv and argv[0] == "consolidate":
         from recall import consolidate
         return consolidate.main(argv[1:])

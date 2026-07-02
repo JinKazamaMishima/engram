@@ -80,6 +80,58 @@ def curate_all(argv: list[str] | None = None) -> int:
     return rc
 
 
+def curate_sessions_all(argv: list[str] | None = None) -> int:
+    """Nightly safety-net sweep: for every registered project, curate each of the
+    day's SESSIONS not already done live (the 'sessions' bucket dedups, so no
+    double-work), catching abandoned / terminal / bridge-was-down sessions. This
+    replaces the date-based curate-all in the nightly cycle; curate-all stays for
+    manual date backfills. One session's failure doesn't stop the rest."""
+    from datetime import date, datetime, timezone
+
+    from recall import curate
+    from recall import transcripts as T
+    from recall.curate import ET
+    ap = argparse.ArgumentParser(prog="recall curate-sessions-all")
+    ap.add_argument("--date", default=None,
+                    help="sweep sessions active on/after this ISO date (default: today ET)")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--commit", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args(argv)
+    try:
+        target = (date.fromisoformat(a.date) if a.date
+                  else datetime.now(timezone.utc).astimezone(ET).date())
+    except ValueError:
+        print(f"[curate-sessions-all] bad --date {a.date!r}", file=sys.stderr)
+        return 1
+
+    projects = list_projects()
+    if not projects:
+        print(f"[curate-sessions-all] no projects registered in {registry_path()} — "
+              f"add one with `recall register`.", file=sys.stderr)
+        return 0
+
+    def _flags(base: list[str]) -> list[str]:
+        if a.force:
+            base.append("--force")
+        if a.commit:
+            base.append("--commit")
+        if a.dry_run:
+            base.append("--dry-run")
+        return base
+
+    rc = 0
+    for d in projects:
+        sessions = T.discover_transcripts(T.project_transcript_dir(d), target)
+        print(f"\n=== curate-sessions {d.name}: {len(sessions)} session(s) "
+              f"active since {target.isoformat()} ({d}) ===", flush=True)
+        for path in sessions:
+            sub = _flags(["--session", path.stem, "--project-dir", str(d)])
+            if curate.run(sub).exit_code != 0:
+                rc = 1
+    return rc
+
+
 def consolidate_all(argv: list[str] | None = None) -> int:
     """Nightly activation fold for the global soul corpus + every registered
     project: bump note stability from the day's recall activations, sync indices,

@@ -67,6 +67,9 @@ REPO = Path(os.environ.get("RECALL_REPO") or Path(__file__).resolve().parents[2]
 DATA_ROOT = Path(os.environ.get("RECALL_DATA_ROOT",
                                 os.path.expanduser("~/.local/share/recall")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
+# The recall CLI used to curate an ended session in the background (brick 2).
+# Default: the console script beside this interpreter (the bridge's own venv).
+RECALL_BIN = os.environ.get("RECALL_BIN") or str(Path(sys.executable).with_name("recall"))
 IDLE_SECS = int(os.environ.get("RECALL_AGENT_IDLE_SECS", "1800"))
 
 
@@ -363,6 +366,46 @@ def _load_session() -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Per-session curation trigger (brick 2) — curate an ended session in the
+# background so memory is fresh the same day, without blocking the user.
+# ---------------------------------------------------------------------------
+
+def _session_curation_cmd(sid: str) -> list[str]:
+    """Argv that curates ONE ended session into its project corpus + the soul,
+    reusing the recall CLI from the bridge's own venv against AGENT_CWD. Pure, so
+    it can be unit-tested without spawning anything."""
+    return [RECALL_BIN, "curate", "--session", sid,
+            "--project-dir", str(AGENT_CWD), "--commit"]
+
+
+async def _reap_curation(sid: str, proc) -> None:
+    try:
+        rc = await proc.wait()
+        log.info("session-curation for %s exited rc=%s", sid[:8], rc)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("session-curation reap error for %s: %s", sid[:8], exc)
+
+
+async def _fire_session_curation(sid: Optional[str]) -> None:
+    """Fire-and-forget: curate the just-ended session in the background so the
+    user is never blocked. Idempotent (the 'sessions' bucket) and re-swept nightly,
+    so a spawn failure — or the child being killed on a bridge restart — is
+    harmless: the session is simply picked up by the nightly safety-net sweep."""
+    if not sid:
+        return
+    cmd = _session_curation_cmd(sid)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+    except Exception as exc:  # noqa: BLE001 — never let curation break session teardown
+        log.warning("session-curation spawn failed for %s: %s", sid[:8], exc)
+        return
+    log.info("session-curation fired for %s (pid %s)", sid[:8], proc.pid)
+    asyncio.create_task(_reap_curation(sid, proc))
+
+
+# ---------------------------------------------------------------------------
 # Claude Agent SDK conversation manager
 # ---------------------------------------------------------------------------
 
@@ -632,11 +675,13 @@ async def handle_message(update: dict) -> None:
             await send("(nothing running)")
         return
     if _matches_cmd(text, "new") or _matches_cmd(text, "end"):
+        ending_sid = _session_id          # capture the ending session before we clear it
         _clear_pending()
         if _busy() and _turn_task is not None:
             _turn_task.cancel()
         await _disconnect_client()
         _save_session(None)
+        await _fire_session_curation(ending_sid)   # brick 2: curate it in the background
         await send("🆕 new conversation — context cleared. Go ahead."
                    if _matches_cmd(text, "new")
                    else "👋 conversation ended. Send anything to start a fresh one.")

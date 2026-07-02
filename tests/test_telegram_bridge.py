@@ -100,3 +100,14 @@ def test_build_options_pins_effort_and_model():
     o = bridge._build_options(None)
     assert o.effort == "max"
     assert o.model == "opus[1m]"
+
+
+@requires_sdk
+def test_session_curation_cmd_targets_the_ended_session():
+    # brick 2: /new and /end fire this argv to curate the ended session in the
+    # background — the recall CLI, --session <id>, scoped to AGENT_CWD, committing.
+    cmd = bridge._session_curation_cmd("sess-123")
+    assert cmd[0] == bridge.RECALL_BIN and cmd[1] == "curate"
+    assert "--session" in cmd and "sess-123" in cmd
+    assert "--project-dir" in cmd and str(bridge.AGENT_CWD) in cmd
+    assert "--commit" in cmd
