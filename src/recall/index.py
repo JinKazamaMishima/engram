@@ -41,9 +41,13 @@ DEFAULT_POOL = 50    # candidates pulled per arm before fusion
 # --- structural + temporal ranking knobs (env-overridable; per-call override too) ---
 # Wikilink 1-hop expansion pulls neighbors of the top-LINK_SEED fused hits in as
 # extra candidates at LINK_DECAY × the top score (so a linked note holding the
-# real answer can surface + be reranked). The recency+salience+retention blend
-# (Generative-Agents style) is OFF by default (weights 0) until the eval earns it.
-LINK_DECAY = _env_float("RECALL_LINK_DECAY", 0.30)
+# real answer can surface + be reranked). OFF by default (0.0): on a 42-case eval
+# it LOST recall — R@1 0.881→0.857, R@k 0.893→0.869, nDCG 0.847→0.822, MRR 0.897→0.865
+# — by over-promoting well-connected hub notes (independently confirmed on a second
+# corpus, where it demoted the correct top hit). PPR (below) is the successor to try.
+# The recency+salience+retention blend (Generative-Agents style) is likewise OFF
+# (weights 0) until the eval earns it.
+LINK_DECAY = _env_float("RECALL_LINK_DECAY", 0.0)
 LINK_SEED = int(_env_float("RECALL_LINK_SEED", 10))
 W_RECENCY = _env_float("RECALL_W_RECENCY", 0.0)
 W_SALIENCE = _env_float("RECALL_W_SALIENCE", 0.0)
