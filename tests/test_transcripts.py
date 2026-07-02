@@ -202,3 +202,55 @@ def test_session_date_is_last_activity(tmp_path):
 def test_session_date_none_when_no_human_turn(tmp_path):
     p = _jsonl(tmp_path, "s.jsonl", [_user("/clear")])   # noise only
     assert T.session_date(p, ET) is None
+
+
+# ---- drop recall's own headless skill runs (brick 2.5) -------------------
+
+def _skill_run(tmp_path, name):
+    """A `claude -p /<name>` headless transcript: command wrapper first, then the
+    injected skill prose as a user turn (which would otherwise survive denoising)."""
+    return _jsonl(tmp_path, f"{name}.jsonl", [
+        {"type": "user",
+         "message": {"role": "user",
+                     "content": f"<command-message>{name}</command-message>\n"
+                                f"<command-name>/{name}</command-name>"},
+         "timestamp": "2026-06-01T16:00:00Z"},
+        {"type": "user",   # skill expansion injected as a user turn — real text
+         "message": {"role": "user",
+                     "content": f"Base directory for this skill: /x/skills/{name}\n\n"
+                                "SKILL_PROSE_MARKER — you are the memory curator."},
+         "timestamp": "2026-06-01T16:00:05Z"},
+        _assistant([_text("Done. Curation complete.")], ts="2026-06-01T16:02:00Z"),
+    ])
+
+
+def test_iter_drops_headless_recall_skill_runs(tmp_path):
+    for name in ("curate-memory", "dream", "reconsolidate-memory"):
+        p = _skill_run(tmp_path, name)
+        assert list(T.iter_exchanges(p, None, ET)) == [], name   # whole session dropped
+        assert T.build_bundle([p], None, ET)[1].exchanges == 0, name
+        assert T.session_date(p, ET) is None, name
+
+
+def test_bundle_drops_skill_run_keeps_real(tmp_path):
+    skill = _skill_run(tmp_path, "curate-memory")
+    real = _jsonl(tmp_path, "real.jsonl",
+                  [_user("genuine question"), _assistant([_text("genuine answer")])])
+    text, stats = T.build_bundle([skill, real], None, ET)
+    assert stats.sessions == 1 and "genuine question" in text
+    assert "SKILL_PROSE_MARKER" not in text          # the skill's own prose is never mined
+
+
+def test_keeps_human_session_opening_with_other_slash_command(tmp_path):
+    # a human session that OPENS with some non-memory slash command must NOT be dropped
+    p = _jsonl(tmp_path, "s.jsonl", [
+        {"type": "user",
+         "message": {"role": "user",
+                     "content": "<command-message>code-review</command-message>\n"
+                                "<command-name>/code-review</command-name>"},
+         "timestamp": "2026-06-01T16:00:00Z"},
+        _user("actually let's discuss the auth bug", ts="2026-06-01T16:01:00Z"),
+        _assistant([_text("Sure — here's the issue.")], ts="2026-06-01T16:02:00Z"),
+    ])
+    texts = [e.text for e in T.iter_exchanges(p, None, ET)]
+    assert "actually let's discuss the auth bug" in texts   # kept, not over-dropped

@@ -39,6 +39,15 @@ _STRAY_TAG_RE = re.compile(
     r"command-name|command-message|command-args)>",
     re.IGNORECASE,
 )
+# A headless run of one of recall's OWN memory skills (`claude -p /curate-memory`,
+# `/dream`, `/reconsolidate-memory`) lands in the transcript dir with the harness
+# command wrapper as its first human turn, then injects the skill's prose as a
+# later user turn — which would otherwise survive denoising and get mined as if it
+# were a real conversation (the curator curating itself). The wrapper is the tell.
+_SKILL_RUN_RE = re.compile(
+    r"<command-name>\s*/?(curate-memory|dream|reconsolidate-memory)\b",
+    re.IGNORECASE,
+)
 
 
 def project_transcript_dir(repo_path: str | Path,
@@ -98,6 +107,30 @@ def _content_to_text(content) -> str:
     return ""
 
 
+def _is_recall_skill_run(raw_lines: list[str]) -> bool:
+    """True if this transcript is a headless run of one of recall's own memory
+    skills (``claude -p /curate-memory`` / ``/dream`` / ``/reconsolidate-memory``).
+    Such runs land in the project transcript dir and — because the skill prose is
+    injected as a later user turn — would otherwise survive denoising and be mined
+    as if they were a human conversation (self-curation). The tell is the harness
+    command wrapper on the FIRST human turn."""
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict) or ev.get("type") != "user":
+            continue
+        msg = ev.get("message")
+        if not isinstance(msg, dict):
+            continue
+        return bool(_SKILL_RUN_RE.search(_content_to_text(msg.get("content"))))
+    return False
+
+
 def _parse_ts(ev: dict) -> datetime | None:
     raw = ev.get("timestamp")
     if not raw:
@@ -120,6 +153,8 @@ def iter_exchanges(path: Path, target: date | None, tz: ZoneInfo = ET
     except OSError:
         return
     session_id = path.stem
+    if _is_recall_skill_run(raw_lines):
+        return  # headless run of recall's own memory skill — machinery, not gold
     for line in raw_lines:
         line = line.strip()
         if not line:
