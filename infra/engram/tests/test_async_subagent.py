@@ -26,6 +26,7 @@ from claude_agent_sdk import (  # noqa: E402
     TaskNotificationMessage,
     TaskProgressMessage,
     TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ToolUseBlock,
 )
@@ -44,6 +45,26 @@ def AM(text=None, *, tool=None, parent=None):
 def RESULT(sid="s"):
     return ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1,
                          is_error=False, num_turns=1, session_id=sid)
+
+
+def TSTART(tid, desc="job"):
+    return TaskStartedMessage(subtype="task_started", data={"subagent_type": "Explore"},
+                              task_id=tid, description=desc, uuid="u", session_id="s")
+
+
+def TUPD(tid, status):
+    """Inline lifecycle patch — the CLI emits status=completed here BEFORE the parent
+    ResultMessage (this is the ordering that used to stop _stream too early)."""
+    return TaskUpdatedMessage(subtype="task_updated", data={}, task_id=tid,
+                              patch={"status": status}, status=status,
+                              session_id="s", uuid="u")
+
+
+def TNOTIF(tid, status, summary):
+    """The async completion ping that re-invokes the model — arrives AFTER the parent result."""
+    return TaskNotificationMessage(subtype="task_notification", data={}, task_id=tid,
+                                   status=status, output_file="/x", summary=summary,
+                                   uuid="u", session_id="s")
 
 
 class FakeClient:
@@ -134,10 +155,69 @@ async def test_idle_detach():
     print("✓ a silent, still-running sub-agent is detached (turn doesn't hang)")
 
 
+async def test_real_ordering_inline_completion_before_parent_result():
+    """Regression for the 'agents finished but no reply' bug. The LIVE CLI ordering
+    (captured via probe): sub-agents run inline and emit a terminal TaskUpdatedMessage
+    BEFORE the parent ResultMessage; the async TaskNotificationMessage arrives AFTER it and
+    re-invokes the model to synthesise. _stream must NOT stop at the parent result — the
+    real answer lands in the notification-driven turn after it."""
+    A, B = "toolu_A", "toolu_B"
+    msgs = [
+        SystemMessage(subtype="init", data={"session_id": "s", "model": "opus[1m]"}),
+        AM("Launching two agents."),                             # top-level narration
+        AM(tool=(A, "Agent", {"subagent_type": "Explore", "description": "count py"})),
+        TSTART("tA", "count py"),                                # pending={tA}
+        AM(tool=(B, "Agent", {"subagent_type": "Explore", "description": "count md"})),
+        TSTART("tB", "count md"),                                # pending={tA,tB}
+        AM("AGENT_A_MONOLOGUE", parent=A),                       # sub-internal → skip
+        AM("AGENT_B_MONOLOGUE", parent=B),                       # sub-internal → skip
+        TUPD("tA", "completed"),                                 # inline — must NOT drain
+        TUPD("tB", "completed"),                                 # inline — must NOT drain
+        AM("Both launched; waiting on results."),               # parent narration
+        RESULT(),                       # parent result — pending STILL {tA,tB} → MUST CONTINUE
+        TNOTIF("tA", "completed", "Agent A finished"),          # async ping → drain tA, ✓
+        AM("Agent A is done."),                                 # re-invocation synthesis
+        RESULT(),                                               # pending {tB} → continue
+        TNOTIF("tB", "completed", "Agent B finished"),          # async ping → drain tB, ✓
+        AM("FINAL py=25 md=12"),                                # the real answer
+        RESULT(),                                               # pending {} → STOP here
+        AM("LEAKED past the true end"),
+    ]
+    body = texts(await collect(msgs))
+    assert "Launching two agents." in body, body
+    assert "Both launched; waiting on results." in body, body
+    assert "FINAL py=25 md=12" in body, "must render the answer that lands AFTER the parent result"
+    assert "Agent A is done." in body, body
+    assert body.count("✓") == 2, f"one completion mark per task; got {body.count('✓')}"
+    assert "AGENT_A_MONOLOGUE" not in body and "AGENT_B_MONOLOGUE" not in body, "skip monologue"
+    assert "LEAKED" not in body, "must stop at the final ResultMessage (pending empty)"
+    print("✓ real ordering: inline TaskUpdated doesn't stop the stream; post-result answer renders")
+
+
+async def test_failed_subagent_via_task_updated_ends_promptly():
+    """A sub-agent that fails/among terminal-but-not-completed via TaskUpdatedMessage (no
+    notification) must clear pending so the turn ends at the next result instead of idling
+    to the timeout."""
+    msgs = [
+        AM("Delegating."),
+        TSTART("tX", "risky job"),                              # pending={tX}
+        TUPD("tX", "failed"),                                   # terminal, non-completed → drain
+        AM("It failed; moving on."),
+        RESULT(),                                               # pending {} → stop
+        AM("LEAKED"),
+    ]
+    body = texts(await collect(msgs))
+    assert "It failed; moving on." in body and "✗" in body, body
+    assert "LEAKED" not in body, body
+    print("✓ failed delegation (TaskUpdated only) drains pending and ends at the next result")
+
+
 async def main() -> int:
     await test_subagent_capture()
     await test_normal_turn_stops_at_first_result()
     await test_idle_detach()
+    await test_real_ordering_inline_completion_before_parent_result()
+    await test_failed_subagent_via_task_updated_ends_promptly()
     print("\nALL PASS")
     return 0
 

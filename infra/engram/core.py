@@ -477,26 +477,34 @@ class AgentSDKDriver(ModelDriver):
     async def _stream(self, text: str) -> AsyncIterator[Event]:
         assert self._client is not None
         await self._client.query(text)
-        # We read the raw message stream (not receive_response) so we can keep going PAST
-        # the parent turn's ResultMessage while a background sub-agent is still running —
-        # the CLI's Agent tool is async (fire-and-forget) and its progress + completion
-        # arrive as Task* messages after that result (see SUBAGENT_IDLE_TIMEOUT). We stop
-        # on a ResultMessage that lands with NO sub-agent pending (a normal turn stops at
-        # the very first one — unchanged). `parent_tool_use_id` tells a sub-agent's OWN
-        # messages (skipped — surfaced as the Task* markers below) from top-level ones, so
-        # the reply shows the main agent's narration + its final synthesis, not the
-        # sub-agent's raw monologue.
+        # We read the RAW message stream (not receive_response) because a delegating turn
+        # spans MULTIPLE ResultMessages. The live CLI ordering (verified empirically) is:
+        #   tool-use(Agent) → TaskStarted → [sub-agent runs INLINE + TaskUpdated=completed]
+        #   → PARENT ResultMessage → TaskNotification → model re-invoked → synthesis → Result
+        # The real answer lands in the notification-driven turns AFTER the parent Result, so
+        # we must not stop there. `pending` therefore tracks tasks whose async NOTIFICATION
+        # hasn't arrived yet — NOT the earlier inline TaskUpdated=completed, which fires
+        # before the parent Result and (if we cleared on it) would stop the stream before the
+        # sub-agent's result comes back. We stop at the first Result with `pending` empty —
+        # the TRUE final one. A normal (no-delegation) turn keeps `pending` empty throughout
+        # and stops at its first Result, unchanged. `parent_tool_use_id` marks a sub-agent's
+        # OWN messages (skipped — surfaced as the Task* markers) vs. top-level narration.
         pending: set[str] = set()
         names: dict[str, str] = {}                       # task_id -> subagent_type
+        saw_task = False                                 # did this turn delegate at all?
         it = self._client.receive_messages().__aiter__()
         while True:
             try:
+                # Once we've delegated, NEVER block un-timed — a wedged sub-agent or a
+                # missing final Result must not hang the turn. A normal (no-task) turn
+                # still blocks for its single Result.
                 msg = await (asyncio.wait_for(it.__anext__(), SUBAGENT_IDLE_TIMEOUT)
-                             if pending else it.__anext__())
-            except asyncio.TimeoutError:                 # a pending sub-agent went silent
-                who = ", ".join(names.get(t, "sub-agent") for t in pending)
-                yield Event("text", f"\n\n> ⏳ *{who} still running — detached; "
-                                    f"its result wasn't captured this turn*\n\n")
+                             if (pending or saw_task) else it.__anext__())
+            except asyncio.TimeoutError:                 # silence after delegating
+                if pending:                              # a sub-agent never finished
+                    who = ", ".join(names.get(t, "sub-agent") for t in pending)
+                    yield Event("text", f"\n\n> ⏳ *{who} still running — detached; "
+                                        f"its result wasn't captured this turn*\n\n")
                 return
             except StopAsyncIteration:
                 return
@@ -513,6 +521,7 @@ class AgentSDKDriver(ModelDriver):
                 name = (getattr(msg, "data", {}) or {}).get("subagent_type") or "sub-agent"
                 names[msg.task_id] = name
                 pending.add(msg.task_id)
+                saw_task = True
                 yield Event("text", f"\n\n> 🛰 *delegated to **{name}** — {msg.description}*\n\n")
             elif isinstance(msg, TaskProgressMessage):
                 bits = f"🛰 {names.get(msg.task_id, 'sub-agent')}"
@@ -522,7 +531,11 @@ class AgentSDKDriver(ModelDriver):
                 if tot:
                     bits += f" · {tot:,} tok"
                 yield Event("status", bits)              # ephemeral — status line only
-            elif isinstance(msg, (TaskNotificationMessage, TaskUpdatedMessage)):
+            elif isinstance(msg, TaskNotificationMessage):
+                # The async completion ping — the signal that this sub-agent's result has
+                # been folded back in (it re-invokes the model). Clear `pending` HERE, not
+                # on the earlier inline TaskUpdated, so the stream keeps reading past the
+                # parent Result until every delegated result has actually landed.
                 status = getattr(msg, "status", None)
                 if status in TERMINAL_TASK_STATUSES and msg.task_id in pending:
                     pending.discard(msg.task_id)
@@ -530,6 +543,19 @@ class AgentSDKDriver(ModelDriver):
                     summ = getattr(msg, "summary", None) or f"{name} {status}"
                     mark = "✓" if status == "completed" else "✗"
                     yield Event("text", f"\n\n> {mark} *{summ}*\n\n")
+            elif isinstance(msg, TaskUpdatedMessage):
+                # Inline lifecycle patch. A terminal "completed" here fires BEFORE the parent
+                # Result and BEFORE the notification-driven re-invocation, so we must NOT
+                # clear `pending` on it (doing so was the bug: the turn stopped before the
+                # answer came back). We DO clear on a non-completed terminal state (failed /
+                # killed / stopped) — a dead-end with no re-invocation to wait for — so a
+                # failed delegation ends promptly instead of idling out to the timeout.
+                status = getattr(msg, "status", None)
+                if (status in TERMINAL_TASK_STATUSES and status != "completed"
+                        and msg.task_id in pending):
+                    pending.discard(msg.task_id)
+                    name = names.get(msg.task_id, "sub-agent")
+                    yield Event("text", f"\n\n> ✗ *{name} {status}*\n\n")
             elif isinstance(msg, SystemMessage):
                 data = getattr(msg, "data", {}) or {}
                 self.session_id = self.session_id or data.get("session_id")
@@ -538,7 +564,8 @@ class AgentSDKDriver(ModelDriver):
                 self.session_id = getattr(msg, "session_id", None) or self.session_id
                 self.actual_model = getattr(msg, "model", None) or self.actual_model
                 # Persist the (authoritative) session id so the next `engram` in this folder
-                # resumes here. Stop only when no sub-agent is still running.
+                # resumes here. Stop only once every delegated task has NOTIFIED (pending
+                # empty) — the true final Result, not the parent one mid-delegation.
                 if self._store and self.session_id:
                     self._store.save(self.cwd, self.session_id)
                 if not pending:
