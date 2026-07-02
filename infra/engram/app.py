@@ -44,8 +44,9 @@ from textual.widgets.option_list import Option  # noqa: E402
 SLASH_CMDS = [
     ("/new", "start a fresh thread"),
     ("/effort", "set reasoning effort  (low|medium|high|xhigh|max)"),
-    ("/model", "switch model  (e.g. opus[1m], sonnet)"),
+    ("/model", "switch model  (opus[1m] · sonnet · fable · haiku)"),
     ("/mode", "toggle plan ↔ regular  (or shift+tab)"),
+    ("/ultracode", "toggle multi-agent workflow orchestration"),
     ("/agent", "delegate to a sub-agent  (e.g. /agent Explore <task>)"),
     ("/context", "show context-window usage"),
     ("/status", "show session · model · effort"),
@@ -65,6 +66,31 @@ STATE_CMDS = ("/new", "/effort", "/model", "/paste", "/context")
 # Task tool). These mirror Claude Code's built-ins — confirm the exact names the CLI
 # exposes with /context's `agents` list, and adjust here if they differ.
 SUBAGENTS = ("Explore", "Plan", "general-purpose")
+
+# Models offered in the /model dropdown. Free-form still works — set_model passes any
+# string straight to the CLI; this is discoverability only. Aliases the CLI accepts;
+# opus[1m] = the 1M-context window. (name, one-line description) like SLASH_CMDS.
+MODELS = (
+    ("opus[1m]", "Opus 4.8 · 1M context (default)"),
+    ("opus",     "Opus 4.8 · 200K"),
+    ("sonnet",   "Sonnet 4.6"),
+    ("fable",    "Fable 5"),
+    ("haiku",    "Haiku 4.5 · fastest"),
+)
+
+# Injected each typed turn while /ultracode is on — mirrors Claude Code's standing
+# "ultracode" opt-in so the CLI's Workflow tool treats multi-agent orchestration as the
+# default for substantive work. Prepended to the turn like the identity marker.
+ULTRACODE_REMINDER = (
+    "<system-reminder>\n"
+    "Ultracode is on for the session — multi-agent Workflow orchestration is a standing "
+    "opt-in. For every substantive task, prefer authoring and running a Workflow "
+    "(decompose → fan out in parallel → adversarially verify → synthesize) over solving "
+    "inline; go solo only for trivial or conversational turns. Favor the most thorough, "
+    "correct result; token cost is not the constraint. Stays on until the user runs "
+    "/ultracode off.\n"
+    "</system-reminder>\n\n"
+)
 
 # Sticky-header palette (Rich-markup hex, matching ENGRAM_THEME — Static markup can't
 # see Textual's $accent vars). The logo is a pixel gem (half-block "pixels") — the
@@ -236,6 +262,7 @@ class EngramApp(App):
         self._menu_open = False          # slash-command dropdown visible?
         self._queue: list[tuple[str, list]] = []   # type-ahead: msgs typed while busy
         self._pending_mode: str | None = None      # plan/regular armed via shift+tab mid-reply
+        self._ultracode = False                     # /ultracode: standing workflow-orchestration opt-in
         self._perception = None                     # PerceptionBridge (opt-in: ENGRAM_PERCEIVE=1)
 
     def compose(self) -> ComposeResult:
@@ -291,9 +318,10 @@ class EngramApp(App):
         model = getattr(self.driver, "model", "?")
         effort = getattr(self.driver, "effort", "")
         mode = " · ⏸ plan" if self._effective_mode() == PLAN_MODE else ""
+        ultra = " · ⚡ ultracode" if self._ultracode else ""
         tail = " · subscription" if _STRIPPED_API_KEY else ""
         base = f"{model} · {effort}" if effort else f"{model}"
-        return f"{base}{mode}{tail}"
+        return f"{base}{mode}{ultra}{tail}"
 
     def _render_header(self) -> None:
         try:                                     # a twinkle tick can race mount/teardown
@@ -497,7 +525,14 @@ class EngramApp(App):
             partial = m.group(1).lower()
             return [(f"/agent {name} ", f"/agent {name}")
                     for name in SUBAGENTS if name.lower().startswith(partial)]
-        # Any other "/cmd <arg>" (e.g. /model foo, or free text) — stop suggesting.
+        # /model <name> — offer the known models, filtered by what's typed. Free-form still
+        # works: an unmatched string just submits and is passed straight to the CLI.
+        m = re.match(r"^/model\s+(\S*)$", text)
+        if m:
+            partial = m.group(1).lower()
+            return [(f"/model {name}", f"/model {name}   {desc}")
+                    for name, desc in MODELS if name.lower().startswith(partial)]
+        # Any other "/cmd <arg>" (free text after a non-completing command) — stop.
         if re.match(r"^/\S+\s", text):
             return []
         # Typing a command name — filter the command list by prefix.
@@ -550,7 +585,7 @@ class EngramApp(App):
             prompt.load_text(value + " ")
             prompt.move_cursor(prompt.document.end)
             prompt.focus()
-            self._refresh_menu(prompt.text)        # /effort,/agent → show options; /model → hide
+            self._refresh_menu(prompt.text)        # /effort,/agent,/model → show options
             return
         # Selected a sub-agent NAME ("/agent Explore ") — complete it and wait for the
         # task; never submit a task-less /agent.
@@ -662,6 +697,12 @@ class EngramApp(App):
                 f"irreversible or private actions on unverified identity alone. No need to "
                 f"acknowledge this line.\n\n")
 
+    def _ultracode_marker(self) -> str:
+        """The standing ultracode opt-in, prepended to a typed turn while /ultracode is on
+        (empty otherwise). Model-only, like the identity marker; typed turns only (camera/
+        perceived turns skip it)."""
+        return ULTRACODE_REMINDER if self._ultracode else ""
+
     def _identity_marker(self) -> str:
         """Gather the live snapshot and build the marker; '' when perception is off, so
         normal launches (ENGRAM_PERCEIVE unset) and the Telegram bridge (no camera, single
@@ -702,6 +743,24 @@ class EngramApp(App):
                 await self._set_mode(REGULAR_MODE)
             else:
                 self._status("usage: /mode [plan|regular]   (bare /mode toggles)")
+            return
+        # /ultracode — standing opt-in to multi-agent workflow orchestration. Safe mid-reply
+        # (only flips a flag + re-renders; governs the NEXT turn's prompt), so it sits with
+        # the other always-safe toggles, not in STATE_CMDS.
+        if text == "/ultracode" or text.startswith("/ultracode "):
+            arg = text[len("/ultracode"):].strip().lower()
+            if arg in ("", "toggle"):
+                self._ultracode = not self._ultracode
+            elif arg in ("on", "yes", "1"):
+                self._ultracode = True
+            elif arg in ("off", "no", "0"):
+                self._ultracode = False
+            else:
+                self._status("usage: /ultracode [on|off]   (bare /ultracode toggles)")
+                return
+            self._render_header()
+            self._status("ultracode ⚡ on — Engram orchestrates substantive work with workflows"
+                         if self._ultracode else "ultracode off")
             return
         # State-changing slash commands can't run while a turn is in flight (they'd
         # disrupt the warm client) — block them, don't queue; otherwise dispatch.
@@ -815,9 +874,10 @@ class EngramApp(App):
         else:
             prompt = shown = text
         await self._add(UserMsg(f"❯ {escape(shown)}"))
-        # Prepend the live face-ID verdict so Engram knows WHO is at the keyboard on every
-        # typed turn (empty unless ENGRAM_PERCEIVE is on). Goes to the model only, not `shown`.
-        self._run_turn(self._identity_marker() + prompt)
+        # Prepend the standing-ultracode reminder (if /ultracode on) + the live face-ID
+        # verdict (if ENGRAM_PERCEIVE on) so Engram knows the mode and WHO is at the keyboard
+        # on every typed turn. Both go to the model only, not `shown`.
+        self._run_turn(self._ultracode_marker() + self._identity_marker() + prompt)
 
     def _render_queue(self) -> None:
         """The pending type-ahead strip above the prompt — previews of queued msgs."""
