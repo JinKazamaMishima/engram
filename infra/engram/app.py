@@ -25,9 +25,11 @@ from attach import grab_clipboard_image, is_image, parse_dropped_paths  # noqa: 
 from core import (  # noqa: E402
     _STRIPPED_API_KEY,
     EFFORT_LEVELS,
+    ENGRAM_CWD,
     PLAN_MODE,
     REGULAR_MODE,
     AgentSDKDriver,
+    LaunchLock,
     ModelDriver,
     render_context_md,
 )
@@ -39,6 +41,13 @@ from textual.message import Message  # noqa: E402
 from textual.theme import Theme  # noqa: E402
 from textual.widgets import Footer, Markdown, OptionList, Static, TextArea  # noqa: E402
 from textual.widgets.option_list import Option  # noqa: E402
+
+# On reattach, replay the tail of the resumed conversation so a fresh TUI isn't blank —
+# you can SEE where you left off (the tmux-like bit). Trailing logical turns (adjacent
+# same-role fragments collapsed into one round), each truncated for a compact recap.
+# OPT-IN via ENGRAM_RESUME_RECAP=1 (it surfaces prior prose from the local transcript).
+RESUME_RECAP_TURNS = 6
+RESUME_RECAP_CHARS = 400
 
 # Slash commands, each (name, one-line help) — the source for the homegrown
 # dropdown (type "/" → ↑/↓-navigable menu, like Claude Code).
@@ -305,8 +314,10 @@ class EngramApp(App):
         prompt.border_title = "message"
         await self._add(Static("✦ Engram — " + random.choice(ENGRAM_EPIGRAPHS), id="welcome"))
         prompt.focus()
-        # If the driver resumed a saved session for this folder, say so.
+        # If the driver resumed a saved session for this folder, replay its tail so the
+        # screen isn't blank on reattach, then say so.
         if getattr(self.driver, "resumed", False):
+            await self._render_resumed_history()
             await self._add(Static("[dim]· · ·  resumed your last conversation here "
                                    "— /new for a fresh thread  · · ·[/dim]"))
             self._status("resumed last session  ·  /new for fresh")
@@ -314,6 +325,57 @@ class EngramApp(App):
             self._status("ready")
         if os.environ.get("ENGRAM_PERCEIVE"):
             self._start_perception()
+
+    async def _render_resumed_history(self) -> None:
+        """Replay the last few turns of a resumed session so reattaching to a fresh TUI
+        shows where you left off (otherwise the screen is blank but for the 'resumed'
+        note — the thing that makes a dropped-VPN reconnect feel like tmux). Reads Claude
+        Code's own session transcript for this cwd through recall's denoiser. Best-effort:
+        any failure — recall not importable, transcript missing or not yet flushed —
+        silently skips the recap; it must never block the home from opening.
+
+        OFF by default: it renders prior conversation prose (from the local transcript), so
+        it's opt-in via ``ENGRAM_RESUME_RECAP=1``. The plain 'resumed last session' note
+        still shows either way — only the prose recap is gated."""
+        if not os.environ.get("ENGRAM_RESUME_RECAP"):
+            return
+        sid = getattr(self.driver, "session_id", None)
+        cwd = getattr(self.driver, "cwd", None)
+        if not sid or not cwd:
+            return
+        try:
+            from recall.transcripts import (
+                iter_exchanges,
+                project_transcript_dir,
+                session_transcript_path,
+            )
+            path = session_transcript_path(project_transcript_dir(cwd), sid)
+            if not path.exists():
+                return
+            exchanges = list(iter_exchanges(path, None))
+        except Exception:  # noqa: BLE001 — the recap is a nicety, never a blocker
+            return
+        if not exchanges:
+            return
+        # One logical turn can span several same-role events (assistant text split by tool
+        # calls); collapse adjacent same-role fragments so the recap reads as real rounds
+        # (a user prompt + its reply) rather than a wall of one turn's fragments.
+        merged: list[list] = []
+        for ex in exchanges:
+            if merged and merged[-1][0] == ex.role:
+                merged[-1][1] += " " + ex.text
+            else:
+                merged.append([ex.role, ex.text])
+        await self._add(Static("[dim]──  earlier in this thread  "
+                               "──────────────────────[/dim]"))
+        for role, text in merged[-RESUME_RECAP_TURNS:]:
+            body = " ".join(text.split())
+            if len(body) > RESUME_RECAP_CHARS:
+                body = body[:RESUME_RECAP_CHARS].rstrip() + "…"
+            prefix = "❯ " if role == "user" else ""
+            await self._add(Static(f"[dim]{prefix}{escape(body)}[/dim]"))
+        await self._add(Static("[dim]──  now  "
+                               "───────────────────────────────────[/dim]"))
 
     # ---- command palette ----
     def get_system_commands(self, screen):
@@ -1121,7 +1183,22 @@ class EngramApp(App):
 
 
 def main() -> int:
-    EngramApp().run()
+    # One Engram per folder: refuse to start a second LIVE instance in the same cwd — both
+    # would resume + write the same session id and interleave into one corrupt thread. A
+    # stale lock from a crashed run is auto-reclaimed, so this only bites a genuine
+    # double-launch; any lock IO error fails open (the launch proceeds).
+    lock = LaunchLock(ENGRAM_CWD)
+    owner = lock.acquire()
+    if owner is not None:
+        sys.stderr.write(
+            f"\nEngram is already running in this folder (pid {owner}).\n"
+            f"Use that terminal, or close it first.\n"
+            f"If you're sure it's gone, remove the stale lock:  rm {lock.path}\n\n")
+        return 1
+    try:
+        EngramApp().run()
+    finally:
+        lock.release()
     return 0
 
 

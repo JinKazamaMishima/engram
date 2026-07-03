@@ -71,6 +71,9 @@ ENGRAM_CWD = Path(os.environ.get("ENGRAM_CWD") or Path.cwd())
 DATA_ROOT = Path(os.environ.get("RECALL_DATA_ROOT",
                                 os.path.expanduser("~/.local/share/recall")))
 SESSION_DIR = Path(os.environ.get("ENGRAM_SESSION_DIR", str(DATA_ROOT / "engram" / "sessions")))
+# Per-launch-directory advisory lock (one file per cwd) so two `engram` in the SAME folder
+# don't both resume + drive one session id and interleave their turns into a corrupt thread.
+LOCK_DIR = Path(os.environ.get("ENGRAM_LOCK_DIR", str(DATA_ROOT / "engram" / "locks")))
 
 # Reasoning effort levels, low→high, matching Claude Code's /effort.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
@@ -312,6 +315,81 @@ class SessionStore:
             pass  # persistence is best-effort; a fresh thread is an acceptable fallback
 
 
+def _pid_is_live_engram(pid: int) -> bool:
+    """True if ``pid`` is a running process that looks like an Engram launcher. Liveness via
+    ``kill(pid, 0)``; on Linux we then confirm it's actually an engram via ``/proc/<pid>/cmdline``
+    to shrug off pid-reuse (a crashed engram's pid recycled by an unrelated process). No procfs
+    (non-Linux) falls back to trusting the liveness probe. Errs toward NOT-live, so a stale
+    lock never wedges a folder shut."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False                      # no such process → stale lock
+    except PermissionError:
+        return True                       # alive, just not ours → still a live holder
+    except OSError:
+        return False
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return True                       # no procfs (non-Linux) → trust kill(0)
+    return b"engram" in raw.lower()       # our launcher's path/name contains "engram"
+
+
+class LaunchLock:
+    """A per-launch-directory advisory lock: one file per cwd holding the owner pid, so two
+    ``engram`` processes don't drive the SAME resumable session from one folder — which would
+    interleave both clients' turns into a single thread and corrupt it. A stale file (dead
+    pid, or a pid that is no longer an engram) is reclaimed, so a crash — SIGHUP on a dropped
+    SSH — never permanently locks a folder out. Advisory, not a hard mutex: any IO failure
+    fails OPEN (the launch proceeds), because guarding the session is a nicety, never a
+    reason to keep the user out of their own terminal."""
+
+    def __init__(self, cwd: Path, root: Path = LOCK_DIR) -> None:
+        self.cwd = Path(cwd).resolve()
+        self.root = root
+        safe = re.sub(r"[^A-Za-z0-9._-]", "-", str(self.cwd))
+        self.path = root / (safe or "root")
+        self._held = False
+
+    def _live_owner(self) -> Optional[int]:
+        """The pid of a LIVE engram already holding this folder, or None (free / stale)."""
+        try:
+            pid = int(self.path.read_text().strip())
+        except (OSError, ValueError):
+            return None
+        if pid <= 0 or not _pid_is_live_engram(pid):
+            return None
+        return pid
+
+    def acquire(self) -> Optional[int]:
+        """Take the lock. Returns None on success (folder was free, or its lock was stale
+        and reclaimed); returns the pid of the live holder if another engram already owns
+        this folder — the caller should refuse to start."""
+        owner = self._live_owner()
+        if owner is not None and owner != os.getpid():
+            return owner
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(str(os.getpid()))
+            self._held = True
+        except OSError:
+            pass                          # fail open — never block a launch on lock IO
+        return None
+
+    def release(self) -> None:
+        """Drop the lock, but only if we still own the file (don't clobber a process that
+        already reclaimed it as stale)."""
+        if not self._held:
+            return
+        try:
+            if self.path.read_text().strip() == str(os.getpid()):
+                self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._held = False
+
+
 # Sentinel so callers can pass ``store=None`` to disable persistence (e.g. tests),
 # while the default constructs a real per-cwd store.
 _DEFAULT_STORE = object()
@@ -522,11 +600,19 @@ class AgentSDKDriver(ModelDriver):
             async for ev in self._stream(text):
                 yield ev
         except Exception:
-            # A stale resume is the common failure: drop it, reconnect fresh, retry.
+            # A stale resume is the common failure: drop the dead pointer, reconnect
+            # fresh, and TELL the front-end — silently swapping in a fresh thread while
+            # the UI still says "resumed your last conversation" was the gap (the Telegram
+            # bridge surfaces this; the TUI didn't).
             if self.session_id is not None:
                 self.session_id = None
+                self.resumed = False
+                if self._store:
+                    self._store.save(self.cwd, None)   # clear the pointer to a dead session
                 await self.disconnect()
                 await self.connect()
+                yield Event("text", "\n\n> ⚠ *couldn't resume the previous thread "
+                                    "— started a fresh one*\n\n")
                 async for ev in self._stream(text):
                     yield ev
             else:
@@ -594,6 +680,12 @@ class AgentSDKDriver(ModelDriver):
                 data = getattr(msg, "data", {}) or {}
                 self.session_id = self.session_id or data.get("session_id")
                 self.actual_model = data.get("model") or self.actual_model
+                # Flush the id the INSTANT the session exists — not only at the closing
+                # ResultMessage below. A turn cut off before its Result (VPN drop / SIGHUP)
+                # would otherwise orphan a live server-side session; this matters most for
+                # the FIRST turn in a fresh folder, when nothing is on disk yet to resume.
+                if self._store and self.session_id:
+                    self._store.save(self.cwd, self.session_id)
             elif isinstance(msg, ResultMessage):
                 self.session_id = getattr(msg, "session_id", None) or self.session_id
                 self.actual_model = getattr(msg, "model", None) or self.actual_model

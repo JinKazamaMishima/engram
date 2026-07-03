@@ -17,7 +17,13 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from core import _STRIPPED_API_KEY, AgentSDKDriver, render_context_md  # noqa: E402
+from core import (  # noqa: E402
+    _STRIPPED_API_KEY,
+    ENGRAM_CWD,
+    AgentSDKDriver,
+    LaunchLock,
+    render_context_md,
+)
 from rich.console import Console  # noqa: E402
 from rich.markdown import Markdown  # noqa: E402
 
@@ -132,8 +138,21 @@ def main() -> int:
         kw["effort"] = args.effort
     driver = AgentSDKDriver(**kw)
     if args.once:
-        return asyncio.run(once(driver, args.once))
-    return asyncio.run(interactive(driver))
+        return asyncio.run(once(driver, args.once))   # transient tooling — no folder lock
+    # Interactive REPL: share app.py's per-folder lock so `engram --simple` and `engram`
+    # can't drive the same session from one folder and interleave into one thread.
+    lock = LaunchLock(ENGRAM_CWD)
+    owner = lock.acquire()
+    if owner is not None:
+        sys.stderr.write(
+            f"\nEngram is already running in this folder (pid {owner}).\n"
+            f"Use that terminal, or close it first.\n"
+            f"If you're sure it's gone, remove the stale lock:  rm {lock.path}\n\n")
+        return 1
+    try:
+        return asyncio.run(interactive(driver))
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
