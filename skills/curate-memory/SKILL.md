@@ -74,8 +74,13 @@ claim. Edit the note to (1) state the corrected belief up top, (2) keep the prio
 claim as a dated line — `Previously (until <RECALL_CURATE_DATE>): <old claim>` —
 so the history survives, (3) bump `last_updated`, append today to `sources`. If a
 note is *wholly replaced* by a different note, set `superseded: true` and
-`superseded_by: <new-slug>` in its frontmatter rather than deleting it. Keep this
-light — most updates just deepen a note, they don't contradict it.
+`superseded_by: <new-slug>` in its frontmatter rather than deleting it, **and
+stamp `valid_to: <YYYY-MM-DD>`** on it — the date the fact stopped being true
+(the reversal date if the bundle names one, else `RECALL_CURATE_DATE`). A
+superseded note without `valid_to` still injects as if current; with it, recall
+labels it `⏳ HISTORICAL`. (The wrapper backstops a missed stamp with the filing
+date, but your date is better.) Keep this light — most updates just deepen a
+note, they don't contradict it.
 
 **`kind: identity` and `kind: achievement` notes are the permanent soul core**
 (born with `importance: 1.0`, exempt from decay). Treat them as edit-resistant:
@@ -99,6 +104,12 @@ last_updated: <YYYY-MM-DD>         # = RECALL_CURATE_DATE
 sources: [<YYYY-MM-DD>, ...]       # dates that contributed; append on updates
 # superseded: false                # optional; set true when a newer note replaces this one
 # superseded_by: <slug>            # optional companion to superseded
+# valid_from: <YYYY-MM-DD>         # optional; when the FACT became true (default: first_seen)
+# valid_to: <YYYY-MM-DD>           # REQUIRED with superseded_by — when the fact STOPPED being
+#                                  #   true; leave absent while it still holds
+# confidence: <0..1>               # optional; certainty of the CURRENT truth-value (distinct
+#                                  #   from novelty). ~0.3 on a provisional pass; raise toward
+#                                  #   1.0 when later bundles corroborate. Omit = asserted.
 # stability / last_used / uses / surprise / importance  ← WRAPPER-MANAGED (dynamic
 #   memory): NEVER write or edit these. The wrapper sets a new note's birth
 #   stability, and `recall consolidate` reinforces it from real recall activity.
@@ -124,6 +135,23 @@ Example:
 When the bundle **deepens or corrects** an existing note: Read it, Edit in place
 (extend/correct the body, bump `last_updated`, append today to `sources`). Don't
 blindly overwrite history or rewrite unrelated notes.
+
+### Provisional / incremental passes (live eviction)
+
+The bundle may open with `> PROVISIONAL PASS` and/or be an **incremental tail**
+— only a conversation's newest turns, curated mid-session while it is still
+unfolding (the head was curated by an earlier pass). Then:
+
+- Decisions and plans in a still-open conversation can reverse within hours.
+  Write such volatile facts with `confidence: 0.3`; durable mechanics (a bug's
+  root cause, a shipped fix, a lesson) may still be asserted plainly.
+- Prefer **raising an existing provisional note's `confidence`** (0.3 → 0.7+)
+  when the tail corroborates it, over minting a near-duplicate.
+- A tail that *reverses* an earlier provisional note: supersede it (with the
+  `valid_to` stamp) — that is the system learning a decision flipped, working
+  as designed.
+- Leave `valid_to` empty on anything still true; never mark a whole
+  conversation "done" in your notes — later tails may follow.
 
 ## 5. Write the manifest
 

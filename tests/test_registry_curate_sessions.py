@@ -52,3 +52,16 @@ def test_sweep_no_projects_is_clean(monkeypatch):
 def test_sweep_bad_date_returns_1(monkeypatch):
     monkeypatch.setattr(registry, "list_projects", lambda: [Path("/x/p")])
     assert registry.curate_sessions_all(["--date", "nope"]) == 1
+
+
+def test_sweep_forwards_incremental(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr("recall.curate.run",
+                        lambda argv: (calls.append(list(argv)) or _Out()))
+    monkeypatch.setattr(registry, "list_projects", lambda: [Path("/x/p")])
+    monkeypatch.setattr("recall.transcripts.project_transcript_dir", lambda d: Path("/t"))
+    monkeypatch.setattr("recall.transcripts.discover_transcripts",
+                        lambda tdir, target: [Path("/t/s.jsonl")])
+    assert registry.curate_sessions_all(
+        ["--date", "2026-06-01", "--incremental"]) == 0
+    assert calls and "--incremental" in calls[0]

@@ -131,8 +131,7 @@ def _is_recall_skill_run(raw_lines: list[str]) -> bool:
     return False
 
 
-def _parse_ts(ev: dict) -> datetime | None:
-    raw = ev.get("timestamp")
+def _parse_iso(raw) -> datetime | None:
     if not raw:
         return None
     try:
@@ -141,13 +140,32 @@ def _parse_ts(ev: dict) -> datetime | None:
         return None
 
 
-def iter_exchanges(path: Path, target: date | None, tz: ZoneInfo = ET
-                   ) -> Iterator[Exchange]:
+def _parse_ts(ev: dict) -> datetime | None:
+    return _parse_iso(ev.get("timestamp"))
+
+
+def _in_window(ts: datetime, since: datetime | None,
+               until: datetime | None) -> bool:
+    """The incremental-slice window: ``since < ts <= until``. ``since`` is the
+    watermark (strictly after — the watermarked exchange itself was already
+    curated); ``until`` is the cooled edge (inclusive — it IS the last row the
+    caller wants curated)."""
+    if since is not None and ts <= since:
+        return False
+    if until is not None and ts > until:
+        return False
+    return True
+
+
+def iter_exchanges(path: Path, target: date | None, tz: ZoneInfo = ET, *,
+                   since: datetime | None = None,
+                   until: datetime | None = None) -> Iterator[Exchange]:
     """Yield denoised user/assistant exchanges from one transcript. With a
     ``target`` date, keep only events on that day (in ``tz``); with
     ``target is None``, keep every properly-dated exchange — the whole session
-    end to end, for session-scoped curation. Malformed lines and events are
-    skipped defensively rather than raising."""
+    end to end, for session-scoped curation. ``since``/``until`` additionally
+    slice by timestamp (``since < ts <= until``) for incremental curation.
+    Malformed lines and events are skipped defensively rather than raising."""
     try:
         raw_lines = path.read_text(errors="replace").splitlines()
     except OSError:
@@ -171,6 +189,8 @@ def iter_exchanges(path: Path, target: date | None, tz: ZoneInfo = ET
             continue
         if target is not None and ts.astimezone(tz).date() != target:
             continue
+        if not _in_window(ts, since, until):
+            continue
         msg = ev.get("message")
         if not isinstance(msg, dict):
             continue
@@ -182,6 +202,77 @@ def iter_exchanges(path: Path, target: date | None, tz: ZoneInfo = ET
             continue
         yield Exchange(role=ev["type"], text=text,
                        session_id=session_id, ts=ts)
+
+
+def iter_buffer_exchanges(path: Path, *,
+                          since: datetime | None = None,
+                          until: datetime | None = None) -> Iterator[Exchange]:
+    """Yield denoised exchanges from an Engram LiveBuffer JSONL — the harness's
+    append-only tier-1 STM, rows ``{"convo_id","seq","ts","role","text"}``.
+    The buffer holds only real user/assistant prose (no tool spam, no headless
+    skill wrappers, so no ``_is_recall_skill_run`` drop), but the same noise
+    discipline applies. A third role, ``perception``, carries gate-verified
+    sensor events from the perceiving loop's own buffer (step-5 eviction) —
+    already corroboration-filtered at write time, so it passes like assistant
+    prose. Rows yield in ``(seq, ts)`` order; a partial line (a crash
+    mid-append) or garbled row is skipped, never fatal. ``since``/``until``
+    slice ``since < ts <= until`` — the incremental-eviction window."""
+    try:
+        raw_lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+    convo_id = path.stem
+    rows: list[tuple[int, datetime, str, str]] = []
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # torn tail write — tolerate, the next row is intact
+        if not isinstance(row, dict) or row.get("role") not in (
+                "user", "assistant", "perception"):
+            continue
+        ts = _parse_iso(row.get("ts"))
+        if ts is None or not _in_window(ts, since, until):
+            continue
+        text = _strip_noise(str(row.get("text") or ""))
+        if row["role"] == "user":
+            if _is_noise_only(text):
+                continue
+        elif not text:
+            continue
+        try:
+            seq = int(row.get("seq", 0))
+        except (TypeError, ValueError):
+            seq = 0
+        rows.append((seq, ts, row["role"], text))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    for seq, ts, role, text in rows:
+        yield Exchange(role=role, text=text, session_id=convo_id, ts=ts)
+
+
+def buffer_last_ts(path: Path, *, until: datetime | None = None
+                   ) -> datetime | None:
+    """Timestamp of the newest surviving buffer exchange (≤ ``until`` if given)
+    — what a successful incremental curation advances the watermark to."""
+    last: datetime | None = None
+    for ex in iter_buffer_exchanges(path, until=until):
+        if last is None or ex.ts > last:
+            last = ex.ts
+    return last
+
+
+def transcript_last_ts(path: Path, *, until: datetime | None = None
+                       ) -> datetime | None:
+    """``buffer_last_ts``'s Claude Code–transcript twin: the newest surviving
+    exchange ≤ ``until`` — the watermark value for incremental --session passes."""
+    last: datetime | None = None
+    for ex in iter_exchanges(path, None, until=until):
+        if last is None or ex.ts > last:
+            last = ex.ts
+    return last
 
 
 def discover_transcripts(transcript_dir: str | Path, target: date,
@@ -221,30 +312,20 @@ def session_date(path: Path, tz: ZoneInfo = ET) -> date | None:
     return last.astimezone(tz).date() if last is not None else None
 
 
-def build_bundle(paths: list[Path], target: date | None, tz: ZoneInfo = ET, *,
-                 max_chars_per_msg: int = 6000) -> tuple[str, BundleStats]:
-    """Group surviving exchanges by session, drop sessions with no genuine user
-    turn (headless skill runs), and render a readable markdown bundle. ``target``
-    scopes the exchanges by day; ``target is None`` keeps every dated exchange in
-    ``paths`` (used to curate a single session end to end).
-
-    Returns ``(bundle_text, stats)``; ``stats.exchanges == 0`` means there was
-    nothing worth curating."""
-    by_session: dict[str, list[Exchange]] = {}
-    order: list[str] = []
-    for p in paths:
-        for ex in iter_exchanges(p, target, tz):
-            if ex.session_id not in by_session:
-                by_session[ex.session_id] = []
-                order.append(ex.session_id)
-            by_session[ex.session_id].append(ex)
-
+def _render_bundle(by_session: dict[str, list[Exchange]], order: list[str],
+                   max_chars_per_msg: int) -> tuple[str, BundleStats]:
+    """The one canonical bundle renderer — every reader (Claude Code transcript,
+    Engram LiveBuffer) funnels through it so the curator sees identical markdown.
+    Drops sessions with no genuine user turn (headless runs → not gold)."""
     chunks: list[str] = []
     n_sessions = n_exchanges = 0
     for sid in order:
         exchanges = sorted(by_session[sid], key=lambda e: e.ts)
-        if not any(e.role == "user" for e in exchanges):
-            continue  # automated/headless run, no human prompt -> not gold
+        # Genuine signal = a human prompt OR gate-verified perception rows
+        # (real-world events). A session with neither is an automated/headless
+        # run -> not gold.
+        if not any(e.role in ("user", "perception") for e in exchanges):
+            continue
         n_sessions += 1
         chunks.append(f"## Session {sid[:8]} — {len(exchanges)} turns")
         for e in exchanges:
@@ -252,10 +333,46 @@ def build_bundle(paths: list[Path], target: date | None, tz: ZoneInfo = ET, *,
             body = e.text
             if len(body) > max_chars_per_msg:
                 body = body[:max_chars_per_msg].rstrip() + "\n…[truncated]"
-            chunks.append(
-                f"\n### {'USER' if e.role == 'user' else 'ASSISTANT'}\n{body}")
+            chunks.append(f"\n### {e.role.upper()}\n{body}")
         chunks.append("")
 
     text = ("\n".join(chunks).strip() + "\n") if chunks else ""
     return text, BundleStats(sessions=n_sessions, exchanges=n_exchanges,
                              chars=len(text))
+
+
+def build_bundle(paths: list[Path], target: date | None, tz: ZoneInfo = ET, *,
+                 max_chars_per_msg: int = 6000,
+                 since: datetime | None = None,
+                 until: datetime | None = None) -> tuple[str, BundleStats]:
+    """Group surviving exchanges by session, drop sessions with no genuine user
+    turn (headless skill runs), and render a readable markdown bundle. ``target``
+    scopes the exchanges by day; ``target is None`` keeps every dated exchange in
+    ``paths`` (used to curate a single session end to end); ``since``/``until``
+    slice by timestamp for incremental curation.
+
+    Returns ``(bundle_text, stats)``; ``stats.exchanges == 0`` means there was
+    nothing worth curating."""
+    by_session: dict[str, list[Exchange]] = {}
+    order: list[str] = []
+    for p in paths:
+        for ex in iter_exchanges(p, target, tz, since=since, until=until):
+            if ex.session_id not in by_session:
+                by_session[ex.session_id] = []
+                order.append(ex.session_id)
+            by_session[ex.session_id].append(ex)
+    return _render_bundle(by_session, order, max_chars_per_msg)
+
+
+def build_buffer_bundle(path: Path, *, max_chars_per_msg: int = 6000,
+                        since: datetime | None = None,
+                        until: datetime | None = None
+                        ) -> tuple[str, BundleStats]:
+    """Render a bundle from ONE Engram LiveBuffer file — same markdown the curator
+    already reads (shared ``_render_bundle``). ``since``/``until`` carve the
+    incremental-eviction window; ``stats.exchanges == 0`` means no new tail."""
+    exchanges = list(iter_buffer_exchanges(path, since=since, until=until))
+    if not exchanges:
+        return "", BundleStats(sessions=0, exchanges=0, chars=0)
+    return _render_bundle({path.stem: exchanges}, [path.stem],
+                          max_chars_per_msg)

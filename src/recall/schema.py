@@ -159,7 +159,15 @@ class KnowledgeNote:
     ``last_updated`` which is the last *content* edit), ``uses`` (cumulative
     activation count), ``surprise`` (novelty σ∈[0,1] at encoding), ``importance``
     (EWC edit-resistance anchor for identity notes). A note without any of them
-    parses and ranks exactly as before."""
+    parses and ranks exactly as before.
+
+    Temporal-validity fields (all optional, Brick 3): ``valid_from`` (ISO date
+    the fact became true; empty ≡ ``first_seen``), ``valid_to`` (ISO date it
+    stopped being true; empty ≡ still true — a set ``valid_to`` renders as
+    HISTORICAL at injection, it never changes ranking), ``confidence``
+    (certainty ∈[0,1] of the *current* truth-value — distinct from ``surprise``
+    which is novelty at encoding; provisional mid-session facts land ~0.3 and
+    are raised or superseded by later passes)."""
 
     slug: str
     description: str
@@ -176,6 +184,9 @@ class KnowledgeNote:
     uses: int = 0
     surprise: float = -1.0   # -1 == unset (distinct from a real σ of 0.0)
     importance: float = 0.0
+    valid_from: str = ""
+    valid_to: str = ""
+    confidence: float = -1.0   # -1 == unset (never asserted, vs a real 0.0)
 
     @staticmethod
     def parse(text: str, *, expect_slug: str | None = None) -> "KnowledgeNote":
@@ -197,6 +208,17 @@ class KnowledgeNote:
         if superseded_by and not SLUG_RE.match(superseded_by):
             raise CurationSchemaError(
                 f"note {name}: superseded_by {superseded_by!r} is not kebab-case")
+        valid_from = str(fm.get("valid_from") or "").strip()
+        valid_to = str(fm.get("valid_to") or "").strip()
+        if valid_from and valid_to and valid_to < valid_from:
+            # ISO dates compare lexicographically; a window that ends before it
+            # starts is curator error, not a representable state.
+            raise CurationSchemaError(
+                f"note {name}: valid_to {valid_to!r} predates "
+                f"valid_from {valid_from!r}")
+        confidence = _as_float(fm.get("confidence"), -1.0)
+        # Negative ≡ unset sentinel; anything else clamps into [0, 1].
+        confidence = -1.0 if confidence < 0 else min(confidence, 1.0)
         return KnowledgeNote(
             slug=name, description=description, body=body.strip(),
             tags=_str_tuple(fm.get("tags")),
@@ -211,6 +233,9 @@ class KnowledgeNote:
             uses=_as_int(fm.get("uses"), 0),
             surprise=_as_float(fm.get("surprise"), -1.0),
             importance=_as_float(fm.get("importance"), 0.0),
+            valid_from=valid_from,
+            valid_to=valid_to,
+            confidence=confidence,
         )
 
 

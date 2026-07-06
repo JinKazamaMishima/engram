@@ -41,9 +41,9 @@ DEFAULT_POOL = 50    # candidates pulled per arm before fusion
 # --- structural + temporal ranking knobs (env-overridable; per-call override too) ---
 # Wikilink 1-hop expansion pulls neighbors of the top-LINK_SEED fused hits in as
 # extra candidates at LINK_DECAY × the top score (so a linked note holding the
-# real answer can surface + be reranked). OFF by default (0.0): on a 42-case eval
+# real answer can surface + be reranked). OFF by default (0.0): on the 42-case eval
 # it LOST recall — R@1 0.881→0.857, R@k 0.893→0.869, nDCG 0.847→0.822, MRR 0.897→0.865
-# — by over-promoting well-connected hub notes (independently confirmed on a second
+# — by over-promoting well-connected hub notes (independently confirmed in the soul
 # corpus, where it demoted the correct top hit). PPR (below) is the successor to try.
 # The recency+salience+retention blend (Generative-Agents style) is likewise OFF
 # (weights 0) until the eval earns it.
@@ -169,6 +169,15 @@ class Hit:
     corpus: str = ""   # provenance label set by the caller (e.g. "myproject", "global")
     kind: str = ""     # note kind (e.g. "identity"/"achievement"); "" for domain notes
     body: str = ""     # full note body — fed to the reranker (snippet is display-only)
+    valid_to: str = ""  # ISO date the fact STOPPED being true; "" = still true
+
+    @property
+    def historical(self) -> bool:
+        """True when this fact has an expired validity window — rendered as a
+        ⏳ HISTORICAL label at injection. NEVER a ranking input: a reversed
+        decision must still surface (so the model knows the history), just not
+        read as current."""
+        return bool(self.valid_to) and self.valid_to < date.today().isoformat()
 
 
 # ---- DB helpers ----------------------------------------------------------
@@ -191,7 +200,8 @@ def _create_schema(conn: sqlite3.Connection, dim: int) -> None:
             description TEXT NOT NULL, body TEXT NOT NULL,
             tags TEXT, sources TEXT, kind TEXT, sha TEXT NOT NULL,
             last_updated TEXT, sources_count INTEGER DEFAULT 0,
-            stability REAL DEFAULT 0, last_used TEXT, uses INTEGER DEFAULT 0)""")
+            stability REAL DEFAULT 0, last_used TEXT, uses INTEGER DEFAULT 0,
+            valid_to TEXT DEFAULT '')""")
     conn.execute("CREATE VIRTUAL TABLE notes_fts USING "
                  "fts5(slug UNINDEXED, description, body, tags)")
     conn.execute(f"CREATE VIRTUAL TABLE vec_notes USING "
@@ -258,12 +268,12 @@ def build_index(knowledge_dir: Path, db_path: Path,
                 tags = " ".join(note.tags)
                 conn.execute(
                     "INSERT INTO notes(id,slug,description,body,tags,sources,kind,"
-                    "sha,last_updated,sources_count,stability,last_used,uses) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "sha,last_updated,sources_count,stability,last_used,uses,"
+                    "valid_to) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (i, note.slug, note.description, note.body, tags,
                      " ".join(note.sources), note.kind, sha,
                      note.last_updated, len(note.sources),
-                     note.stability, note.last_used, note.uses))
+                     note.stability, note.last_used, note.uses, note.valid_to))
                 conn.execute(
                     "INSERT INTO notes_fts(rowid,slug,description,body,tags)"
                     " VALUES (?,?,?,?,?)",
@@ -493,6 +503,17 @@ def _has_dynamic_cols(conn: sqlite3.Connection) -> bool:
     return {"stability", "last_used"} <= have
 
 
+def _has_validity_cols(conn: sqlite3.Connection) -> bool:
+    """Whether this index carries the temporal-validity column (Brick 3). A
+    pre-validity index degrades to no HISTORICAL label rather than erroring —
+    it picks the column up on the next full rebuild."""
+    try:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(notes)")}
+    except sqlite3.Error:
+        return False
+    return "valid_to" in have
+
+
 def search(conn: sqlite3.Connection, query_text: str, *,
            query_vector: list[float] | None = None, k: int = 5,
            pool: int = DEFAULT_POOL, corpus_label: str = "",
@@ -548,11 +569,15 @@ def search(conn: sqlite3.Connection, query_text: str, *,
     span = (max(base.values()) - mn) or 1.0
     blend = w_recency > 0 or w_salience > 0 or w_retention > 0
     dyn = w_retention > 0 and _has_dynamic_cols(conn)
+    validity = _has_validity_cols(conn)
     cols = "description, body, kind, last_updated, sources_count"
     if dyn:
         cols += ", stability, last_used"
+    if validity:
+        # Render-time label ONLY — valid_to never enters the score math.
+        cols += ", valid_to"
     today = now or date.today()
-    scored: list[tuple[float, str, str, str, str]] = []
+    scored: list[tuple[float, str, str, str, str, str]] = []
     for slug, rel_raw in base.items():
         row = conn.execute(
             f"SELECT {cols} FROM notes WHERE slug = ?", (slug,)).fetchone()
@@ -560,22 +585,24 @@ def search(conn: sqlite3.Connection, query_text: str, *,
             continue
         desc, body, kind, last_updated, scount = row[:5]
         stability, last_used = (row[5], row[6]) if dyn else (0.0, "")
+        valid_to = (row[-1] or "") if validity else ""
         final = (rel_raw - mn) / span
         if blend:
             final += (w_recency * _recency(last_updated or "", today, half_life_days)
                       + w_salience * _salience(scount or 0)
                       + w_retention * _retention(stability or 0.0, last_used or "",
                                                  last_updated or "", today))
-        scored.append((final, slug, desc, body or "", kind or ""))
+        scored.append((final, slug, desc, body or "", kind or "", valid_to))
     scored.sort(key=lambda t: t[0], reverse=True)
     hits: list[Hit] = []
-    for final, slug, desc, body, kind in scored[:k]:
+    for final, slug, desc, body, kind, valid_to in scored[:k]:
         full = body.strip()
         snippet = full.replace("\n", " ")
         if len(snippet) > 240:
             snippet = snippet[:240].rstrip() + "…"
         hits.append(Hit(slug=slug, description=desc, snippet=snippet,
-                        score=final, corpus=corpus_label, kind=kind, body=full))
+                        score=final, corpus=corpus_label, kind=kind, body=full,
+                        valid_to=valid_to))
     return hits
 
 
@@ -620,7 +647,8 @@ def search_corpora(scopes: list[tuple[str, Path]], query_text: str, *,
     for key, score in _rrf(ranked_lists, k, rrf_k=rrf_k):
         h = per_scope[key]
         out.append(Hit(slug=h.slug, description=h.description, snippet=h.snippet,
-                       score=score, corpus=h.corpus, kind=h.kind, body=h.body))
+                       score=score, corpus=h.corpus, kind=h.kind, body=h.body,
+                       valid_to=h.valid_to))
     return out
 
 
@@ -643,6 +671,7 @@ def rerank_hits(scorer, query_text: str, hits: list[Hit], k: int) -> list[Hit]:
     return [
         Hit(slug=hits[i].slug, description=hits[i].description,
             snippet=hits[i].snippet, score=float(scores[i]),
-            corpus=hits[i].corpus, kind=hits[i].kind, body=hits[i].body)
+            corpus=hits[i].corpus, kind=hits[i].kind, body=hits[i].body,
+            valid_to=hits[i].valid_to)
         for i in order[:k]
     ]

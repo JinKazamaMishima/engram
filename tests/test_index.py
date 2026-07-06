@@ -394,3 +394,99 @@ def test_retention_ignored_on_pre_dynamics_index(tmp_path):
         assert hits and hits[0].slug == "a"
     finally:
         conn.close()
+
+
+# ---- temporal validity: HISTORICAL label, never ranking (Brick 3) ----------
+
+def _vnote(d, slug, desc, body, valid_to=""):
+    extra = f"valid_to: {valid_to}\n" if valid_to else ""
+    (d / f"{slug}.md").write_text(
+        f"---\nname: {slug}\ndescription: {desc}\ntags: [t]\n{extra}---\n{body}\n")
+
+
+def test_valid_to_threads_through_all_three_hit_factories(tmp_path):
+    # THE highest-risk Brick-3 bug: a Hit factory that drops valid_to silently
+    # re-presents a reversed fact as current. Pin all three constructors.
+    kd = tmp_path / "k"; kd.mkdir()
+    _vnote(kd, "old-plan", "the deploy plan", "Deploy plan via GH Pages.",
+           valid_to="2020-01-02")
+    _vnote(kd, "new-plan", "the new deploy plan", "Deploy via Cloudflare.")
+    db = tmp_path / "i.sqlite"
+    emb = FakeEmbedder()
+    assert index.build_index(kd, db, emb) == 2
+
+    conn = index._connect(db, read_only=True)
+    try:
+        qv = emb.embed(["deploy plan"], is_query=True)[0]
+        hits = index.search(conn, "deploy plan", query_vector=qv, k=2)  # factory 1
+    finally:
+        conn.close()
+    by_slug = {h.slug: h for h in hits}
+    assert by_slug["old-plan"].valid_to == "2020-01-02"
+    assert by_slug["old-plan"].historical is True
+    assert by_slug["new-plan"].valid_to == "" and not by_slug["new-plan"].historical
+
+    fused = index.search_corpora([("proj", db)], "deploy plan",           # factory 2
+                                 query_vector=qv, k=2)
+    assert {h.slug: h.valid_to for h in fused}["old-plan"] == "2020-01-02"
+
+    rer = index.rerank_hits(lambda q, ps: [0.9] * len(fused), "deploy plan",
+                            fused, k=2)                                   # factory 3
+    assert {h.slug: h.valid_to for h in rer}["old-plan"] == "2020-01-02"
+
+
+def test_validity_never_changes_ranking(tmp_path):
+    # Identical corpora, one with valid_to stamped — scores must be identical.
+    emb = FakeEmbedder()
+    scores = {}
+    for label, stamp in (("plain", ""), ("stamped", "2020-01-02")):
+        kd = tmp_path / f"k-{label}"; kd.mkdir()
+        _vnote(kd, "fact-a", "how the cache works", "Prefix cache with 5m TTL.",
+               valid_to=stamp)
+        _vnote(kd, "fact-b", "how eviction works", "Cooled tail is curated.")
+        db = tmp_path / f"{label}.sqlite"
+        index.build_index(kd, db, emb)
+        conn = index._connect(db, read_only=True)
+        try:
+            qv = emb.embed(["cache TTL"], is_query=True)[0]
+            scores[label] = [(h.slug, round(h.score, 9)) for h in
+                             index.search(conn, "cache TTL", query_vector=qv, k=2)]
+        finally:
+            conn.close()
+    assert scores["plain"] == scores["stamped"]   # label-only, zero score impact
+
+
+def test_pre_validity_index_degrades_to_no_label(tmp_path):
+    # A legacy index built before the valid_to column existed: searches must
+    # succeed with valid_to="" (no label), never error.
+    import sqlite3 as _sq
+
+    import sqlite_vec as _sv
+    db = tmp_path / "legacy.sqlite"
+    conn = _sq.connect(db)
+    conn.enable_load_extension(True); _sv.load(conn); conn.enable_load_extension(False)
+    conn.execute("""
+        CREATE TABLE notes (
+            id INTEGER PRIMARY KEY, slug TEXT UNIQUE NOT NULL,
+            description TEXT NOT NULL, body TEXT NOT NULL,
+            tags TEXT, sources TEXT, kind TEXT, sha TEXT NOT NULL,
+            last_updated TEXT, sources_count INTEGER DEFAULT 0,
+            stability REAL DEFAULT 0, last_used TEXT, uses INTEGER DEFAULT 0)""")
+    conn.execute("CREATE VIRTUAL TABLE notes_fts USING "
+                 "fts5(slug UNINDEXED, description, body, tags)")
+    conn.execute("CREATE VIRTUAL TABLE vec_notes USING "
+                 "vec0(note_id INTEGER PRIMARY KEY, embedding float[16])")
+    conn.execute("CREATE TABLE links (from_slug TEXT NOT NULL, to_slug TEXT NOT NULL)")
+    conn.execute("INSERT INTO notes(id,slug,description,body,tags,sources,kind,sha)"
+                 " VALUES (1,'legacy-note','an old note','Legacy body.','t','','','x')")
+    conn.execute("INSERT INTO notes_fts(rowid,slug,description,body,tags)"
+                 " VALUES (1,'legacy-note','an old note','Legacy body.','t')")
+    conn.commit(); conn.close()
+
+    conn = index._connect(db, read_only=True)
+    try:
+        assert index._has_validity_cols(conn) is False
+        hits = index.search(conn, "legacy note", query_vector=None, k=1)
+    finally:
+        conn.close()
+    assert hits and hits[0].valid_to == "" and hits[0].historical is False

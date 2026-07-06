@@ -97,6 +97,11 @@ def curate_sessions_all(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--commit", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--incremental", action="store_true",
+                    help="per-session watermark slicing: curate only each "
+                         "session's uncurated tail (the crash-safety net for "
+                         "live buffer eviction — a fully-watermarked session "
+                         "skips clean)")
     a = ap.parse_args(argv)
     try:
         target = (date.fromisoformat(a.date) if a.date
@@ -118,6 +123,8 @@ def curate_sessions_all(argv: list[str] | None = None) -> int:
             base.append("--commit")
         if a.dry_run:
             base.append("--dry-run")
+        if a.incremental:
+            base.append("--incremental")
         return base
 
     rc = 0

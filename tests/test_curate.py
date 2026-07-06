@@ -5,8 +5,13 @@ manifest that references a note the skill never wrote."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 from datetime import date
+from pathlib import Path
+
+import pytest
 
 from recall import curate, dynamics
 from recall.schema import KnowledgeNote
@@ -188,14 +193,15 @@ def test_curate_birth_stability_does_not_clobber_seed(tmp_path, monkeypatch):
 
 # ---- brick 1: session-scoped curation ------------------------------------
 
-def _run_session(tmp_path, monkeypatch, session_id="s", invoke_claude=None):
+def _run_session(tmp_path, monkeypatch, session_id="s", invoke_claude=None,
+                 extra=()):
     monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.delenv("RECALL_GLOBAL_DIR", raising=False)
     proj = tmp_path / "proj"
     (proj / "docs" / "knowledge").mkdir(parents=True, exist_ok=True)
     tdir = _transcript(tmp_path / "transcripts", name=f"{session_id}.jsonl")
     argv = ["--project-dir", str(proj), "--session", session_id,
-            "--transcript-dir", str(tdir)]
+            "--transcript-dir", str(tdir), *extra]
     out = curate.run(argv, invoke_claude=invoke_claude or _fake_claude(),
                      rebuild_indices=lambda ctx: {ctx.slug: 1, "global": 1},
                      autocommit=lambda ctx, m: [],
@@ -245,3 +251,316 @@ def test_curate_date_and_session_buckets_independent(tmp_path, monkeypatch):
     state = json.loads(
         (tmp_path / "data" / "curation" / "proj" / "curated.json").read_text())
     assert TARGET.isoformat() in state["dates"] and "s" in state["sessions"]
+
+
+# ---- --provisional (live pass over a possibly-still-open conversation) ----
+
+def test_curate_provisional_hints_bundle_and_skips_mark(tmp_path, monkeypatch):
+    seen = {}
+
+    def capture(ctx, env, timeout):
+        seen["bundle"] = ctx.bundle_text
+        return _fake_claude()(ctx, env, timeout)
+
+    _proj, out = _run_session(tmp_path, monkeypatch, invoke_claude=capture,
+                              extra=("--provisional",))
+    assert out.kind == "curated", out
+    # The curator was told this pass is provisional …
+    assert seen["bundle"].startswith("> PROVISIONAL PASS")
+    # … and the session was NOT claimed: the canonical pass can rerun it.
+    state_file = tmp_path / "data" / "curation" / "proj" / "curated.json"
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    assert "s" not in state.get("sessions", [])
+
+
+def test_curate_provisional_then_canonical_reruns(tmp_path, monkeypatch):
+    _run_session(tmp_path, monkeypatch, extra=("--provisional",))
+    _proj, out = _run_session(tmp_path, monkeypatch)   # canonical, same session
+    assert out.kind == "curated", "provisional must not block the canonical pass"
+    state = json.loads(
+        (tmp_path / "data" / "curation" / "proj" / "curated.json").read_text())
+    assert "s" in state.get("sessions", [])
+
+
+def test_session_curation_cmd_argv_parses():
+    """Cross-boundary contract: the harness spawns `recall curate <argv>`
+    DETACHED with stderr to DEVNULL — an unrecognized flag dies silently (the
+    61fef58 inert-seam bug, where --provisional didn't exist). Whatever
+    session_curation_cmd() builds must parse in curate._parse_args, forever."""
+    pytest.importorskip("claude_agent_sdk")   # the harness core imports it at module top
+    harness = os.path.join(os.path.dirname(__file__), "..", "infra", "engram")
+    sys.path.insert(0, harness)
+    try:
+        from core import session_curation_cmd
+    finally:
+        sys.path.remove(harness)
+    cmd = session_curation_cmd("abc-123", Path("/tmp/p"), provisional=True)
+    assert cmd[1] == "curate"
+    ns = curate._parse_args(cmd[2:])          # drop binary + subcommand
+    assert ns.session == "abc-123"
+    assert ns.provisional is True and ns.commit is True
+    # The non-provisional variant must parse too.
+    ns2 = curate._parse_args(session_curation_cmd("abc", Path("/tmp/p"))[2:])
+    assert ns2.provisional is False
+
+
+# ---- --buffer (Engram LiveBuffer as the curation source) ---------------------
+
+def _buffer(tmp_path, name="sid-42.jsonl"):
+    buf = tmp_path / "buffers" / name
+    buf.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"convo_id": buf.stem, "seq": 1, "ts": "2026-06-01T16:00:00+00:00",
+         "role": "user", "text": "why does X happen?"},
+        {"convo_id": buf.stem, "seq": 2, "ts": "2026-06-01T16:01:00+00:00",
+         "role": "assistant", "text": "Because of Y."},
+    ]
+    buf.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return buf
+
+
+def _run_buffer(tmp_path, monkeypatch, buf, extra=(), invoke_claude=None):
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.delenv("RECALL_GLOBAL_DIR", raising=False)
+    proj = tmp_path / "proj"
+    (proj / "docs" / "knowledge").mkdir(parents=True, exist_ok=True)
+    out = curate.run(["--project-dir", str(proj), "--buffer", str(buf), *extra],
+                     invoke_claude=invoke_claude or _fake_claude(),
+                     rebuild_indices=lambda ctx: {ctx.slug: 1, "global": 1},
+                     autocommit=lambda ctx, m: [],
+                     compute_neighbors=lambda ctx: [],
+                     compute_surprise=lambda ctx, created: {},
+                     today_et=TARGET)
+    return proj, out
+
+
+def test_curate_buffer_mode_shares_sessions_bucket(tmp_path, monkeypatch):
+    buf = _buffer(tmp_path)
+    _proj, out = _run_buffer(tmp_path, monkeypatch, buf)
+    assert out.kind == "curated", out
+    state = json.loads(
+        (tmp_path / "data" / "curation" / "proj" / "curated.json").read_text())
+    # The buffer's convo id IS the SDK session id: one shared state key, so the
+    # nightly --session sweep and live eviction see each other's work.
+    assert "sid-42" in state.get("sessions", [])
+    assert (tmp_path / "data" / "curation" / "proj" / "bundles"
+            / "session-sid-42.md").exists()
+
+
+def test_curate_buffer_missing_is_clean_skip(tmp_path, monkeypatch):
+    _proj, out = _run_buffer(tmp_path, monkeypatch,
+                             tmp_path / "buffers" / "ghost.jsonl")
+    assert out.kind == "skipped" and out.reason == "buffer_missing"
+    assert out.exit_code == 0
+
+
+def test_curate_buffer_provisional_composes(tmp_path, monkeypatch):
+    buf = _buffer(tmp_path)
+    _proj, out = _run_buffer(tmp_path, monkeypatch, buf, extra=("--provisional",))
+    assert out.kind == "curated", out
+    state_file = tmp_path / "data" / "curation" / "proj" / "curated.json"
+    state = json.loads(state_file.read_text()) if state_file.exists() else {}
+    assert "sid-42" not in state.get("sessions", [])   # provisional never claims
+
+
+# ---- --incremental (per-conversation watermark) -----------------------------
+
+def _grow_buffer(buf, seq, ts, role="user", text="later question"):
+    row = {"convo_id": buf.stem, "seq": seq, "ts": ts, "role": role, "text": text}
+    with buf.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def _watermarks(tmp_path):
+    state_file = tmp_path / "data" / "curation" / "proj" / "curated.json"
+    if not state_file.exists():
+        return {}
+    return json.loads(state_file.read_text()).get("watermarks", {})
+
+
+def test_incremental_first_pass_sets_watermark_then_skips(tmp_path, monkeypatch):
+    buf = _buffer(tmp_path)
+    _proj, out = _run_buffer(tmp_path, monkeypatch, buf, extra=("--incremental",))
+    assert out.kind == "curated", out
+    assert _watermarks(tmp_path)["sid-42"] == "2026-06-01T16:01:00+00:00"
+    # Buckets untouched: the watermark IS the incremental state.
+    state = json.loads(
+        (tmp_path / "data" / "curation" / "proj" / "curated.json").read_text())
+    assert "sid-42" not in state.get("sessions", [])
+    # Second pass, nothing new → clean skip, exit 0, watermark unchanged.
+    _proj, out2 = _run_buffer(tmp_path, monkeypatch, buf, extra=("--incremental",))
+    assert out2.kind == "skipped" and out2.reason == "no_new_exchanges"
+    assert out2.exit_code == 0
+    assert _watermarks(tmp_path)["sid-42"] == "2026-06-01T16:01:00+00:00"
+
+
+def test_incremental_curates_only_new_tail(tmp_path, monkeypatch):
+    buf = _buffer(tmp_path)
+    _run_buffer(tmp_path, monkeypatch, buf, extra=("--incremental",))
+    _grow_buffer(buf, 3, "2026-06-01T17:00:00+00:00", text="a NEW question")
+    seen = {}
+
+    def capture(ctx, env, timeout):
+        seen["bundle"] = ctx.bundle_text
+        return _fake_claude()(ctx, env, timeout)
+
+    _proj, out = _run_buffer(tmp_path, monkeypatch, buf,
+                             extra=("--incremental",), invoke_claude=capture)
+    assert out.kind == "curated", out
+    assert "a NEW question" in seen["bundle"]
+    assert "why does X happen?" not in seen["bundle"]   # already-curated head sliced off
+    assert _watermarks(tmp_path)["sid-42"] == "2026-06-01T17:00:00+00:00"
+
+
+def test_incremental_watermark_not_advanced_on_failure(tmp_path, monkeypatch):
+    buf = _buffer(tmp_path)
+
+    def broken_claude(ctx, env, timeout):
+        return subprocess.CompletedProcess(args=[], returncode=3)
+
+    _proj, out = _run_buffer(tmp_path, monkeypatch, buf,
+                             extra=("--incremental",), invoke_claude=broken_claude)
+    assert out.kind == "failed"
+    assert _watermarks(tmp_path) == {}      # failed pass never advances → no tail lost
+
+
+def test_incremental_until_caps_slice_and_watermark(tmp_path, monkeypatch):
+    buf = _buffer(tmp_path)
+    _grow_buffer(buf, 3, "2026-06-01T17:00:00+00:00", text="still hot")
+    seen = {}
+
+    def capture(ctx, env, timeout):
+        seen["bundle"] = ctx.bundle_text
+        return _fake_claude()(ctx, env, timeout)
+
+    _proj, out = _run_buffer(
+        tmp_path, monkeypatch, buf,
+        extra=("--incremental", "--until", "2026-06-01T16:30:00+00:00"),
+        invoke_claude=capture)
+    assert out.kind == "curated", out
+    assert "still hot" not in seen["bundle"]            # hot row stays uncurated
+    assert _watermarks(tmp_path)["sid-42"] == "2026-06-01T16:01:00+00:00"
+
+
+def test_incremental_force_recurates_whole_and_rewrites(tmp_path, monkeypatch):
+    buf = _buffer(tmp_path)
+    _run_buffer(tmp_path, monkeypatch, buf, extra=("--incremental",))
+    seen = {}
+
+    def capture(ctx, env, timeout):
+        seen["bundle"] = ctx.bundle_text
+        return _fake_claude()(ctx, env, timeout)
+
+    _proj, out = _run_buffer(tmp_path, monkeypatch, buf,
+                             extra=("--incremental", "--force"),
+                             invoke_claude=capture)
+    assert out.kind == "curated", out
+    assert "why does X happen?" in seen["bundle"]       # whole convo re-read
+    assert _watermarks(tmp_path)["sid-42"] == "2026-06-01T16:01:00+00:00"
+
+
+def test_incremental_ignores_sessions_bucket(tmp_path, monkeypatch):
+    # A session canonically curated (bucket-marked) that then GROWS after a
+    # resume: incremental must still curate it — the watermark alone governs.
+    buf = _buffer(tmp_path)
+    _run_buffer(tmp_path, monkeypatch, buf)             # canonical: marks bucket
+    _grow_buffer(buf, 3, "2026-06-01T18:00:00+00:00", text="post-resume growth")
+    _proj, out = _run_buffer(tmp_path, monkeypatch, buf, extra=("--incremental",))
+    assert out.kind == "curated", "bucket mark must not orphan post-resume growth"
+    assert _watermarks(tmp_path)["sid-42"] == "2026-06-01T18:00:00+00:00"
+
+
+def test_incremental_provisional_advances_watermark_only(tmp_path, monkeypatch):
+    buf = _buffer(tmp_path)
+    _proj, out = _run_buffer(tmp_path, monkeypatch, buf,
+                             extra=("--incremental", "--provisional"))
+    assert out.kind == "curated", out
+    assert _watermarks(tmp_path)["sid-42"]              # position tracked …
+    state = json.loads(
+        (tmp_path / "data" / "curation" / "proj" / "curated.json").read_text())
+    assert "sid-42" not in state.get("sessions", [])    # … unit never claimed
+
+
+def test_incremental_bad_flag_combos_fail_loud(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    proj = tmp_path / "proj"
+    (proj / "docs" / "knowledge").mkdir(parents=True)
+    tdir = _transcript(tmp_path / "transcripts")
+    common = dict(invoke_claude=_fake_claude(), rebuild_indices=lambda c: {},
+                  autocommit=lambda c, m: [], today_et=TARGET)
+    # --incremental needs a per-conversation unit …
+    out = curate.run(["--project-dir", str(proj), "--date", TARGET.isoformat(),
+                      "--transcript-dir", str(tdir), "--incremental"], **common)
+    assert out.kind == "failed" and out.reason == "bad_flags"
+    # … and --until means nothing outside --incremental.
+    out = curate.run(["--project-dir", str(proj), "--session", "s",
+                      "--transcript-dir", str(tdir),
+                      "--until", "2026-06-01T16:00:00+00:00"], **common)
+    assert out.kind == "failed" and out.reason == "bad_flags"
+    # Garbled --until fails loud, not silent.
+    out = curate.run(["--project-dir", str(proj), "--session", "s",
+                      "--transcript-dir", str(tdir), "--incremental",
+                      "--until", "not-a-ts"], **common)
+    assert out.kind == "failed" and out.reason == "bad_until"
+
+
+def test_incremental_session_mode_watermarks_transcript(tmp_path, monkeypatch):
+    # The nightly sweep's form: --session <id> --incremental over a CC transcript.
+    _proj, out = _run_session(tmp_path, monkeypatch, extra=("--incremental",))
+    assert out.kind == "curated", out
+    assert _watermarks(tmp_path)["s"] == "2026-06-01T16:01:00+00:00"
+    _proj, out2 = _run_session(tmp_path, monkeypatch, extra=("--incremental",))
+    assert out2.kind == "skipped" and out2.reason == "no_new_exchanges"
+
+
+# ---- supersession → valid_to backstop (Brick 3, B5) -------------------------
+
+def test_supersession_stamps_valid_to(tmp_path, monkeypatch):
+    def superseding_claude(ctx, env, timeout):
+        # New note replaces an old one; curator sets superseded_by but FORGETS
+        # valid_to — the backstop must stamp it with the filing date.
+        (ctx.project_knowledge_dir / "new-way.md").write_text(
+            "---\nname: new-way\ndescription: the new approach\n---\nUse B.\n")
+        (ctx.project_knowledge_dir / "old-way.md").write_text(
+            "---\nname: old-way\ndescription: the old approach\n"
+            "superseded: true\nsuperseded_by: new-way\n---\nUse A.\n")
+        ctx.manifest_path.write_text(json.dumps({
+            "schema_version": 1, "date": ctx.target.isoformat(),
+            "summary": "superseded old-way with new-way",
+            "notes": [
+                {"slug": "new-way", "action": "created", "title": "new",
+                 "scope": "project"},
+                {"slug": "old-way", "action": "updated", "title": "old",
+                 "scope": "project"}]}))
+        return subprocess.CompletedProcess(args=[], returncode=0)
+
+    proj, out = _run(tmp_path, monkeypatch, invoke_claude=superseding_claude)
+    assert out.kind == "curated", out
+    old = KnowledgeNote.parse((proj / "docs" / "knowledge" / "old-way.md").read_text())
+    assert old.valid_to == TARGET.isoformat()      # backstop stamped it
+    new = KnowledgeNote.parse((proj / "docs" / "knowledge" / "new-way.md").read_text())
+    assert new.valid_to == ""                      # the replacement stays open
+
+
+def test_supersession_never_overwrites_existing_valid_to(tmp_path, monkeypatch):
+    def claude(ctx, env, timeout):
+        (ctx.project_knowledge_dir / "new-way.md").write_text(
+            "---\nname: new-way\ndescription: the new approach\n---\nUse B.\n")
+        (ctx.project_knowledge_dir / "old-way.md").write_text(
+            "---\nname: old-way\ndescription: the old approach\n"
+            "superseded: true\nsuperseded_by: new-way\n"
+            "valid_to: 2026-05-15\n---\nUse A.\n")   # curator knew the real date
+        ctx.manifest_path.write_text(json.dumps({
+            "schema_version": 1, "date": ctx.target.isoformat(),
+            "summary": "superseded with explicit reversal date",
+            "notes": [
+                {"slug": "new-way", "action": "created", "title": "n",
+                 "scope": "project"},
+                {"slug": "old-way", "action": "updated", "title": "o",
+                 "scope": "project"}]}))
+        return subprocess.CompletedProcess(args=[], returncode=0)
+
+    proj, out = _run(tmp_path, monkeypatch, invoke_claude=claude)
+    assert out.kind == "curated", out
+    old = KnowledgeNote.parse((proj / "docs" / "knowledge" / "old-way.md").read_text())
+    assert old.valid_to == "2026-05-15"            # curator's date wins

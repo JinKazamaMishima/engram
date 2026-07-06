@@ -44,6 +44,12 @@ def curation_dir() -> Path:
     return data_root() / "curation"
 
 
+def engram_buffer_dir() -> Path:
+    """Where the Engram harness appends its per-conversation LiveBuffer JSONLs
+    (``<convo_id>.jsonl``) — tier-1 STM, read by ``curate --buffer``."""
+    return data_root() / "engram" / "buffer"
+
+
 def subconscious_dir(scope: str) -> Path:
     """Quarantined staging for the nightly dream pass — hypothesis notes recombined
     from the day's memory. Deliberately OUTSIDE the corpus and NEVER indexed into

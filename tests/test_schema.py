@@ -268,6 +268,53 @@ def test_knowledge_note_garbled_dynamic_scalar_falls_back():
     assert KnowledgeNote.parse(note).stability == 0.0   # garbled -> default
 
 
+# ---- temporal-validity fields (valid_from / valid_to / confidence) --------
+
+def _with_fm(extra: str) -> str:
+    return GOOD_NOTE.replace("sources: [2026-06-01]",
+                             f"sources: [2026-06-01]\n{extra}")
+
+
+def test_knowledge_note_validity_fields_parsed():
+    n = KnowledgeNote.parse(_with_fm(
+        "valid_from: 2026-06-01\nvalid_to: 2026-07-01\nconfidence: 0.3"))
+    assert n.valid_from == "2026-06-01" and n.valid_to == "2026-07-01"
+    assert n.confidence == 0.3
+
+
+def test_knowledge_note_validity_defaults_backward_compatible():
+    n = KnowledgeNote.parse(GOOD_NOTE)  # no validity keys present
+    assert n.valid_from == "" and n.valid_to == ""
+    assert n.confidence == -1.0   # -1 == "never asserted" sentinel
+
+
+def test_knowledge_note_valid_to_before_valid_from_rejected():
+    with pytest.raises(CurationSchemaError, match="predates"):
+        KnowledgeNote.parse(_with_fm(
+            "valid_from: 2026-07-01\nvalid_to: 2026-06-01"))
+
+
+def test_knowledge_note_valid_to_alone_is_fine():
+    # An open-start window (only the end known) is representable.
+    n = KnowledgeNote.parse(_with_fm("valid_to: 2026-07-01"))
+    assert n.valid_from == "" and n.valid_to == "2026-07-01"
+
+
+def test_knowledge_note_confidence_clamps_and_sentinels():
+    assert KnowledgeNote.parse(_with_fm("confidence: 1.7")).confidence == 1.0
+    assert KnowledgeNote.parse(_with_fm("confidence: -0.5")).confidence == -1.0
+    assert KnowledgeNote.parse(_with_fm("confidence: garbled")).confidence == -1.0
+    assert KnowledgeNote.parse(_with_fm("confidence: 0.0")).confidence == 0.0
+
+
+def test_set_frontmatter_keys_writes_validity_scalars():
+    # The B5 supersession backstop writes valid_to through this exact path.
+    out = set_frontmatter_keys(GOOD_NOTE, {"valid_to": "2026-07-03",
+                                           "confidence": 0.9})
+    n = KnowledgeNote.parse(out)
+    assert n.valid_to == "2026-07-03" and n.confidence == 0.9
+
+
 # ---- set_frontmatter_keys (surgical scalar writer) -----------------------
 
 def test_set_frontmatter_keys_updates_in_place_and_inserts():

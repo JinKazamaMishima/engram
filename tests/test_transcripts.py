@@ -254,3 +254,159 @@ def test_keeps_human_session_opening_with_other_slash_command(tmp_path):
     ])
     texts = [e.text for e in T.iter_exchanges(p, None, ET)]
     assert "actually let's discuss the auth bug" in texts   # kept, not over-dropped
+
+
+# ---- since/until slicing (incremental curation) ----------------------------
+
+def _utc(h, m=0):
+    from datetime import timezone
+    return datetime(2026, 6, 1, h, m, tzinfo=timezone.utc)
+
+
+def test_iter_exchanges_since_until_window(tmp_path):
+    p = _jsonl(tmp_path, "s.jsonl", [
+        _user("first", ts="2026-06-01T10:00:00Z"),
+        _assistant([_text("one")], ts="2026-06-01T11:00:00Z"),
+        _user("second", ts="2026-06-01T12:00:00Z"),
+        _assistant([_text("two")], ts="2026-06-01T13:00:00Z"),
+    ])
+    # since is EXCLUSIVE (the watermarked exchange was already curated) …
+    texts = [e.text for e in T.iter_exchanges(p, None, ET, since=_utc(11))]
+    assert texts == ["second", "two"]
+    # … until is INCLUSIVE (it IS the cooled edge the caller wants curated).
+    texts = [e.text for e in T.iter_exchanges(p, None, ET,
+                                              since=_utc(10), until=_utc(12))]
+    assert texts == ["one", "second"]
+    # empty window → nothing.
+    assert list(T.iter_exchanges(p, None, ET, since=_utc(13))) == []
+
+
+def test_build_bundle_threads_since(tmp_path):
+    p = _jsonl(tmp_path, "s.jsonl", [
+        _user("old", ts="2026-06-01T10:00:00Z"),
+        _user("new", ts="2026-06-01T12:00:00Z"),
+        _assistant([_text("reply")], ts="2026-06-01T12:01:00Z"),
+    ])
+    text, stats = T.build_bundle([p], None, ET, since=_utc(11))
+    assert "new" in text and "old" not in text
+    assert stats.exchanges == 2
+
+
+# ---- Engram LiveBuffer reader -------------------------------------------------
+
+def _buffer_row(seq, role, text, ts):
+    return json.dumps({"convo_id": "conv-1", "seq": seq, "ts": ts,
+                       "role": role, "text": text})
+
+
+def _buffer_file(tmp_path, rows, name="conv-1.jsonl"):
+    p = tmp_path / name
+    p.write_text("\n".join(rows) + "\n")
+    return p
+
+
+def test_iter_buffer_exchanges_roundtrip_and_order(tmp_path):
+    p = _buffer_file(tmp_path, [
+        _buffer_row(2, "assistant", "the reply", "2026-06-01T16:01:00+00:00"),
+        _buffer_row(1, "user", "the question", "2026-06-01T16:00:00+00:00"),
+    ])
+    exs = list(T.iter_buffer_exchanges(p))
+    assert [(e.role, e.text) for e in exs] == [
+        ("user", "the question"), ("assistant", "the reply")]   # (seq, ts) order
+    assert all(e.session_id == "conv-1" for e in exs)
+
+
+def test_iter_buffer_exchanges_tolerates_garbage(tmp_path):
+    p = _buffer_file(tmp_path, [
+        _buffer_row(1, "user", "good row", "2026-06-01T16:00:00+00:00"),
+        '{"convo_id": "conv-1", "seq": 2, "ts": "2026-06-01T16:0',  # torn write
+        "not json at all",
+        _buffer_row(3, "assistant", "still fine", "2026-06-01T16:02:00+00:00"),
+        _buffer_row(4, "assistant", "", "2026-06-01T16:03:00+00:00"),  # empty
+        _buffer_row(5, "user", "/lone-slash", "2026-06-01T16:04:00+00:00"),
+    ])
+    exs = list(T.iter_buffer_exchanges(p))
+    assert [e.text for e in exs] == ["good row", "still fine"]
+
+
+def test_iter_buffer_exchanges_window_and_noise(tmp_path):
+    p = _buffer_file(tmp_path, [
+        _buffer_row(1, "user", "old", "2026-06-01T10:00:00+00:00"),
+        _buffer_row(2, "user",
+                    "<system-reminder>x</system-reminder>real ask",
+                    "2026-06-01T12:00:00+00:00"),
+    ])
+    exs = list(T.iter_buffer_exchanges(p, since=_utc(11)))
+    assert [e.text for e in exs] == ["real ask"]    # sliced + denoised
+
+
+def test_build_buffer_bundle_matches_canonical_render(tmp_path):
+    # The buffer path must produce byte-identical markdown to the transcript
+    # path for the same conversation — one renderer, one curator contract.
+    buf = _buffer_file(tmp_path, [
+        _buffer_row(1, "user", "why X?", "2026-06-01T16:00:00+00:00"),
+        _buffer_row(2, "assistant", "because Y.", "2026-06-01T16:01:00+00:00"),
+    ])
+    tr = _jsonl(tmp_path, "conv-1t.jsonl", [
+        _user("why X?", ts="2026-06-01T16:00:00Z"),
+        _assistant([_text("because Y.")], ts="2026-06-01T16:01:00Z"),
+    ])
+    btext, bstats = T.build_buffer_bundle(buf)
+    ttext, tstats = T.build_bundle([tr], None, ET)
+    assert btext.replace("conv-1t", "conv-1") == ttext.replace("conv-1t", "conv-1")
+    assert (bstats.sessions, bstats.exchanges) == (tstats.sessions, tstats.exchanges)
+
+
+def test_build_buffer_bundle_empty_and_assistant_only(tmp_path):
+    empty = _buffer_file(tmp_path, [], name="empty.jsonl")
+    text, stats = T.build_buffer_bundle(empty)
+    assert text == "" and stats.exchanges == 0
+    solo = _buffer_file(tmp_path, [
+        _buffer_row(1, "assistant", "greeting into the void",
+                    "2026-06-01T16:00:00+00:00")], name="solo.jsonl")
+    text, stats = T.build_buffer_bundle(solo)
+    assert stats.exchanges == 0     # no human turn -> not gold (same rule as transcripts)
+
+
+def test_buffer_last_ts(tmp_path):
+    p = _buffer_file(tmp_path, [
+        _buffer_row(1, "user", "a", "2026-06-01T10:00:00+00:00"),
+        _buffer_row(2, "assistant", "b", "2026-06-01T11:00:00+00:00"),
+    ])
+    assert T.buffer_last_ts(p) == _utc(11)
+    assert T.buffer_last_ts(p, until=_utc(10, 30)) == _utc(10)
+    assert T.buffer_last_ts(tmp_path / "nope.jsonl") is None
+
+
+def test_iter_buffer_exchanges_perception_role(tmp_path):
+    # Perception rows (the perceiving loop's step-5 buffer) yield like
+    # assistant prose; unknown roles stay dropped; extra provenance keys in
+    # the row are tolerated; the watermark advances over perception rows.
+    rows = [
+        _buffer_row(1, "perception", "[engage] Ada is here — engaging",
+                    "2026-06-01T10:00:00+00:00"),
+        _buffer_row(2, "tool", "never a memory", "2026-06-01T10:30:00+00:00"),
+        json.dumps({"convo_id": "conv-1", "seq": 3,
+                    "ts": "2026-06-01T11:00:00+00:00", "role": "perception",
+                    "text": "[eye] a desk with a laptop  [✓ desk, laptop]",
+                    "kind": "eye", "data": {"stable": True}}),
+    ]
+    p = _buffer_file(tmp_path, rows, name="percept-2026-06-01.jsonl")
+    exs = list(T.iter_buffer_exchanges(p))
+    assert [(e.role, e.text[:6]) for e in exs] == [
+        ("perception", "[engag"), ("perception", "[eye] ")]
+    assert T.buffer_last_ts(p) == _utc(11)
+
+
+def test_build_buffer_bundle_perception_only_is_gold(tmp_path):
+    # A perception-only buffer is genuine signal (gate-verified real-world
+    # events), NOT a headless run — it must render, as ### PERCEPTION blocks.
+    p = _buffer_file(tmp_path, [
+        _buffer_row(1, "perception", "[engage] Ada is here — engaging",
+                    "2026-06-01T10:00:00+00:00"),
+        _buffer_row(2, "perception", "[idle] frame is clear — resting",
+                    "2026-06-01T18:00:00+00:00"),
+    ], name="percept-2026-06-01.jsonl")
+    text, stats = T.build_buffer_bundle(p)
+    assert stats.exchanges == 2
+    assert "### PERCEPTION" in text and "[engage] Ada" in text

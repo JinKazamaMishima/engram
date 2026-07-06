@@ -46,3 +46,21 @@ def test_format_system_message():
     msg = recall_inject._format_system_message(
         [Hit("a", "d", "s", 0.5, "myproject")])
     assert msg.startswith("🧠 recalled:") and "myproject:a" in msg
+
+
+def test_format_context_labels_historical():
+    hits = [Hit("old-deploy-plan", "deploy via GH Pages", "s", 0.9, "proj",
+                valid_to="2020-01-02"),
+            Hit("new-deploy-plan", "deploy via Cloudflare", "s", 0.8, "proj")]
+    out = recall_inject._format_context(hits)
+    assert "⏳ HISTORICAL (was true until 2020-01-02)" in out
+    # The label rides the historical line only.
+    current_line = [ln for ln in out.splitlines() if "new-deploy-plan" in ln][0]
+    assert "HISTORICAL" not in current_line
+
+
+def test_format_context_future_valid_to_not_historical():
+    # A fact scheduled to expire is still true today — no label yet.
+    hits = [Hit("expiring", "true until the far future", "s", 0.9, "proj",
+                valid_to="2099-01-01")]
+    assert "HISTORICAL" not in recall_inject._format_context(hits)

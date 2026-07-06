@@ -30,7 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -75,6 +75,9 @@ class FireContext:
     state_bucket: str          # "dates" (nightly sweep) | "sessions" (--session)
     state_key: str             # idempotency key within that bucket
     today_et: date
+    # Incremental mode only: ISO ts of the newest exchange in this pass — the
+    # value the watermark advances to at the success point. "" = non-incremental.
+    watermark_advance: str = ""
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,14 @@ class Outcome:
 
 # ---- argument parsing ----------------------------------------------------
 
+PROVISIONAL_HINT = (
+    "> PROVISIONAL PASS — this conversation may still be OPEN (mid-session "
+    "eviction or shutdown). Facts below can still reverse: write them with "
+    "`confidence: 0.3` unless clearly durable, leave `valid_to` empty, and "
+    "prefer raising an existing provisional note's confidence over minting a "
+    "duplicate.\n\n")
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="recall curate",
                                 description=__doc__.splitlines()[0])
@@ -98,6 +109,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--session", type=str, default=None,
                    help="curate ONE session by id (<id>.jsonl) instead of a whole "
                         "day; idempotency tracked per-session (ignores --date)")
+    p.add_argument("--buffer", type=Path, default=None,
+                   help="curate an Engram LiveBuffer JSONL instead of a Claude Code "
+                        "transcript; unit id = filename stem, tracked in the "
+                        "sessions bucket (overrides --session/--date)")
     p.add_argument("--force", action="store_true",
                    help="re-curate even if this date is already curated")
     p.add_argument("--dry-run", action="store_true",
@@ -106,6 +121,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="override the Claude Code transcript dir (tests)")
     p.add_argument("--commit", action="store_true",
                    help="on success, scoped-commit the corpora ([curator], no push)")
+    p.add_argument("--provisional", action="store_true",
+                   help="live pass over a possibly-still-open conversation: hint "
+                        "the curator toward low-confidence facts and do NOT mark "
+                        "the unit curated (the canonical pass can rerun it)")
+    p.add_argument("--incremental", action="store_true",
+                   help="curate only the tail after this conversation's watermark "
+                        "(requires --session or --buffer); on success the watermark "
+                        "advances — buckets are never written, the watermark IS the "
+                        "state. --force ignores + rewrites the watermark")
+    p.add_argument("--until", type=str, default=None,
+                   help="upper slice bound (ISO ts, inclusive) for --incremental — "
+                        "the harness passes the cooled edge so still-hot turns stay "
+                        "uncurated")
     return p.parse_args(argv)
 
 
@@ -137,6 +165,47 @@ def _mark_curated(state_file: Path, bucket: str, key: str) -> None:
     state_file.write_text(json.dumps(data, indent=2))
 
 
+def _read_watermark(state_file: Path, convo_id: str) -> datetime | None:
+    """The per-conversation incremental watermark: everything with
+    ``ts <= watermark`` has already been curated. ``None`` = never watermarked
+    (a first incremental pass curates the whole conversation — at-least-once;
+    the curator's dedup absorbs any overlap with a past canonical pass)."""
+    if not state_file.exists():
+        return None
+    try:
+        raw = json.loads(state_file.read_text()).get("watermarks", {})
+        raw = raw.get(convo_id) if isinstance(raw, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def _mark_watermark(state_file: Path, convo_id: str, iso_ts: str) -> None:
+    """Advance ``convo_id``'s watermark, preserving every other bucket (same
+    read-modify-write discipline as ``_mark_curated``). Called ONLY at the
+    post-validation success point — a failed pass never advances, so no tail
+    is ever silently lost."""
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(state_file.read_text()) if state_file.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    marks = data.get("watermarks", {})
+    if not isinstance(marks, dict):
+        marks = {}
+    marks[convo_id] = iso_ts
+    data["watermarks"] = marks
+    state_file.write_text(json.dumps(data, indent=2))
+
+
 # ---- context resolution --------------------------------------------------
 
 def _resolve_context(args: argparse.Namespace, today_et: date,
@@ -149,32 +218,92 @@ def _resolve_context(args: argparse.Namespace, today_et: date,
     cdir = config.curation_dir() / slug
     state_file = cdir / "curated.json"
 
-    # Unit of work: a whole day (nightly sweep) or one session (live --session).
-    # Independent idempotency buckets so the two never clobber each other's state.
-    if args.session:
+    # Unit of work: a whole day (nightly sweep), one session (live --session), or
+    # one Engram LiveBuffer (eviction --buffer; shares the sessions bucket + stem —
+    # the buffer's convo id IS the SDK session id, so the nightly sweep and live
+    # eviction see one another's state). Buckets stay independent of dates.
+    if args.buffer:
+        sid = args.buffer.stem
+        bucket, state_key, stem = "sessions", sid, f"session-{sid}"
+    elif args.session:
         bucket, state_key, stem = "sessions", args.session, f"session-{args.session}"
     else:
         bucket, state_key, stem = "dates", target.isoformat(), target.isoformat()
 
-    if state_key in _curated_keys(state_file, bucket) and not args.force:
+    # Incremental slicing window: since = this convo's watermark (strictly
+    # after — the watermarked exchange was already curated), until = the
+    # caller's cooled edge (inclusive).
+    if args.incremental and not (args.buffer or args.session):
+        return Outcome(kind="failed", reason="bad_flags",
+                       detail="--incremental requires --session or --buffer "
+                              "(the watermark is per-conversation)",
+                       exit_code=1, alert_priority="urgent")
+    if args.until and not args.incremental:
+        return Outcome(kind="failed", reason="bad_flags",
+                       detail="--until only applies with --incremental",
+                       exit_code=1, alert_priority="urgent")
+    until: datetime | None = None
+    if args.until:
+        try:
+            until = datetime.fromisoformat(args.until.replace("Z", "+00:00"))
+        except ValueError:
+            return Outcome(kind="failed", reason="bad_until",
+                           detail=f"--until {args.until!r} is not an ISO "
+                                  f"timestamp", exit_code=1,
+                           alert_priority="urgent")
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+    since = (_read_watermark(state_file, state_key)
+             if args.incremental and not args.force else None)
+
+    # Whole-unit idempotency (buckets) gates canonical passes only. Incremental
+    # passes answer to the watermark alone: a bucket-marked session that GREW
+    # after a resume must still get its tail curated — the first incremental
+    # pass on a legacy session re-reads it whole (at-least-once; the curator's
+    # dedup absorbs the overlap) and the watermark takes over from there.
+    if (not args.incremental and not args.force
+            and state_key in _curated_keys(state_file, bucket)):
         return Outcome(kind="skipped", reason="already_curated",
                        detail=f"{state_key} already curated for {slug} "
                               f"(use --force to redo)", exit_code=0)
 
-    if args.session:
+    watermark_advance = ""
+    if args.buffer:
+        path = args.buffer
+        if not path.exists():
+            return Outcome(kind="skipped", reason="buffer_missing",
+                           detail=f"no buffer {path} for {slug}", exit_code=0)
+        last = T.buffer_last_ts(path, until=until)
+        target = (last.astimezone(T.ET).date() if last else today_et)
+        if args.incremental and last is not None:
+            watermark_advance = last.isoformat()
+        paths = [path]
+        bundle_text, stats = T.build_buffer_bundle(path, since=since,
+                                                   until=until)
+    elif args.session:
         path = T.session_transcript_path(transcript_dir, args.session)
         if not path.exists():
             return Outcome(kind="skipped", reason="session_missing",
                            detail=f"no transcript {path.name} for {slug} "
                                   f"in {transcript_dir}", exit_code=0)
         target = T.session_date(path) or today_et   # file it under the session's day
+        if args.incremental:
+            last = T.transcript_last_ts(path, until=until)
+            if last is not None:
+                watermark_advance = last.isoformat()
         paths = [path]
-        bundle_text, stats = T.build_bundle(paths, None)
+        bundle_text, stats = T.build_bundle(paths, None, since=since,
+                                            until=until)
     else:
         paths = T.discover_transcripts(transcript_dir, target)
         bundle_text, stats = T.build_bundle(paths, target)
 
     if stats.exchanges == 0:
+        if args.incremental and since is not None:
+            return Outcome(kind="skipped", reason="no_new_exchanges",
+                           detail=f"nothing after watermark "
+                                  f"{since.isoformat()} for {slug} "
+                                  f"({state_key})", exit_code=0)
         return Outcome(kind="skipped", reason="no_conversations",
                        detail=f"no human conversation for {slug} "
                               f"({state_key}; {len(paths)} transcript(s) scanned)",
@@ -193,7 +322,7 @@ def _resolve_context(args: argparse.Namespace, today_et: date,
         global_index_path=config.index_path(config.GLOBAL_SCOPE),
         session_log_path=cdir / "sessions" / f"{target.isoformat()}.md",
         state_file=state_file, state_bucket=bucket, state_key=state_key,
-        today_et=today_et)
+        today_et=today_et, watermark_advance=watermark_advance)
 
 
 # ---- env contract + input materialization ---------------------------------
@@ -368,6 +497,37 @@ def _set_birth_stability(ctx: FireContext, manifest: CurationManifest,
             n_set += 1
         except (CurationSchemaError, OSError) as e:
             print(f"[curate] WARN birth-stability skip {slug}: {e}", flush=True)
+    return n_set
+
+
+def _stamp_supersession_validity(ctx: FireContext,
+                                 manifest: CurationManifest) -> int:
+    """Belt-and-suspenders for temporal validity (Brick 3): any note this run
+    touched that now carries ``superseded_by`` must also carry ``valid_to`` —
+    the moment a fact is superseded is the moment it stopped being true, and a
+    reversed decision without a ``valid_to`` silently injects as current. The
+    skill contract asks the curator to stamp it; this backstop catches misses.
+    An existing ``valid_to`` is NEVER overwritten (the curator may know the
+    real reversal date better than the filing date). Runs before the index
+    rebuild so the stamp is indexed + committed with the run."""
+    n_set = 0
+    for edit in manifest.notes:
+        path = _note_dir(ctx, edit.scope) / f"{edit.slug}.md"
+        if not path.exists():
+            continue
+        try:
+            note = KnowledgeNote.parse(path.read_text(), expect_slug=edit.slug)
+        except CurationSchemaError:
+            continue
+        if not note.superseded_by or note.valid_to:
+            continue
+        try:
+            path.write_text(set_frontmatter_keys(
+                path.read_text(), {"valid_to": ctx.target.isoformat()}))
+            n_set += 1
+        except (CurationSchemaError, OSError) as e:
+            print(f"[curate] WARN validity stamp skip {edit.slug}: {e}",
+                  flush=True)
     return n_set
 
 
@@ -564,6 +724,10 @@ def run(argv: list[str] | None = None, *,
                 target, slug, resolved, None, None)
         return resolved
     ctx = resolved
+    if args.provisional:
+        # A provisional bundle announces itself: the curator writes volatile
+        # facts at confidence ~0.3 instead of asserting them as settled.
+        ctx = replace(ctx, bundle_text=PROVISIONAL_HINT + ctx.bundle_text)
     env = _build_env(ctx)
 
     if args.dry_run:
@@ -620,7 +784,30 @@ def run(argv: list[str] | None = None, *,
     except Exception as e:  # noqa: BLE001 — corpus already written, never fatal
         print(f"[curate] WARN birth-stability failed (corpus intact): {e}", flush=True)
 
-    _mark_curated(ctx.state_file, ctx.state_bucket, ctx.state_key)
+    try:
+        n_stamp = _stamp_supersession_validity(ctx, manifest)
+        if n_stamp:
+            print(f"[curate] valid_to stamped on {n_stamp} superseded note(s)",
+                  flush=True)
+    except Exception as e:  # noqa: BLE001 — corpus already written, never fatal
+        print(f"[curate] WARN validity stamp failed (corpus intact): {e}", flush=True)
+
+    if args.incremental:
+        # The watermark IS the incremental state; buckets stay untouched so the
+        # canonical machinery never mistakes a partial pass for a finished unit.
+        # Advancing only here — after validation — means a failed pass never
+        # loses tail (at-least-once; dedup absorbs re-runs).
+        if ctx.watermark_advance:
+            _mark_watermark(ctx.state_file, ctx.state_key, ctx.watermark_advance)
+            print(f"[curate] watermark {ctx.state_key} → {ctx.watermark_advance}",
+                  flush=True)
+    elif args.provisional:
+        # Provisional passes never claim the unit: the session may grow after a
+        # resume, and the canonical (nightly / final) pass must be able to rerun.
+        print(f"[curate] provisional pass — {ctx.state_bucket}:{ctx.state_key} "
+              f"left unmarked", flush=True)
+    else:
+        _mark_curated(ctx.state_file, ctx.state_bucket, ctx.state_key)
     try:
         counts = rebuild_indices(ctx)
         print(f"[curate] indices rebuilt: {counts}", flush=True)

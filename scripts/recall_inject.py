@@ -77,7 +77,9 @@ def _format_context(hits) -> str:
         lines.append(f"\n### {title}")
         for h in group:
             tag = f" [{h.kind}]" if h.kind else ""
-            lines.append(f"- **{h.slug}**{tag} — {h.description}")
+            hist = (f" — ⏳ HISTORICAL (was true until {h.valid_to})"
+                    if getattr(h, "historical", False) else "")
+            lines.append(f"- **{h.slug}**{tag} — {h.description}{hist}")
 
     _section("This project", [h for h in hits if h.corpus != GLOBAL_SCOPE])
     _section("Global / soul", [h for h in hits if h.corpus == GLOBAL_SCOPE])
