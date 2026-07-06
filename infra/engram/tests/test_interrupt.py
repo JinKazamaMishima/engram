@@ -16,8 +16,8 @@ import sys
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
-from app import EngramApp, PromptArea  # noqa: E402
-from core import REGULAR_MODE, Event, ModelDriver  # noqa: E402
+from core import Event, ModelDriver, REGULAR_MODE  # noqa: E402
+from app import PromptArea, EngramApp  # noqa: E402
 
 
 class FakeDriver(ModelDriver):
@@ -37,7 +37,7 @@ class FakeDriver(ModelDriver):
         self.interrupted = False
         self.gate = asyncio.Event()
 
-    async def query(self, text):
+    async def query(self, text, *, prepend=""):
         if self.block:
             await self.gate.wait()           # hold the turn open until interrupt()
             return                           # released → stream ends (no more text)

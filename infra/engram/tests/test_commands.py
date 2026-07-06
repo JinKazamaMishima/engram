@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Headless tests for the two new harness features: /context and /agent.
+"""Headless tests for harness slash-commands: /context, /agent, /model, /ultracode.
 
 Covers (1) the pure markdown renderer for the SDK's context-usage payload,
 (2) /context renders when idle but is BLOCKED (driver never polled) mid-turn,
@@ -16,9 +16,10 @@ import sys
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
-from app import EngramApp, PromptArea  # noqa: E402
 from core import Event, ModelDriver, render_context_md  # noqa: E402
+from app import MODELS, PromptArea, EngramApp  # noqa: E402
 from textual.widgets import Static  # noqa: E402
+
 
 USAGE = {
     "model": "opus[1m]",
@@ -49,14 +50,19 @@ class FakeDriver(ModelDriver):
         self.actual_model = None
         self.resumed = False
         self.stderr_tail = ""
-        self.calls: list[str] = []
+        self.calls: list[str] = []          # prepend + text (what the SDK sees)
+        self.raw_calls: list[str] = []       # raw text only (what the buffer logs)
         self.subagent_calls: list[tuple[str, str]] = []
         self.gates: list[asyncio.Event] = []
         self.context_calls = 0
         self._usage = usage or {}
 
-    async def query(self, text):
-        self.calls.append(text)
+    async def query(self, text, *, prepend=""):
+        # `text` is the operator's raw message; `prepend` is the model-only
+        # block (working memory + markers). Record the full thing the SDK sees
+        # so marker assertions still hold, and the raw text separately.
+        self.calls.append(prepend + text)
+        self.raw_calls.append(text)
         gate = asyncio.Event()
         self.gates.append(gate)
         await gate.wait()
@@ -115,6 +121,23 @@ def test_render_context() -> None:
     print("✓ render_context_md formats the usage payload (bar, table, rollups, footer)")
 
 
+def test_model_menu() -> None:
+    """The /model dropdown offers the model roster (incl. Fable 5); free-form still works."""
+    app = EngramApp(driver=FakeDriver())
+
+    def vals(text):
+        return [v for v, _ in app._menu_items(text)]
+
+    assert vals("/model ") == [f"/model {n}" for n, _ in MODELS], vals("/model ")
+    assert "/model fable" in vals("/model "), "Fable 5 must be offered"
+    assert vals("/model f") == ["/model fable"], vals("/model f")
+    assert vals("/model op") == ["/model opus[1m]", "/model opus"], vals("/model op")
+    labels = {v: lbl for v, lbl in app._menu_items("/model f")}
+    assert "Fable 5" in labels["/model fable"], labels
+    assert "/model" in vals("/model"), vals("/model")           # still in the top-level menu
+    print("✓ /model dropdown offers the roster incl. Fable 5 (free-form entry still works)")
+
+
 async def scenario_context() -> None:
     driver = FakeDriver(usage=USAGE)
     app = EngramApp(driver=driver)
@@ -161,10 +184,41 @@ async def scenario_agent() -> None:
     print("✓ /agent runs the named sub-agent as a sub-query; task-less/name-only is rejected")
 
 
+async def scenario_ultracode() -> None:
+    driver = FakeDriver()
+    app = EngramApp(driver=driver)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._ultracode is False and app._ultracode_marker() == ""
+        # Toggle on → subtitle badge + a non-empty standing marker.
+        app.post_message(PromptArea.Submitted("/ultracode"))
+        await wait_until(lambda: app._ultracode is True, pilot, "ultracode on")
+        assert "ultracode" in app._subtitle(), app._subtitle()
+        assert app._ultracode_marker().startswith("<system-reminder>"), "marker present when on"
+        # A typed turn now carries the standing opt-in to the model (prepended, model-only).
+        app.post_message(PromptArea.Submitted("hello"))
+        await wait_until(lambda: len(driver.calls) == 1, pilot, "turn to start")
+        sent = driver.calls[0]
+        assert sent.startswith("<system-reminder>") and "Ultracode is on" in sent, sent[:80]
+        assert sent.rstrip().endswith("hello"), sent[-40:]
+        driver.gates[0].set()
+        await wait_until(lambda: not app._busy, pilot, "idle")
+        # Explicit off → marker empty, badge gone, next turn is clean.
+        app.post_message(PromptArea.Submitted("/ultracode off"))
+        await wait_until(lambda: app._ultracode is False, pilot, "ultracode off")
+        assert app._ultracode_marker() == "" and "ultracode" not in app._subtitle()
+        app.post_message(PromptArea.Submitted("hi again"))
+        await wait_until(lambda: len(driver.calls) == 2, pilot, "second turn")
+        assert driver.calls[1] == "hi again", driver.calls[1]
+    print("✓ /ultracode toggles the standing opt-in: subtitle badge + per-turn system-reminder")
+
+
 async def main() -> int:
     test_render_context()
+    test_model_menu()
     await scenario_context()
     await scenario_agent()
+    await scenario_ultracode()
     print("\nALL PASS")
     return 0
 

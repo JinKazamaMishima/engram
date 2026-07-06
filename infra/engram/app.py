@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,8 +57,13 @@ SLASH_CMDS = [
     ("/effort", "set reasoning effort  (low|medium|high|xhigh|max)"),
     ("/model", "switch model  (e.g. opus[1m], sonnet)"),
     ("/mode", "toggle plan ↔ regular  (or shift+tab)"),
+    ("/ultracode", "toggle multi-agent workflow orchestration"),
     ("/agent", "delegate to a sub-agent  (e.g. /agent Explore <task>)"),
     ("/context", "show context-window usage"),
+    ("/rewind", "restore files to before an earlier message"),
+    ("/sessions", "resume another of this folder's sessions"),
+    ("/fork", "branch this conversation (original kept)"),
+    ("/export", "save this conversation as markdown"),
     ("/status", "show session · model · effort"),
     ("/paste", "attach a clipboard image"),
     ("/exit", "quit Engram"),
@@ -69,12 +75,69 @@ ARG_CMDS = {"/effort", "/model", "/agent"}
 # State-changing commands — they touch the driver / warm client, so they must not
 # run while a reply is streaming (mid-turn they're blocked, never queued). /context
 # is read-only but pokes the warm client (a control request), so it's gated too.
-STATE_CMDS = ("/new", "/effort", "/model", "/paste", "/context")
+STATE_CMDS = ("/new", "/effort", "/model", "/paste", "/context", "/rewind",
+              "/sessions", "/fork", "/export")
 
 # Sub-agents Engram can delegate to via /agent (and that the model auto-invokes via the
 # Task tool). These mirror Claude Code's built-ins — confirm the exact names the CLI
 # exposes with /context's `agents` list, and adjust here if they differ.
 SUBAGENTS = ("Explore", "Plan", "general-purpose")
+
+
+def render_tasks_line(todos: list, tasks: list) -> str:
+    """The one-line task panel: todo progress + the active step, then each LIVE
+    sub-agent with its state. Finished agents don't stack up — the transcript
+    already carries their ✓/✗ summary lines inline, so terminal entries collapse
+    into compact counters (and the whole panel empties when nothing is live).
+    Pure (unit-testable without Textual); empty string when nothing to show."""
+    parts = []
+    if todos:
+        done = sum(1 for t in todos if t.get("status") == "completed")
+        line = f"☑ {done}/{len(todos)}"
+        cur = next((t for t in todos if t.get("status") == "in_progress"), None)
+        if cur:
+            line += f"  ▶ {cur.get('activeForm') or cur.get('content') or ''}"
+        parts.append(line)
+    n_done = n_dead = 0
+    for t in tasks:
+        status = t.get("status")
+        if status == "completed":
+            n_done += 1
+        elif status in ("failed", "stopped", "killed"):
+            n_dead += 1
+        else:
+            bit = f"🛰 {t.get('name', 'sub-agent')} ⏳"
+            if t.get("tokens"):
+                bit += f" {int(t['tokens']) // 1000}k"
+            parts.append(bit)
+    if n_done:
+        parts.append(f"🛰 ✓ {n_done} done")
+    if n_dead:
+        parts.append(f"🛰 ✗ {n_dead} failed")
+    return "   ".join(parts)
+
+
+def _age(ts) -> str:
+    """Compact relative-age suffix for a checkpoint row ('' when unknown)."""
+    if not ts:
+        return ""
+    m = int(max(0.0, time.time() - float(ts)) // 60)
+    if m == 0:
+        return "   · just now"
+    if m < 60:
+        return f"   · {m}m ago"
+    return f"   · {m // 60}h {m % 60}m ago"
+
+# Models offered in the /model dropdown. Free-form still works — set_model passes any
+# string straight to the CLI; this is discoverability only. Aliases the CLI accepts;
+# opus[1m] = the 1M-context window. (name, one-line description) like SLASH_CMDS.
+MODELS = (
+    ("opus[1m]", "Opus 4.8 · 1M context (default)"),
+    ("opus",     "Opus 4.8 · 200K"),
+    ("sonnet",   "Sonnet 4.6"),
+    ("fable",    "Fable 5"),
+    ("haiku",    "Haiku 4.5 · fastest"),
+)
 
 # Sticky-header palette (Rich-markup hex, matching ENGRAM_THEME — Static markup can't
 # see Textual's $accent vars). The logo is a pixel gem (half-block "pixels") — the
@@ -100,6 +163,20 @@ ENGRAM_EPIGRAPHS = (
     "to find where a memory lives is to go looking for the self.",
     "not the recollection, but the change it leaves in you.",
     "what persists when the moment is gone.",
+)
+
+# Injected each typed turn while /ultracode is on — mirrors Claude Code's standing
+# "ultracode" opt-in so the CLI's Workflow tool treats multi-agent orchestration as the
+# default for substantive work. Prepended to the turn like the identity marker.
+ULTRACODE_REMINDER = (
+    "<system-reminder>\n"
+    "Ultracode is on for the session — multi-agent Workflow orchestration is a standing "
+    "opt-in. For every substantive task, prefer authoring and running a Workflow "
+    "(decompose → fan out in parallel → adversarially verify → synthesize) over solving "
+    "inline; go solo only for trivial or conversational turns. Favor the most thorough, "
+    "correct result; token cost is not the constraint. Stays on until the user runs "
+    "/ultracode off.\n"
+    "</system-reminder>\n\n"
 )
 
 # A deep night-sky palette: blue-white starlight text on near-black, with a single
@@ -231,6 +308,7 @@ class EngramApp(App):
     #status { height: 1; color: $secondary; text-style: italic; padding: 0 2; }
     #chips { height: auto; color: $accent; padding: 0 2; }
     #queued { height: auto; color: $warning; text-style: italic; padding: 0 2; }
+    #tasks { height: auto; color: $secondary; padding: 0 2; }
     #cmdmenu {
         display: none;
         margin: 0 2; height: auto; max-height: 8;
@@ -279,6 +357,10 @@ class EngramApp(App):
         self._menu_open = False          # slash-command dropdown visible?
         self._queue: list[tuple[str, list]] = []   # type-ahead: msgs typed while busy
         self._pending_mode: str | None = None      # plan/regular armed via shift+tab mid-reply
+        self._ultracode = False                     # /ultracode: standing workflow-orchestration opt-in
+        self._rewind_note = ""                      # model-only heads-up after a /rewind
+        self._todos: list = []                      # last TodoWrite list (persists across turns)
+        self._tasks_snapshot: list = []             # last sub-agent registry snapshot
         self._perception = None                     # PerceptionBridge (opt-in: ENGRAM_PERCEIVE=1)
         # Interactive tools (plan approval · option questions). The driver calls
         # self._handle_interaction through its on_interaction seam; a live card parks the
@@ -300,6 +382,7 @@ class EngramApp(App):
         yield Static("", id="status")
         yield Static("", id="chips")
         yield Static("", id="queued")
+        yield Static("", id="tasks")        # live todo + sub-agent panel
         yield OptionList(id="cmdmenu")
         yield Static("", id="perception")   # live senses HUD (shown when ENGRAM_PERCEIVE on)
         yield PromptArea(id="prompt", soft_wrap=True, tab_behavior="focus")
@@ -400,9 +483,10 @@ class EngramApp(App):
         model = getattr(self.driver, "model", "?")
         effort = getattr(self.driver, "effort", "")
         mode = " · ⏸ plan" if self._effective_mode() == PLAN_MODE else ""
+        ultra = " · ⚡ ultracode" if self._ultracode else ""
         tail = " · subscription" if _STRIPPED_API_KEY else ""
         base = f"{model} · {effort}" if effort else f"{model}"
-        return f"{base}{mode}{tail}"
+        return f"{base}{mode}{ultra}{tail}"
 
     def _render_header(self) -> None:
         try:                                     # a twinkle tick can race mount/teardown
@@ -413,7 +497,7 @@ class EngramApp(App):
         sub = self._subtitle()
         left = [
             (a, f"[{LOGO_C}]{a}[/]"),
-            (f"{b}  V E G A", f"[{LOGO_C}]{b}[/]  [b {NAME_C}]V E G A[/]"),
+            (f"{b}  E N G R A M", f"[{LOGO_C}]{b}[/]  [b {NAME_C}]E N G R A M[/]"),
             (f"{c}  {sub}", f"[{LOGO_C}]{c}[/]  [{SUB_C}]{sub}[/]"),
         ]
         width = head.content_size.width
@@ -456,7 +540,14 @@ class EngramApp(App):
                 + f" · session={getattr(d, 'session_id', None) or 'fresh'}")
 
     def _scroll(self) -> None:
-        self.query_one("#convo", VerticalScroll).scroll_end(animate=False)
+        # Force the convo region to re-layout+repaint each event, THEN pin to the
+        # bottom. scroll_end alone is a no-op once already at the bottom, so streamed
+        # MarkdownStream writes + freshly-mounted widgets sat un-composited until the
+        # next input triggered a re-layout — the "reply only shows on my next message"
+        # bug. The header kept painting only because its 0.7s timer marks it dirty.
+        convo = self.query_one("#convo", VerticalScroll)
+        convo.refresh(layout=True)
+        convo.scroll_end(animate=False)
 
     async def _add(self, widget) -> None:
         await self.query_one("#convo", VerticalScroll).mount(widget)
@@ -465,6 +556,9 @@ class EngramApp(App):
     async def _reset_thread(self) -> None:
         await self.driver.disconnect()
         self.driver.reset()
+        self._todos = []
+        self._tasks_snapshot = []
+        self._render_tasks()
         await self._add(Static("[dim]· · ·  new thread  · · ·[/dim]"))
 
     async def _apply_effort(self, level: str) -> None:
@@ -488,7 +582,10 @@ class EngramApp(App):
         reconnects in the new mode; mid-reply we must NOT drop the warm client — so we
         ARM it and apply the moment the turn ends (it governs the next turn, exactly like
         Claude Code)."""
-        if self._busy:
+        if self._busy or getattr(self.driver, "has_background_tasks", False):
+            # Mid-reply OR background agents out: applying now would recycle (busy)
+            # or kill (background) the warm client — ARM it; it applies at the next
+            # quiet turn end and governs the turn after, exactly like Claude Code.
             self._pending_mode = target
             self._render_header()
             self._status(self._mode_msg(target) + "  ·  applies after this reply")
@@ -524,8 +621,9 @@ class EngramApp(App):
 
     # ---- actions ----
     async def action_new_thread(self) -> None:
-        if not self._busy:
-            await self._reset_thread()
+        if self._busy or getattr(self.driver, "has_background_tasks", False):
+            return                    # same guard as /new — don't orphan live agents
+        await self._reset_thread()
 
     async def action_paste_image(self) -> None:
         self._status("checking clipboard…")
@@ -606,7 +704,14 @@ class EngramApp(App):
             partial = m.group(1).lower()
             return [(f"/agent {name} ", f"/agent {name}")
                     for name in SUBAGENTS if name.lower().startswith(partial)]
-        # Any other "/cmd <arg>" (e.g. /model foo, or free text) — stop suggesting.
+        # /model <name> — offer the known models, filtered by what's typed. Free-form still
+        # works: an unmatched string just submits and is passed straight to the CLI.
+        m = re.match(r"^/model\s+(\S*)$", text)
+        if m:
+            partial = m.group(1).lower()
+            return [(f"/model {name}", f"/model {name}   {desc}")
+                    for name, desc in MODELS if name.lower().startswith(partial)]
+        # Any other "/cmd <arg>" (free text after a non-completing command) — stop.
         if re.match(r"^/\S+\s", text):
             return []
         # Typing a command name — filter the command list by prefix.
@@ -667,7 +772,7 @@ class EngramApp(App):
             prompt.load_text(value + " ")
             prompt.move_cursor(prompt.document.end)
             prompt.focus()
-            self._refresh_menu(prompt.text)        # /effort,/agent → show options; /model → hide
+            self._refresh_menu(prompt.text)        # /effort,/agent,/model → show options
             return
         # Selected a sub-agent NAME ("/agent Explore ") — complete it and wait for the
         # task; never submit a task-less /agent.
@@ -690,6 +795,17 @@ class EngramApp(App):
         try:
             await self.driver.disconnect()
         except Exception:  # noqa: BLE001
+            pass
+        # Terminal session-end curation seam (the SDK has no SessionEnd hook).
+        # PROVISIONAL full-flush of the LiveBuffer (Brick 3) — folds the whole
+        # un-evicted tail into LTM, advancing the watermark; the nightly confirm
+        # pass reconciles late reversals. Falls back to the transcript --session
+        # pass when there's no buffer. Never marks the session fully-curated.
+        try:
+            evict = getattr(self.driver, "evict_on_shutdown", None)
+            if evict is not None:
+                evict()
+        except Exception:  # noqa: BLE001 — teardown must never fail on curation
             pass
 
     # ---- perception (opt-in: ENGRAM_PERCEIVE=1) — camera senses wired into THIS chat ----
@@ -779,6 +895,30 @@ class EngramApp(App):
                 f"irreversible or private actions on unverified identity alone. No need to "
                 f"acknowledge this line.\n\n")
 
+    def _ultracode_marker(self) -> str:
+        """The standing ultracode opt-in, prepended to a typed turn while /ultracode is on
+        (empty otherwise). Model-only, like the identity marker; typed turns only."""
+        return ULTRACODE_REMINDER if self._ultracode else ""
+
+    def _working_memory_marker(self) -> str:
+        """The Brick-3 tier-2 block: the conversation's recent raw turns + hot
+        notes, re-derived from THIS driver's LiveBuffer (never the SDK's drifting
+        self-summary). Model-only, prepended to `prompt`; the buffer logs the raw
+        `prompt`, so this derived block never feeds back into its own source.
+        ENGRAM_WORKING_MEMORY=0 turns it off; fail-open '' otherwise (like the
+        identity marker), so a memory hiccup never touches the turn."""
+        if os.environ.get("ENGRAM_WORKING_MEMORY", "1") == "0":
+            return ""
+        buf = getattr(self.driver, "_buffer", None)
+        if buf is None:
+            return ""
+        try:
+            from working_set import build_working_memory
+            block = build_working_memory(buf, getattr(self.driver, "cwd", ENGRAM_CWD))
+        except Exception:  # noqa: BLE001 — passenger, never the driver
+            return ""
+        return (block + "\n\n") if block else ""
+
     def _identity_marker(self) -> str:
         """Gather the live snapshot and build the marker; '' when perception is off, so
         normal launches (ENGRAM_PERCEIVE unset) and the Telegram bridge (no camera, single
@@ -825,11 +965,36 @@ class EngramApp(App):
             else:
                 self._status("usage: /mode [plan|regular]   (bare /mode toggles)")
             return
+        # /ultracode — standing opt-in to multi-agent workflow orchestration. Safe mid-reply
+        # (only flips a flag + re-renders; governs the NEXT turn's prompt), so it sits with
+        # the other always-safe toggles, not in STATE_CMDS.
+        if text == "/ultracode" or text.startswith("/ultracode "):
+            arg = text[len("/ultracode"):].strip().lower()
+            if arg in ("", "toggle"):
+                self._ultracode = not self._ultracode
+            elif arg in ("on", "yes", "1"):
+                self._ultracode = True
+            elif arg in ("off", "no", "0"):
+                self._ultracode = False
+            else:
+                self._status("usage: /ultracode [on|off]   (bare /ultracode toggles)")
+                return
+            self._render_header()
+            self._status("ultracode ⚡ on — Engram orchestrates substantive work with workflows"
+                         if self._ultracode else "ultracode off")
+            return
         # State-changing slash commands can't run while a turn is in flight (they'd
         # disrupt the warm client) — block them, don't queue; otherwise dispatch.
+        # The client-RECYCLING ones are also blocked while background agents are out:
+        # dropping the warm client would kill them mid-run.
         if any(text == c or text.startswith(c + " ") for c in STATE_CMDS):
+            cmd = text.split()[0]
             if self._busy:
-                self._status(f"busy — {text.split()[0]} runs once the reply finishes")
+                self._status(f"busy — {cmd} runs once the reply finishes")
+            elif (cmd in ("/new", "/effort", "/model", "/rewind", "/sessions", "/fork")
+                    and getattr(self.driver, "has_background_tasks", False)):
+                self._status(f"🛰 background agents still working — {cmd} would drop "
+                             "them; try again when they finish")
             else:
                 await self._handle_command(text)
             return
@@ -888,6 +1053,132 @@ class EngramApp(App):
             await self.action_paste_image()
         elif text == "/context":
             await self._show_context()
+        elif text == "/rewind":
+            await self._show_rewind()
+        elif text == "/sessions":
+            await self._show_sessions()
+        elif text == "/fork":
+            await self._do_fork()
+        elif text == "/export":
+            await self._do_export()
+
+    async def _show_rewind(self) -> None:
+        """List this session's file checkpoints (one per typed prompt, newest first)
+        and restore the working tree to just before the picked one. Files only —
+        the conversation is untouched (the SDK's rewind semantics) — so a model-only
+        note is armed for the next turn telling Engram the tree moved under it."""
+        if self._busy:
+            self._status("busy — /rewind runs once the reply finishes")
+            return
+        cps = list(getattr(self.driver, "list_checkpoints", lambda: [])())
+        if not cps:
+            self._status("no file checkpoints yet this session — they start with your next message")
+            return
+        recent = list(reversed(cps[-9:]))          # newest first, capped for the card
+        await self._add(Static("[b]▌ Rewind files to just before…[/b]"))
+        choices = [(c["uuid"], f"{i}. ❯ {c['preview']}{_age(c.get('ts'))}")
+                   for i, c in enumerate(recent, 1)]
+        choice = await self._await_choice(
+            choices, hint="↑/↓ + Enter to restore files  ·  Esc to cancel")
+        if choice.get("kind") != "option":
+            await self._add(Static("[dim]rewind cancelled[/dim]"))
+            self._status("ready")
+            return
+        picked = next(c for c in recent if c["uuid"] == choice["id"])
+        try:
+            await self.driver.rewind_to(picked["uuid"])
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the home
+            await self._add(Static(
+                f"[red]rewind failed — {type(exc).__name__}: {escape(str(exc))}[/red]"))
+            tail = getattr(self.driver, "stderr_tail", "")
+            if tail:
+                await self._add(Static(f"[red dim]{escape(tail)}[/red dim]"))
+            self._status("ready")
+            return
+        await self._add(Static(
+            f"[#86EFAC]⏪ files restored to just before: ❯ {escape(picked['preview'])}[/]"))
+        self._rewind_note = (
+            "[system] The working tree was just REWOUND to its state before the prompt "
+            f"\"{picked['preview']}\" — edits made after that point are undone on disk; "
+            "re-read any file you rely on before acting.\n\n")
+        self._status("⏪ rewound — Engram is told on your next message")
+
+    async def _show_sessions(self) -> None:
+        """Pick one of this folder's recent sessions and resume it — per-cwd,
+        like Claude Code's session picker."""
+        if self._busy:
+            self._status("busy — /sessions runs once the reply finishes")
+            return
+        self._status("listing sessions…")
+        sessions = list(getattr(self.driver, "list_sessions", lambda: [])())
+        if not sessions:
+            self._status("no sessions found for this folder")
+            return
+        await self._add(Static("[b]▌ Resume a session in this folder…[/b]"))
+        choices = []
+        for i, s in enumerate(sessions, 1):
+            mark = "   · current" if s.get("current") else ""
+            choices.append((s["sid"], f"{i}. ❯ {s['preview']}{_age(s.get('mtime'))}{mark}"))
+        choice = await self._await_choice(
+            choices, hint="↑/↓ + Enter to resume  ·  Esc to cancel")
+        if choice.get("kind") != "option":
+            await self._add(Static("[dim]cancelled[/dim]"))
+            self._status("ready")
+            return
+        await self.driver.resume_session(choice["id"])
+        await self._add(Static(f"[#86EFAC]↺ resumed session {escape(choice['id'][:8])} — "
+                               "your next message continues that thread[/]"))
+        self._status("↺ resumed — next message continues that thread")
+
+    async def _do_fork(self) -> None:
+        """Branch the conversation: next message starts a NEW session id resumed
+        from here; the original thread stays untouched (see /sessions)."""
+        if self._busy:
+            self._status("busy — /fork runs once the reply finishes")
+            return
+        if not getattr(self.driver, "session_id", None):
+            self._status("nothing to fork yet — this thread has no session")
+            return
+        await self.driver.fork()
+        await self._add(Static("[#C4B5FD]⑂ forked — your next message starts a new "
+                               "branch; the original thread is kept (see /sessions)[/]"))
+        self._status("⑂ forked — next message begins the branch")
+
+    async def _do_export(self) -> None:
+        """Write this session's conversation (denoised) to a markdown file in the
+        launch folder."""
+        sid = getattr(self.driver, "session_id", None)
+        cwd = Path(getattr(self.driver, "cwd", ENGRAM_CWD))
+        if not sid:
+            self._status("nothing to export yet — this thread has no session")
+            return
+        try:
+            from recall.transcripts import (
+                iter_exchanges,
+                project_transcript_dir,
+                session_transcript_path,
+            )
+            path = session_transcript_path(project_transcript_dir(cwd), sid)
+            exchanges = list(iter_exchanges(path, None))
+        except Exception as exc:  # noqa: BLE001 — surface, never crash the home
+            self._status(f"export failed: {type(exc).__name__}")
+            return
+        if not exchanges:
+            self._status("nothing to export yet — the transcript is still empty")
+            return
+        stamp = time.strftime("%Y%m%d-%H%M")
+        out = cwd / f"engram-session-{sid[:8]}-{stamp}.md"
+        lines = [f"# Engram session {sid[:8]} — exported {time.strftime('%Y-%m-%d %H:%M')}", ""]
+        for ex in exchanges:
+            who = "**❯ you**" if ex.role == "user" else "**Engram**"
+            lines += [f"{who}:", "", ex.text.strip(), ""]
+        try:
+            out.write_text("\n".join(lines))
+        except OSError as exc:
+            self._status(f"export failed: {exc}")
+            return
+        await self._add(Static(f"[#86EFAC]⇩ exported → {escape(str(out))}[/]"))
+        self._status("exported")
 
     async def _show_context(self) -> None:
         """Render the context-window breakdown into the scrollback. Gated on busy so
@@ -937,9 +1228,25 @@ class EngramApp(App):
         else:
             prompt = shown = text
         await self._add(UserMsg(f"❯ {escape(shown)}"))
-        # Prepend the live face-ID verdict so Engram knows WHO is at the keyboard on every
-        # typed turn (empty unless ENGRAM_PERCEIVE is on). Goes to the model only, not `shown`.
-        self._run_turn(self._identity_marker() + prompt)
+        # Build the model-ONLY prepend (never logged as the operator's raw text —
+        # the LiveBuffer logs `prompt`, the driver sends prepend+prompt): the
+        # working-memory block (standing conversation context, re-grounded from
+        # the buffer) → the one-shot rewind note (if files were just restored) →
+        # the standing ultracode reminder (if /ultracode on) → the live face-ID
+        # verdict (if ENGRAM_PERCEIVE on). Order = standing memory → tree state →
+        # mode → who. All model-only, none in `shown`.
+        note, self._rewind_note = self._rewind_note, ""
+        prepend = (self._working_memory_marker() + note
+                   + self._ultracode_marker() + self._identity_marker())
+        self._run_turn(prompt, prepend=prepend)
+
+    def _render_tasks(self) -> None:
+        """Refresh the sticky todo/sub-agent panel above the prompt."""
+        try:
+            self.query_one("#tasks", Static).update(
+                escape(render_tasks_line(self._todos, self._tasks_snapshot)))
+        except Exception:  # noqa: BLE001 — panel not mounted (teardown); skip
+            pass
 
     def _render_queue(self) -> None:
         """The pending type-ahead strip above the prompt — previews of queued msgs."""
@@ -996,9 +1303,11 @@ class EngramApp(App):
              ("keep",    "✎  Keep planning — refine it (or type feedback below)")],
             hint="↑/↓ + Enter to choose  ·  or type feedback + Enter to keep planning")
         if choice.get("kind") == "option" and choice.get("id") == "approve":
-            # Approving persistently exits plan mode (the driver synced its field); mirror it
-            # here for the indicator and drop any armed pending mode so nothing re-enters plan.
-            self.driver.permission_mode = REGULAR_MODE
+            # Approving lands back in the PRE-plan mode (the driver restores it live once
+            # this handler returns); mirror the same target here for the indicator and drop
+            # any armed pending mode so nothing re-enters plan.
+            self.driver.permission_mode = getattr(
+                self.driver, "plan_restore_target", REGULAR_MODE)
             self._pending_mode = None
             self._render_header()
             await self._add(Static("[#86EFAC]✓ approved — leaving plan mode, implementing…[/]"))
@@ -1121,7 +1430,8 @@ class EngramApp(App):
 
     # ---- the turn (background worker; incremental Markdown streaming) ----
     @work(exclusive=True)
-    async def _run_turn(self, text: str, agent: "tuple | None" = None) -> None:
+    async def _run_turn(self, text: str, agent: "tuple | None" = None,
+                        prepend: str = "") -> None:
         self._busy = True
         self._cur_md = None
         self._cur_stream = None
@@ -1132,7 +1442,7 @@ class EngramApp(App):
         self._status(f"✦ {agent[0]} working…" if agent else "✦ thinking…")
         try:
             source = (self.driver.run_subagent(*agent) if agent
-                      else self.driver.query(text))
+                      else self.driver.query(text, prepend=prepend))
             async for ev in source:
                 if ev.kind == "text":
                     await self._ensure_stream()     # (re)open a block; a card may have broken it
@@ -1150,6 +1460,12 @@ class EngramApp(App):
                     self._status(f"⚙ {ev.text}…")
                 elif ev.kind == "status":          # ephemeral (sub-agent progress)
                     self._status(f"⚙ {ev.text}…")
+                elif ev.kind == "todos":
+                    self._todos = (ev.data or {}).get("todos") or []
+                    self._render_tasks()
+                elif ev.kind == "task":
+                    self._tasks_snapshot = (ev.data or {}).get("tasks") or []
+                    self._render_tasks()
                 self._scroll()
         except Exception as exc:  # noqa: BLE001 — surface, never crash the home
             await self._ensure_stream()
@@ -1160,8 +1476,11 @@ class EngramApp(App):
         finally:
             await self._break_stream()
             self._busy = False
-            # A mode armed via shift+tab mid-reply applies now, governing the next turn.
-            if self._pending_mode is not None:
+            bg_live = getattr(self.driver, "has_background_tasks", False)
+            # A mode armed via shift+tab mid-reply applies now, governing the next turn —
+            # unless background agents are still out: applying recycles the warm client,
+            # which would kill them. It stays armed and applies at the next quiet turn end.
+            if self._pending_mode is not None and not bg_live:
                 target, self._pending_mode = self._pending_mode, None
                 try:
                     await self.driver.set_permission_mode(target)
@@ -1172,7 +1491,13 @@ class EngramApp(App):
             try:                                   # all best-effort: a quit/teardown mid-turn
                 if not wrote_any and not self._last_reply:   # removes #convo before this runs
                     await self._add(Static("[dim]*(no text in reply)*[/dim]"))
-                self._status("ready" + (f"   ·   ⚙ {', '.join(tools)}" if tools else ""))
+                self._status("🛰 background agents working — results stream in here" if bg_live
+                             else "ready" + (f"   ·   ⚙ {', '.join(tools)}" if tools else ""))
+                if not bg_live:
+                    # The turn is over: finished sub-agents live in the transcript,
+                    # not the panel (todos persist — they're session state).
+                    self._tasks_snapshot = []
+                    self._render_tasks()
                 self._scroll()
             except Exception:  # noqa: BLE001 — convo/status gone (app closing); nothing to show
                 pass
@@ -1180,6 +1505,54 @@ class EngramApp(App):
             # Deferred to after-refresh so this (exclusive) worker fully exits first.
             if self._queue:
                 self.call_after_refresh(self._drain_queue)
+            elif bg_live:
+                # Nothing queued but background agents are out: keep listening while
+                # idle so their results PAINT when they land (prompt stays unlocked;
+                # a typed turn cancels this exclusive-group worker and takes over).
+                self.call_after_refresh(self._drain_bg)
+
+    @work(exclusive=True)
+    async def _drain_bg(self) -> None:
+        """Idle listener: paints background sub-agent completions and the model's
+        follow-up turns the moment they land, with the prompt UNLOCKED throughout.
+        Same exclusive worker group as _run_turn, so typing cancels this instantly
+        and the typed turn (reading the same stream) takes over seamlessly."""
+        source = getattr(self.driver, "drain_background", None)
+        if source is None:
+            return
+        self._cur_md = None
+        self._cur_stream = None
+        self._cur_last = ""
+        try:
+            async for ev in source():
+                if ev.kind == "text":
+                    await self._ensure_stream()
+                    sep = _seam(self._cur_last, ev.text)
+                    if sep:
+                        await self._cur_stream.write(sep)
+                    await self._cur_stream.write(ev.text)
+                    self._cur_last = ev.text
+                elif ev.kind in ("tool", "status"):
+                    self._status(f"⚙ {ev.text}…")
+                elif ev.kind == "todos":
+                    self._todos = (ev.data or {}).get("todos") or []
+                    self._render_tasks()
+                elif ev.kind == "task":
+                    self._tasks_snapshot = (ev.data or {}).get("tasks") or []
+                    self._render_tasks()
+                self._scroll()
+        except Exception:  # noqa: BLE001 — best-effort; the next typed turn re-reads
+            pass
+        finally:
+            try:
+                await self._break_stream()
+                if not getattr(self.driver, "has_background_tasks", False):
+                    self._status("ready")
+                    self._tasks_snapshot = []      # last background agent landed —
+                    self._render_tasks()           # the panel's job here is done
+                    self._scroll()
+            except Exception:  # noqa: BLE001 — teardown / cancelled mid-await
+                pass
 
 
 def main() -> int:

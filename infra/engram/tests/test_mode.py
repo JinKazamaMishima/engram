@@ -15,8 +15,10 @@ import sys
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
-from app import EngramApp, PromptArea  # noqa: E402
-from core import PLAN_MODE, REGULAR_MODE, AgentSDKDriver, Event, ModelDriver  # noqa: E402
+from core import (  # noqa: E402
+    AgentSDKDriver, Event, ModelDriver, PLAN_MODE, REGULAR_MODE,
+)
+from app import PromptArea, EngramApp  # noqa: E402
 
 
 class FakeDriver(ModelDriver):
@@ -33,7 +35,7 @@ class FakeDriver(ModelDriver):
         self.mode_calls: list[str] = []
         self.gates: list[asyncio.Event] = []
 
-    async def query(self, text):
+    async def query(self, text, *, prepend=""):
         gate = asyncio.Event()
         self.gates.append(gate)
         await gate.wait()
@@ -65,16 +67,16 @@ async def scenario_shift_tab() -> None:
         # Starts in regular; the subtitle says nothing about plan.
         assert driver.permission_mode == REGULAR_MODE
         assert "plan" not in app._subtitle(), app._subtitle()
-        # The real keypress (prompt is focused on mount) → flips to plan, live.
+        # The real keypress (prompt is focused on mount) → plan (no ask stop anymore).
         await pilot.press("shift+tab")
         await wait_until(lambda: driver.permission_mode == PLAN_MODE, pilot, "shift+tab → plan")
         assert "plan" in app._subtitle(), app._subtitle()
         assert "plan mode" in widget_status(app).lower(), widget_status(app)
-        # Again → back to regular.
+        # Again → back to regular (full cycle).
         await pilot.press("shift+tab")
         await wait_until(lambda: driver.permission_mode == REGULAR_MODE, pilot, "shift+tab → regular")
         assert "plan" not in app._subtitle(), app._subtitle()
-    print("✓ shift+tab cycles plan ↔ regular live (driver mode + subtitle follow)")
+    print("✓ shift+tab cycles regular → plan → regular (driver mode + subtitle follow)")
 
 
 async def scenario_mode_command() -> None:
@@ -86,14 +88,14 @@ async def scenario_mode_command() -> None:
         await wait_until(lambda: driver.permission_mode == PLAN_MODE, pilot, "/mode plan")
         app.post_message(PromptArea.Submitted("/mode regular"))
         await wait_until(lambda: driver.permission_mode == REGULAR_MODE, pilot, "/mode regular")
-        app.post_message(PromptArea.Submitted("/mode"))            # bare → toggle
-        await wait_until(lambda: driver.permission_mode == PLAN_MODE, pilot, "/mode toggle")
+        app.post_message(PromptArea.Submitted("/mode"))            # bare → cycle: regular → plan
+        await wait_until(lambda: driver.permission_mode == PLAN_MODE, pilot, "/mode cycle")
         # Garbage arg → usage hint, mode unchanged.
         app.post_message(PromptArea.Submitted("/mode sideways"))
         await pilot.pause()
         assert driver.permission_mode == PLAN_MODE, "bad /mode arg must not change the mode"
         assert "usage" in widget_status(app).lower(), widget_status(app)
-    print("✓ /mode sets plan|regular explicitly, bare /mode toggles, bad arg → usage")
+    print("✓ /mode sets plan|regular explicitly, bare /mode cycles, bad arg → usage")
 
 
 async def scenario_arm_mid_reply() -> None:
@@ -107,7 +109,7 @@ async def scenario_arm_mid_reply() -> None:
         await pilot.pause()
         # Driver NOT switched yet (a live control request would race the stream)…
         assert driver.mode_calls == [], "mode must not switch live mid-reply"
-        assert app._pending_mode == PLAN_MODE
+        assert app._pending_mode == PLAN_MODE, app._pending_mode
         assert "plan" in app._subtitle(), "subtitle should preview the armed mode"
         # …it applies the instant the turn ends.
         driver.gates[0].set()
@@ -136,6 +138,40 @@ async def scenario_leaving_plan_recycles_client() -> None:
     print("✓ set_permission_mode recycles the client — no live-switch plan-mode wedge")
 
 
+async def scenario_plan_approval_restores_pre_plan_mode() -> None:
+    """The prompt-hell fix (2026-07-03): approving a plan releases plan mode at the CLI
+    level — but into the CLI's own "default" mode, NOT the bypass mode you act in. The
+    driver must remember the pre-plan mode and restore it LIVE on approval so the
+    implementation turn runs free."""
+    class FakeClient:
+        def __init__(self): self.modes: list[str] = []
+        async def disconnect(self): ...
+        async def set_permission_mode(self, mode): self.modes.append(mode)
+
+    async def approve(req): return {"approved": True}
+
+    # Planned from regular: approval restores regular, via a live control request.
+    driver = AgentSDKDriver(store=None)
+    driver.permission_mode = REGULAR_MODE
+    await driver.set_permission_mode(PLAN_MODE)            # enter plan (from regular)
+    assert driver.plan_restore_target == REGULAR_MODE
+    fc = FakeClient()
+    driver._client = fc                                    # the client reconnected in plan
+    driver.on_interaction = approve
+    res = await driver._can_use_tool("ExitPlanMode", {"plan": "do it"}, None)
+    assert res is not None
+    assert driver.permission_mode == REGULAR_MODE, "approval must restore the PRE-plan mode"
+    assert fc.modes == [REGULAR_MODE], f"live restore expected, got {fc.modes}"
+
+    # Manually cycling OUT of plan consumes the memory (next approval can't restore stale).
+    driver3 = AgentSDKDriver(store=None)
+    driver3.permission_mode = REGULAR_MODE
+    await driver3.set_permission_mode(PLAN_MODE)
+    await driver3.set_permission_mode(REGULAR_MODE)        # manual exit, no approval
+    assert driver3._pre_plan_mode is None, "manual exit must clear the pre-plan memory"
+    print("✓ plan approval restores the pre-plan mode (live restore to regular)")
+
+
 def widget_status(app) -> str:
     from textual.widgets import Static
     w = app.query_one("#status", Static)
@@ -151,6 +187,7 @@ async def main() -> int:
     await scenario_mode_command()
     await scenario_arm_mid_reply()
     await scenario_leaving_plan_recycles_client()
+    await scenario_plan_approval_restores_pre_plan_mode()
     print("\nALL PASS")
     return 0
 

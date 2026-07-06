@@ -15,8 +15,8 @@ import sys
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
-from app import EngramApp, PromptArea  # noqa: E402
 from core import Event, ModelDriver  # noqa: E402
+from app import PromptArea, EngramApp  # noqa: E402
 from textual.widgets import Static  # noqa: E402
 
 
@@ -32,7 +32,7 @@ class FakeDriver(ModelDriver):
         self.calls: list[str] = []
         self.gates: list[asyncio.Event] = []
 
-    async def query(self, text):
+    async def query(self, text, *, prepend=""):
         self.calls.append(text)
         gate = asyncio.Event()
         self.gates.append(gate)

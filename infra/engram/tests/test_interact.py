@@ -2,8 +2,8 @@
 """Headless tests for the interactive tools — plan approval (ExitPlanMode) and option
 questions (AskUserQuestion) — driven through the real Textual UI with a fake driver that
 invokes the app's ``on_interaction`` seam exactly the way core.AgentSDKDriver._can_use_tool
-does. Covers the five behaviours: render the plan, approve → leave plan mode, keep-planning
-with feedback, pick an option, and type-your-own / chat. Same FakeDriver + pilot style as
+does. Covers the operator's five asks: render the plan, approve → leave plan mode, keep-planning with
+feedback, pick an option, and type-your-own / chat. Same FakeDriver + pilot style as
 test_mode.py.
 
     .venv/bin/python infra/engram/tests/test_interact.py
@@ -15,7 +15,7 @@ import sys
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
-from app import EngramApp, PromptArea  # noqa: E402
+from app import PromptArea, EngramApp  # noqa: E402
 from core import PLAN_MODE, REGULAR_MODE, Event, ModelDriver  # noqa: E402
 from textual.widgets import OptionList  # noqa: E402
 
@@ -37,7 +37,7 @@ class InteractDriver(ModelDriver):
         self.result = None            # what on_interaction returned (the verdict)
         self.mode_calls: list[str] = []
 
-    async def query(self, text):
+    async def query(self, text, *, prepend=""):
         self.result = await self.on_interaction(self._request)
         yield Event("text", "done")
 
