@@ -14,8 +14,8 @@ REPO = os.path.abspath(os.path.join(ENGRAM, "..", ".."))
 sys.path.insert(0, ENGRAM)
 sys.path.insert(0, os.path.join(REPO, "src"))
 
-from core import AgentSDKDriver, SessionStore  # noqa: E402
 from claude_agent_sdk import ResultMessage, SystemMessage  # noqa: E402
+from core import AgentSDKDriver, SessionStore  # noqa: E402
 
 
 class FakeClient:

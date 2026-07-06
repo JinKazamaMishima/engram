@@ -15,10 +15,14 @@ import sys
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
+from app import EngramApp, PromptArea  # noqa: E402
 from core import (  # noqa: E402
-    AgentSDKDriver, Event, ModelDriver, PLAN_MODE, REGULAR_MODE,
+    PLAN_MODE,
+    REGULAR_MODE,
+    AgentSDKDriver,
+    Event,
+    ModelDriver,
 )
-from app import PromptArea, EngramApp  # noqa: E402
 
 
 class FakeDriver(ModelDriver):

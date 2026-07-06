@@ -8,7 +8,6 @@ LiveBuffer must round-trip through recall.transcripts.iter_buffer_exchanges.
     .venv/bin/python infra/engram/tests/test_buffer.py
 """
 import asyncio
-import json
 import os
 import sys
 import tempfile
@@ -26,6 +25,7 @@ from core import AgentSDKDriver, Event  # noqa: E402
 # which mirrors on a separate track — skip that one round-trip check when this repo's
 # engine predates Brick-3 (the rest of the LiveBuffer suite is engine-independent).
 from recall import transcripts as _T  # noqa: E402
+
 _ENGINE_HAS_BRICK3 = hasattr(_T, "iter_buffer_exchanges")
 
 

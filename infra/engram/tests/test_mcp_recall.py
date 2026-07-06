@@ -46,8 +46,8 @@ def make_world(tmp: Path):
 async def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         project = make_world(Path(td))
-        from memory_tools import build_recall_server
         import memory_tools
+        from memory_tools import build_recall_server
         # Force keyword-only determinism: no daemon reachable in tests anyway,
         # but make it explicit and instant.
         memory_tools._fetch_query_vector = lambda prompt: None

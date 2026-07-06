@@ -19,11 +19,18 @@ ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
 import core  # noqa: E402  (for monkeypatching the idle timeout)
-from core import AgentSDKDriver  # noqa: E402
 from claude_agent_sdk import (  # noqa: E402
-    AssistantMessage, ResultMessage, SystemMessage, TaskNotificationMessage,
-    TaskProgressMessage, TaskStartedMessage, TaskUpdatedMessage, TextBlock, ToolUseBlock,
+    AssistantMessage,
+    ResultMessage,
+    SystemMessage,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
+    TextBlock,
+    ToolUseBlock,
 )
+from core import AgentSDKDriver  # noqa: E402
 
 
 def AM(text=None, *, tool=None, parent=None):

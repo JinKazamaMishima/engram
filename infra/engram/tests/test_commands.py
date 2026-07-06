@@ -16,10 +16,9 @@ import sys
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
+from app import MODELS, EngramApp, PromptArea  # noqa: E402
 from core import Event, ModelDriver, render_context_md  # noqa: E402
-from app import MODELS, PromptArea, EngramApp  # noqa: E402
 from textual.widgets import Static  # noqa: E402
-
 
 USAGE = {
     "model": "opus[1m]",

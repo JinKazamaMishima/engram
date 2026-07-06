@@ -72,8 +72,6 @@ def test_cooled_edge_excludes_hot_window():
             assert edge is not None
             rows = d._buffer.tail(10)
             assert edge[0] == rows[1]["ts"]  # cooled = rows[:-3] → last cooled is row index 1
-            # not enough rows to cool → None
-            d2 = _driver(tmp + "/x" if False else tmp, dr)
         finally:
             core.EVICT_HOT_TURNS = hot
     with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as dr:

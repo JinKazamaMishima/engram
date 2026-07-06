@@ -5,7 +5,6 @@ truncation, and the fail-open contract.
 
     .venv/bin/python infra/engram/tests/test_working_set.py
 """
-import json
 import os
 import sys
 import tempfile
@@ -17,13 +16,14 @@ sys.path.insert(0, ENGRAM)
 REPO = os.path.abspath(os.path.join(ENGRAM, "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "src"))
 
-from buffer import LiveBuffer  # noqa: E402
 import working_set as ws  # noqa: E402
+from buffer import LiveBuffer  # noqa: E402
 
 # Activation/validity note-surfacing lives in the recall ENGINE (separate mirror track);
 # skip the note tests when this repo's engine predates Brick-3 (the buffer/render tests
 # are engine-independent). Probe a concrete Brick-3 engine symbol as the gate.
 from recall import transcripts as _T  # noqa: E402
+
 _ENGINE_HAS_BRICK3 = hasattr(_T, "iter_buffer_exchanges")
 
 
@@ -72,7 +72,6 @@ def test_turns_window_and_per_turn_cap():
         block = ws.build_working_memory(b, Path(d), turns=3, notes=0)
         assert "msg 19" in block and "msg 16" not in block   # only last 3
         # a huge single turn is capped, block stays bounded
-        b2 = _buf(d + "/x" if False else d, [])
     with tempfile.TemporaryDirectory() as d2:
         big = _buf(d2, [("user", "x" * 5000)])
         block = ws.build_working_memory(big, Path(d2), notes=0)
@@ -154,7 +153,7 @@ def test_fail_open_on_broken_corpus():
     # the block still builds from the turns.
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["RECALL_DATA_ROOT"] = str(Path(tmp) / "data")
-        from recall import config, activation
+        from recall import activation, config
         cwd = Path(tmp) / "proj"
         kd = config.project_corpus_dir(cwd)
         kd.mkdir(parents=True, exist_ok=True)
