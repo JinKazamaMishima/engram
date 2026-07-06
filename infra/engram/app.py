@@ -32,6 +32,7 @@ from core import (  # noqa: E402
     AgentSDKDriver,
     LaunchLock,
     ModelDriver,
+    _model_family,
     render_context_md,
 )
 from rich.markup import escape  # noqa: E402
@@ -359,6 +360,7 @@ class EngramApp(App):
         self._pending_mode: str | None = None      # plan/regular armed via shift+tab mid-reply
         self._ultracode = False                     # /ultracode: standing workflow-orchestration opt-in
         self._rewind_note = ""                      # model-only heads-up after a /rewind
+        self._fallback_shown = False                # one-time notice when the model rotates
         self._todos: list = []                      # last TodoWrite list (persists across turns)
         self._tasks_snapshot: list = []             # last sub-agent registry snapshot
         self._perception = None                     # PerceptionBridge (opt-in: ENGRAM_PERCEIVE=1)
@@ -482,6 +484,11 @@ class EngramApp(App):
     def _subtitle(self) -> str:
         model = getattr(self.driver, "model", "?")
         effort = getattr(self.driver, "effort", "")
+        # A live fallback rotation is loud in the header: "fable → opus ⚠ fallback".
+        # The 0.7s twinkle re-renders this, so it appears within a blink of the switch.
+        fb = getattr(self.driver, "active_fallback", None)
+        if fb:
+            model = f"{model} → {_model_family(fb) or fb} ⚠ fallback"
         mode = " · ⏸ plan" if self._effective_mode() == PLAN_MODE else ""
         ultra = " · ⚡ ultracode" if self._ultracode else ""
         tail = " · subscription" if _STRIPPED_API_KEY else ""
@@ -534,8 +541,12 @@ class EngramApp(App):
     def _status_line(self) -> str:
         d = self.driver
         actual = getattr(d, "actual_model", None)
+        fb = getattr(d, "active_fallback", None)
+        cfg_fb = getattr(d, "fallback_model", None)
         return (f"model={getattr(d, 'model', '?')}"
                 + (f"  (SDK reports: {actual})" if actual else "")
+                + (f"  ⚠ ON FALLBACK: {fb}" if fb
+                   else (f" · fallback={cfg_fb}" if cfg_fb else ""))
                 + f" · effort={getattr(d, 'effort', '?')}"
                 + f" · session={getattr(d, 'session_id', None) or 'fresh'}")
 
@@ -1489,6 +1500,19 @@ class EngramApp(App):
                 self._render_header()
             self._last_reply = "".join(acc).strip()
             try:                                   # all best-effort: a quit/teardown mid-turn
+                # Loud, once-per-rotation notice when the CLI silently drops to the
+                # fallback (overload). Re-arms when it rotates back, so a later switch
+                # announces again. The header marker (via _subtitle) stays up meanwhile.
+                fb = getattr(self.driver, "active_fallback", None)
+                if fb and not self._fallback_shown:
+                    self._fallback_shown = True
+                    await self._add(Static(
+                        f"[yellow]⚠ primary model unavailable — this turn ran on the "
+                        f"fallback ([b]{escape(str(fb))}[/b]). The conversation "
+                        f"continues; it rotates back automatically when the primary "
+                        f"recovers.[/yellow]"))
+                elif not fb:
+                    self._fallback_shown = False
                 if not wrote_any and not self._last_reply:   # removes #convo before this runs
                     await self._add(Static("[dim]*(no text in reply)*[/dim]"))
                 self._status("🛰 background agents working — results stream in here" if bg_live

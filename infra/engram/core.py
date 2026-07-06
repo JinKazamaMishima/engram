@@ -104,6 +104,22 @@ EVICT_HOT_TURNS = int(os.environ.get("ENGRAM_WM_TURNS", "12"))
 # Reasoning effort levels, low→high, matching Claude Code's /effort.
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
+# Known model families, so the UI can tell a fallback apart from the primary even
+# though one side is an alias ("fable", "opus[1m]") and the other the resolved id
+# the SDK reports back ("claude-fable-5", "claude-opus-4-8"). Order matters only if
+# an id ever contained two — it won't.
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+
+
+def _model_family(name: Optional[str]) -> Optional[str]:
+    """The family token in a model alias OR a resolved id ('opus'/'sonnet'/
+    'haiku'/'fable'), else None — lets configured-vs-actual be compared across the
+    alias/id boundary without a lookup table."""
+    if not name:
+        return None
+    low = str(name).lower()
+    return next((f for f in _MODEL_FAMILIES if f in low), None)
+
 # Permission modes Engram cycles between with shift+tab, like Claude Code. "Regular" =
 # bypassPermissions (Engram acts freely; the persona is the only guardrail). "Plan" =
 # the SDK's read-only plan mode (investigate + propose, make no changes). The SDK also
@@ -607,6 +623,7 @@ class AgentSDKDriver(ModelDriver):
         self._fork_buf_copy = False    # armed by fork(); consumed at the new sid
         self._evicting = False         # one detached curate at a time (A6)
         self.actual_model: Optional[str] = None   # what the SDK reports it's REALLY using
+        self.fallback_model: Optional[str] = None  # configured fallback (set in _options)
         self._stderr: list[str] = []
         # Set by the front-end (app.py) to render plan-approval / option-question UI; see
         # ModelDriver.on_interaction. None → headless defaults in _can_use_tool.
@@ -663,10 +680,17 @@ class AgentSDKDriver(ModelDriver):
         # overloaded/unavailable error, the CLI retries the SAME turn on the fallback
         # instead of dying — which also kept the stale-resume fallback in query() from
         # ever misreading an overload as a dead session and resetting the thread.
-        # ENGRAM_FALLBACK_MODEL="" disables; equal-to-primary is skipped (CLI rejects it).
-        fallback = os.environ.get("ENGRAM_FALLBACK_MODEL", "sonnet")
-        if fallback and fallback != self.model:
+        # Default Opus 4.8 — a real capability floor, not Sonnet.
+        # ENGRAM_FALLBACK_MODEL="" disables; a SAME-FAMILY fallback is skipped (pointless,
+        # and the CLI rejects a fallback equal to the primary) so opus-primary sessions
+        # don't "fall back" to Opus. self.fallback_model names it for the UI.
+        fallback = os.environ.get("ENGRAM_FALLBACK_MODEL", "claude-opus-4-8")
+        if (fallback and fallback != self.model
+                and _model_family(fallback) != _model_family(self.model)):
             opts["fallback_model"] = fallback
+            self.fallback_model = fallback
+        else:
+            self.fallback_model = None
         if os.environ.get("ENGRAM_CHECKPOINTS", "1") != "0":
             # File checkpoints (the CLI shadow-copies before each edit, one anchor per
             # user prompt) + replay-user-messages so the stream echoes UserMessages
@@ -751,18 +775,10 @@ class AgentSDKDriver(ModelDriver):
     # ---- eviction-is-curation (Brick 3 A6) ---------------------------------
 
     def _evict_watermark(self) -> str:
-        """This convo's curation watermark, read fresh from core's own
-        curated.json (core is authoritative — it advances it only at the
-        post-validation success point). '' when never curated. Fail-open ''."""
-        try:
-            import json
-            from recall import config
-            f = (config.curation_dir() / config.project_slug(self.cwd)
-                 / "curated.json")
-            data = json.loads(f.read_text())
-            return (data.get("watermarks") or {}).get(self._buf_convo_id) or ""
-        except Exception:  # noqa: BLE001
-            return ""
+        """This convo's curation watermark, read fresh each time. '' when
+        never curated. Fail-open '' (see buffer.read_buffer_watermark)."""
+        from buffer import read_buffer_watermark
+        return read_buffer_watermark(self.cwd, self._buf_convo_id)
 
     def _cooled_edge(self) -> Optional[tuple[str, int]]:
         """(until_ts, cooled_char_count) for the buffer range that has cooled OUT
@@ -988,6 +1004,15 @@ class AgentSDKDriver(ModelDriver):
         await self.connect()
         assert self._client is not None
         return dict(await self._client.get_context_usage())
+
+    @property
+    def active_fallback(self) -> Optional[str]:
+        """The model actually serving THIS session when it differs in FAMILY from
+        the configured primary — i.e. the CLI silently rotated to the fallback on an
+        overload. None while running on the primary (or when actual/primary can't be
+        told apart). The UI surfaces this so a rotation to Opus isn't invisible."""
+        prim, act = _model_family(self.model), _model_family(self.actual_model)
+        return self.actual_model if (prim and act and prim != act) else None
 
     async def run_subagent(self, name: str, task: str) -> AsyncIterator[Event]:
         """Run a named sub-agent as a one-off, ISOLATED, synchronous sub-query — its

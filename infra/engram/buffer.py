@@ -46,16 +46,21 @@ class LiveBuffer:
 
     # ---- write side --------------------------------------------------------
 
-    def append(self, role: str, text: str) -> None:
+    def append(self, role: str, text: str,
+               extra: Optional[dict] = None) -> None:
         """One raw message, written immediately. The caller passes the text the
         HUMAN exchanged — never an injected/derived block (the log-raw/
-        inject-derived invariant lives in the driver)."""
+        inject-derived invariant lives in the driver). ``extra`` merges
+        additional provenance keys into the row (perception rows carry their
+        event kind + gate evidence); the core keys always win a collision and
+        readers ignore keys they don't know."""
         if self._dir is None or not text:
             return
         try:
             self._dir.mkdir(parents=True, exist_ok=True)
             self._seq += 1
-            row = {"convo_id": self._convo_id(), "seq": self._seq,
+            row = {**(extra or {}),
+                   "convo_id": self._convo_id(), "seq": self._seq,
                    "ts": datetime.now(timezone.utc).isoformat(),
                    "role": role, "text": text}
             with self.path().open("a") as f:
@@ -151,3 +156,17 @@ class LiveBuffer:
                 os.replace(src, dst)
         except Exception:  # noqa: BLE001 — fail-open; worst case rows stay
             pass           # under the old id, swept by the nightly net
+
+
+def read_buffer_watermark(cwd: Path, convo_id: str) -> str:
+    """This convo's curation watermark from core's own curated.json (the
+    curate CLI is authoritative — it advances it only at the post-validation
+    success point). Shared by the driver's eviction gate and the perceiving
+    loop's percept eviction. '' when never curated; fail-open ''."""
+    try:
+        from recall import config  # lazy: keeps module import dependency-light
+        f = config.curation_dir() / config.project_slug(cwd) / "curated.json"
+        data = json.loads(f.read_text())
+        return (data.get("watermarks") or {}).get(convo_id) or ""
+    except Exception:  # noqa: BLE001
+        return ""

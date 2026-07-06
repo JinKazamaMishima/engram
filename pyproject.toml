@@ -45,7 +45,12 @@ engram = [
     "textual>=8,<9",
     "rich>=13",
     "opencv-python>=4.13,<5",   # the eye: webcam capture + bench window (infra/engram/eye)
-    "onnxruntime>=1.18,<2",     # face-ID: YuNet detect + ArcFace w600k_mbf embed (ONNX)
+    # face-ID (eye/face.py): YuNet detect + ArcFace w600k_mbf embed — and the ear's
+    # speaker-ID (voice.py): WeSpeaker CAM++ ONNX, with a kaldi-compatible fbank
+    # frontend — all torch-free wheels (no ML-stack re-resolve).
+    "onnxruntime>=1.18,<2",
+    "kaldi-native-fbank>=1.18",
+    "faster-whisper>=1.0,<2",   # the ear's transcription (CTranslate2, torch-free; runs CPU)
 ]
 
 [project.scripts]

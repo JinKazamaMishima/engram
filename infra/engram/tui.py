@@ -90,8 +90,12 @@ async def interactive(driver: AgentSDKDriver) -> int:
                 console.print("[dim]🆕 fresh thread[/dim]\n")
                 continue
             if text == "/status":
+                fb = getattr(driver, "active_fallback", None)
+                cfg_fb = getattr(driver, "fallback_model", None)
+                fb_str = (f" · [yellow]⚠ ON FALLBACK: {fb}[/yellow]" if fb
+                          else (f" · fallback={cfg_fb}" if cfg_fb else ""))
                 console.print(f"[dim]session={driver.session_id or 'fresh'} · "
-                              f"model={driver.model} · effort={driver.effort} · "
+                              f"model={driver.model}{fb_str} · effort={driver.effort} · "
                               f"cwd={driver.cwd}[/dim]\n")
                 continue
             if text == "/context":
@@ -111,6 +115,10 @@ async def interactive(driver: AgentSDKDriver) -> int:
                 console.print(f"[red]error: {type(exc).__name__}: {exc}[/red]")
                 if driver.stderr_tail:
                     console.print(f"[red dim]{driver.stderr_tail}[/red dim]")
+            fb = getattr(driver, "active_fallback", None)
+            if fb:                       # loud per-turn heads-up: the model rotated
+                console.print(f"[yellow]⚠ ran on fallback ({fb}) — primary "
+                              f"unavailable; rotates back automatically.[/yellow]")
             console.print()
     finally:
         await driver.disconnect()

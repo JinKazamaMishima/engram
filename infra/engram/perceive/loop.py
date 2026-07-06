@@ -60,9 +60,9 @@ ENGAGE_PROMPT = ("Look at this webcam frame. Describe ONLY what you can clearly 
 # not an observation; a real object persists across the throttled ~8s reads while a
 # misread does not. We tag each reading with the scene terms that RECUR across the
 # recent reads (≥ CORROBORATE_MIN of the last CORROBORATE_WINDOW) and a ``stable``
-# flag. Nothing is promoted to long-term memory here — step-5 eviction does not exist
-# yet — but this is the signal that gate will require BEFORE recall's surprise scoring,
-# so a hallucinated (hence surprising) claim can't buy permanence.
+# flag. Nothing is promoted to long-term memory HERE — that is step-5 eviction
+# (``percept.PerceptMemory``), whose gate requires this signal BEFORE recall's
+# surprise scoring, so a hallucinated (hence surprising) claim can't buy permanence.
 CORROBORATE_WINDOW = 4     # look back over the last N eye reads (~30s at the 8s cadence)
 CORROBORATE_MIN = 3        # a scene term must recur in ≥ this many of them to be trusted
 
@@ -109,8 +109,7 @@ class PerceiveLoop:
     uses to wake ``core.AgentSDKDriver`` (drive the real mind from perception)."""
 
     def __init__(self, sensorium: Sensorium, faceid: FaceID, eye: Eye, *,
-                 target: str = os.environ.get("ENGRAM_USER") or getpass.getuser(),
-                 eye_interval: float = 8.0, hold: float = 1.5,
+                 target: str = os.environ.get("ENGRAM_USER") or getpass.getuser(), eye_interval: float = 8.0, hold: float = 1.5,
                  use_eye: bool = True, on_event: Optional[Callable[[Event], None]] = None,
                  log_maxlen: int = 500) -> None:
         self.sensorium = sensorium
@@ -205,9 +204,9 @@ class PerceiveLoop:
         """Update the rolling window with this reading and return the scene terms that
         RECUR across ≥ CORROBORATE_MIN of the last CORROBORATE_WINDOW reads, plus a
         ``stable`` flag. A real object persists across reads; a one-off misread does
-        not — so only ``stable`` readings are eviction-eligible (the future step-5
-        gate consumes ``data['corroborated']``/``data['stable']``). Nothing persists
-        here yet; this only produces the signal."""
+        not — so only ``stable`` readings are eviction-eligible (the step-5 gate,
+        ``percept.PerceptMemory._gate``, consumes ``data['corroborated']``/
+        ``data['stable']``). This only produces the signal; percept persists it."""
         terms = _content_terms(text)
         self._reading_terms.append(terms)
         counts: Counter = Counter()
@@ -262,8 +261,8 @@ class PerceiveLoop:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Engram perceiving loop — the engagement gate")
-    ap.add_argument("--device", type=int, default=0, help="V4L2 camera index (usually 0)")
-    ap.add_argument("--person", default=getpass.getuser(), help="who to engage with (the 'is it me' gate)")
+    ap.add_argument("--device", type=int, default=0, help="V4L2 camera index (Brio = 0)")
+    ap.add_argument("--person", default=os.environ.get("ENGRAM_USER") or getpass.getuser(), help="who to engage with (the 'is it me' gate)")
     ap.add_argument("--seconds", type=float, default=None,
                     help="run for N seconds then exit (default: until Ctrl-C)")
     ap.add_argument("--eye-interval", type=float, default=8.0,
