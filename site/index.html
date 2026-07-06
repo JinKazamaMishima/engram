@@ -124,6 +124,7 @@
   <div class="brand">ENGRAM</div>
   <div class="navlinks">
     <a href="#memory">Memory</a>
+    <a href="#context">Continuity</a>
     <a href="#dream">Dream</a>
     <a href="#personality">Personality</a>
     <a href="#install">Install</a>
@@ -177,8 +178,48 @@
   </div>
 </div></section>
 
+<section id="context"><div class="wrap">
+  <div class="reveal">
+    <div class="eyebrow">02 — Continuity</div>
+    <h2>A conversation that <span class="glint">never rots</span>.</h2>
+    <p class="lead">Context windows are rented by the token, and every long chat pays
+      the same three taxes: you re-send the past on every turn, the model loses the
+      middle of what you sent, and when the window finally fills, the transcript gets
+      summarised — then the summary gets summarised. Details die quietly, and the
+      agent keeps talking as if they hadn't.</p>
+  </div>
+  <div class="cols">
+    <div class="col reveal">
+      <span class="num">i</span>
+      <h3>An immutable record</h3>
+      <p>Every exchange lands raw in an append-only buffer on disk — free, because disk
+        isn't context. Each turn, a small working set is re-derived from that record.
+        Never a summary of a summary, so it cannot drift; if it's ever wrong, it's
+        wrong for one turn.</p>
+    </div>
+    <div class="col reveal">
+      <span class="num">ii</span>
+      <h3>Eviction is curation</h3>
+      <p>History that cools out of the window is distilled into memory in the
+        background, off the hot path. Leaving the context window and being forgotten
+        stop being the same event — context becomes a cache over memory, not the
+        memory itself.</p>
+    </div>
+    <div class="col reveal">
+      <span class="num">iii</span>
+      <h3>Priced like it's new</h3>
+      <p>A stock agent's every turn is dearer than the last; Engram's turn carries a
+        bounded block and a few relevant memories, so a week-old conversation is priced
+        like a fresh one. The moving parts ride the newest message, leaving the prefix
+        byte-stable for the prompt cache — and on a local model, where resident context
+        is literal VRAM, a bounded working set is the difference between an agent that
+        fits and one that doesn't.</p>
+    </div>
+  </div>
+</div></section>
+
 <section id="dream" class="on-dark"><div class="wrap reveal">
-  <div class="eyebrow">02 — Dream</div>
+  <div class="eyebrow">03 — Dream</div>
   <h2>And every night, it <span class="glint">dreams</span>.</h2>
   <p class="lead">After it curates the day, Engram sleeps on it — because sleep does two
     opposite jobs, and a living memory needs both.</p>
@@ -199,7 +240,7 @@
 </div></section>
 
 <section id="personality" class="on-dark"><div class="wrap reveal">
-  <div class="eyebrow">03 — Personality</div>
+  <div class="eyebrow">04 — Personality</div>
   <h2>The making of a <span class="glint">self</span>.</h2>
   <p class="lead">Beneath the memory sits a soul — Engram's model of you, and of itself.
     Every night a little of what it learned bleeds in. This is the foundation of an
@@ -212,17 +253,23 @@
 </div></section>
 
 <section id="perception" class="on-dark"><div class="wrap reveal">
-  <div class="eyebrow">04 — Perception <span class="preview-badge">Research preview</span></div>
+  <div class="eyebrow">05 — Perception <span class="preview-badge">Research preview</span></div>
   <h2>Give it <span class="glint">eyes</span>.</h2>
   <p class="lead">An optional perceiving loop turns Engram from a tool into a presence.
     A webcam eye recognises who is there and a local vision model lets it see — so it
     knows you've arrived and what's in front of it.</p>
+  <p>And what it sees, it can now <b>remember</b>. Sightings that survive the
+    corroboration gate — who arrived, what changed, what was said to it — persist to
+    their own buffer and are distilled into memory through the same path as
+    conversation. An hour of an unchanged desk is one memory, not four hundred; a
+    hallucinated reading is none at all.</p>
   <p class="caveat">Experimental. Requires a GPU and a webcam. Off by default, and
-    entirely local — no frame ever leaves the machine.</p>
+    entirely local — no frame ever leaves the machine. An experimental wake-word ear
+    ships in the tree, disabled by default.</p>
 </div></section>
 
 <section id="local" class="on-dark"><div class="wrap reveal">
-  <div class="eyebrow">05 — Local</div>
+  <div class="eyebrow">06 — Local</div>
   <h2>Yours, and only yours.</h2>
   <p class="lead">Your corpus, your models, your face data — none of it leaves this
     computer. No telemetry. The only calls out are to the model you choose, billed to
@@ -230,7 +277,7 @@
 </div></section>
 
 <section id="running" class="on-dark"><div class="wrap reveal">
-  <div class="eyebrow">06 — Always on</div>
+  <div class="eyebrow">07 — Always on</div>
   <h2>Built to <span class="glint">stay running</span>.</h2>
   <p class="lead">Engram is meant to live on a machine you leave on — a home server,
     a workstation, a quiet box in the corner. Its memory work runs on its own

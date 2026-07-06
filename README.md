@@ -25,9 +25,9 @@ runs anywhere; the rest is optional.
 
 | Tier | What it is | Needs |
 |------|-----------|-------|
-| **Memory brain** (`recall`) | The core engine. A hybrid keyword + vector corpus, nightly curation that distills your Claude Code conversations into notes, FSRS-based memory dynamics (reinforce/decay), a nightly "dream" pass that surfaces connections and imagines what-ifs, and weekly reconsolidation. Installs as skills + a retrieval hook into Claude Code. | Python 3.12+ (CPU is fine) |
-| **Engram assistant** | A standalone terminal chat app on the Claude Agent SDK, with the memory wired in — plus `/context`, sub-agent delegation, and a plan ↔ act mode toggle. | + a subscription/API key |
-| **Sensorium** *(experimental)* | A perceiving loop: a webcam "eye" (face recognition + a local vision model) that recognizes the operator and lets the assistant *see*. | + an NVIDIA GPU + a webcam |
+| **Memory brain** (`recall`) | The core engine. A hybrid keyword + vector corpus, nightly curation that distills your Claude Code conversations into notes, FSRS-based memory dynamics (reinforce/decay), temporal validity (superseded facts stay queryable as *historical*, never silently wrong), a nightly "dream" pass that surfaces connections and imagines what-ifs, and weekly reconsolidation. Installs as skills + a retrieval hook into Claude Code. | Python 3.12+ (CPU is fine) |
+| **Engram assistant** | A standalone terminal chat app on the Claude Agent SDK, with the memory wired in — plus **continuous memory**: every exchange lands in an append-only conversation buffer, a bounded working-set block is re-derived from it each turn, and cooled history is evicted *into the corpus* instead of being lost (see [the context problem](#the-context-problem-tokens-kv-and-why-long-chats-rot)). Also: file checkpoints + `/rewind`, `/sessions` + `/fork` + `/export`, a live todo + sub-agent panel, plan ↔ act with an interactive approval card, `/context`, recall as in-process MCP tools, and automatic fallback-model rotation, surfaced loudly in the UI. | + a subscription/API key |
+| **Sensorium** *(experimental)* | A perceiving loop: a webcam "eye" (face recognition + a local vision model) that recognizes the operator and lets the assistant *see* — and **remember what it sees**: gate-verified perception events persist to their own buffer and evict into the corpus exactly like conversation does. An experimental **ear** (wake-word-gated local Whisper) ships in the tree but stays off by default. | + an NVIDIA GPU + a webcam |
 | **Telegram bridge** *(optional)* | Talk to your Engram from your phone; one bot, one authorized chat. | + a bot token |
 
 ## How the memory works
@@ -47,6 +47,103 @@ runs anywhere; the rest is optional.
   over the day's decisions. Nothing a dream invents is treated as fact: a conjecture
   only graduates into the durable corpus once later days corroborate it (a
   counterfactual on a single confirming match; a wrong prediction retires it).
+- **Conversation memory is three-tiered.** The assistant's live conversation
+  rides a stack: an immutable append-only **buffer** (tier 1, disk, raw), a
+  bounded **working-set block** re-derived from that buffer every turn (tier 2,
+  in-context), and the curated **corpus** (tier 3, retrieved on demand). History
+  that cools out of the working set is *evicted into curation* — distilled into
+  notes off the hot path — so a conversation can span days without its context
+  rotting. The full design: [docs/continuous-memory.md](docs/continuous-memory.md).
+- **Facts carry validity windows.** When a new note supersedes an old one, the
+  old note is stamped with the date the fact *stopped being true* and injects as
+  `⏳ HISTORICAL` from then on — the system remembers what used to be true
+  without ever presenting it as current.
+- **Perception becomes memory.** With the Sensorium on, corroboration-verified
+  sightings and wake-word utterances append to a day-keyed perception buffer with
+  provenance, and evict into the corpus through the same curation path as
+  conversation. An hour of an unchanged desk is one row, not four hundred.
+
+## The context problem: tokens, KV, and why long chats rot
+
+Every chat agent faces the same constraint: the model is stateless, so "memory"
+is whatever you re-send in the context window — and the context window is the
+most expensive real estate in the system. Three costs compound as a
+conversation grows:
+
+1. **Linear re-send, quadratic conversation.** Turn *N* pays input tokens for
+   everything before it, so an append-only transcript costs O(N) per turn and
+   O(N²) cumulatively. A long-running assistant that keeps continuity by
+   dragging its whole history gets more expensive *every single turn*.
+2. **Attention degrades.** Models demonstrably lose the middle of very long
+   contexts; the marginal token you pay the most for is the one the model is
+   most likely to ignore.
+3. **Compaction drifts.** The standard fix — summarize the transcript in place,
+   then later summarize the summary — is *recursive lossy compression*. Each
+   pass bakes the previous pass's omissions in as ground truth. What the first
+   summary dropped is unrecoverable, and the agent slowly forgets what actually
+   happened while sounding confident about it.
+
+Engram's design goal is **continuity without context residency**: the
+conversation's history lives on disk, and only two small, high-value
+derivatives of it ride the prompt.
+
+| Tier | Where | Cost in tokens |
+|------|-------|----------------|
+| 1 — **LiveBuffer** | append-only JSONL on disk; every raw exchange, immutable | zero |
+| 2 — **working set** | a bounded block **re-derived from tier 1 every turn** — never appended to, never a summary of a summary | small and *constant* |
+| 3 — **corpus** | curated notes; the retrieval hook injects only what's relevant to the current prompt | a handful of notes per turn |
+
+The load-bearing rule is *never consolidate a summary — always re-derive from
+the immutable buffer*. Tier 2 is recomputed from raw source each turn, so it
+cannot drift the way recursive compaction does. And when buffer history cools
+out of the working-set window, **eviction is curation**: a detached background
+pass distills it into corpus notes and advances a per-conversation watermark.
+Leaving the context window and being forgotten stop being the same event.
+
+### What that does to your token bill
+
+- **Per-turn cost stays roughly flat.** The prompt carries the system prompt, a
+  bounded working-set block, a few retrieved notes, and the recent turns — not
+  an unbounded transcript. The conversation can be a week old; the turn is
+  priced like it's an hour old.
+- **Retrieval replaces stuffing.** Notes are injected because they match the
+  current prompt, not because they might someday be useful. You pay for what
+  the turn actually needs.
+- **Nothing is pay-to-keep.** In a stock agent, history you stop re-sending is
+  history you lose, so you hoard tokens. Here the buffer and corpus hold it for
+  free, and it comes back — verbatim from the buffer, or distilled via recall —
+  when it's relevant.
+- **Starting fresh is cheap and safe.** A `/new` session drops the accumulated
+  transcript, and continuity survives it: the working-set block and the
+  retrieval hook re-ground the next turn from tiers 1 and 3.
+
+### What it does to the KV-cache
+
+Prompt caching (and on local models, the literal KV-cache) rewards one thing:
+a **byte-stable prefix**. Engram's layout is shaped around that:
+
+- **Dynamic content rides the newest message.** The working-set block, the
+  recalled notes, and the perception marker are injected into the *current*
+  user message — the end of the prompt — so every prior turn stays byte-stable
+  and cache-eligible. Anthropic bills cache reads at a fraction of fresh input
+  tokens; a stable prefix turns most of each turn's input into cache reads.
+- **Compaction is a cache catastrophe; Engram defuses it.** In-place
+  summarization rewrites the entire prefix at once — full-price re-ingestion of
+  the whole context. Engram banks history *before* that can hurt: a PreCompact
+  hook triggers a provisional curation of the buffer, so if the CLI ever does
+  compact, nothing is lost — and the cheaper move (a fresh session, re-grounded
+  from memory) is always available.
+- **On local models, KV is VRAM.** Even with grouped-query attention, an
+  8B-class model's KV-cache runs on the order of ~100 KiB per token in fp16 —
+  a 100k-token context is ~12 GiB of KV, more than the 4-bit weights
+  themselves. A bounded working set means a bounded KV footprint, which is
+  what makes an always-on, long-lived agent *feasible* on consumer hardware at
+  all. The memory system is the plan for running Engram on a local model, not
+  an accessory to the hosted one.
+
+The full architecture walk-through — tiers, eviction mechanics, temporal
+validity, and the perception path — is in
+[docs/continuous-memory.md](docs/continuous-memory.md).
 
 ## Intended use
 
@@ -204,18 +301,25 @@ Common environment variables (all optional):
 | `RECALL_DATA_ROOT` | Where your corpus/indices/sessions live. Default `~/.local/share/recall`. |
 | `ENGRAM_PERSONA_FILE` | Path to a text file that overrides the assistant's default persona. |
 | `ENGRAM_MODEL` / `ENGRAM_EFFORT` | Model id and reasoning effort for the assistant. |
+| `ENGRAM_FALLBACK_MODEL` | Fallback for overload rotation (default `claude-opus-4-8`; empty disables). |
 | `ENGRAM_USER` | Name the perceiving loop greets / the face-ID gate looks for. |
+| `ENGRAM_WORKING_MEMORY` / `ENGRAM_EVICT` / `ENGRAM_BUFFER` | Continuous-memory cutouts — set to `0` to disable the working-set block, eviction, or the buffer entirely. |
+| `ENGRAM_WM_TURNS` | Size of the hot working-set window in turns (default 12). |
+| `ENGRAM_PERCEPT` | Set to `0` to keep perception events out of memory (Sensorium still runs). |
 | `CLAUDE_BIN` | Path to the `claude` CLI (default: found on `PATH`). |
 
 ## Layout
 
 ```
 src/recall/          the memory engine (index, curate, dream, consolidate, cli)
-infra/engram/        the terminal assistant (core.py + Textual app) + Sensorium (eye/, perceive/)
+infra/engram/        the terminal assistant (core.py + Textual app.py, buffer.py +
+                     working_set.py = continuous memory) + Sensorium (eye/, perceive/;
+                     perceive/percept.py = perception memory)
 infra/telegram/      the optional Telegram bridge
 infra/systemd/       user-level service/timer templates (rendered by the installer)
 skills/              /recall, /curate-memory, /dream, /reconsolidate-memory
-scripts/             install helpers (skills, hook, systemd)
+scripts/             install helpers (skills, hook, systemd) + the CI leak scanner
+docs/                architecture notes (continuous-memory.md, dynamic-memory.md)
 ```
 
 ## Development
