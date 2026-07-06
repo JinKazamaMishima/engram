@@ -39,7 +39,7 @@ class FakeDriver(ModelDriver):
         self.reset_calls += 1
         self.session_id = None
 
-    async def query(self, text: str):
+    async def query(self, text: str, *, prepend: str = ""):
         self.queried.append(text)
         yield Event("tool", "Read")
         yield Event("text", "hello from ")
