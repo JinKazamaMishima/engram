@@ -533,9 +533,17 @@ def _stamp_supersession_validity(ctx: FireContext,
 
 def _rebuild_indices(ctx: FireContext) -> dict[str, int]:
     """Rebuild the derived project + global indices from the canonical corpora.
-    Lazy import keeps torch out of the wrapper's import path (and the tests)."""
-    from recall.index import SentenceTransformerEmbedder, build_index
-    emb = SentenceTransformerEmbedder()
+    Embeds via the WARM DAEMON when it's up: rebuilds used to load a second
+    in-process model while the daemon held the GPU — every one OOM'd, silently,
+    freezing production recall on a stale index (2026-07-04..06). In-process is
+    now only the daemon-down fallback (the GPU is free then). Lazy imports keep
+    torch out of the wrapper's import path (and the tests)."""
+    from recall.index import DaemonEmbedder, SentenceTransformerEmbedder, build_index
+    try:
+        emb = DaemonEmbedder()
+        print("[curate] index embeddings via the warm daemon", flush=True)
+    except Exception:  # noqa: BLE001 — daemon down: the GPU is free for in-process
+        emb = SentenceTransformerEmbedder()
     out = {ctx.slug: build_index(ctx.project_knowledge_dir,
                                  ctx.project_index_path, emb)}
     out[config.GLOBAL_SCOPE] = build_index(ctx.global_dir,
@@ -811,8 +819,18 @@ def run(argv: list[str] | None = None, *,
     try:
         counts = rebuild_indices(ctx)
         print(f"[curate] indices rebuilt: {counts}", flush=True)
-    except Exception as e:  # noqa: BLE001 — derived index, never fatal
-        print(f"[curate] WARN index rebuild failed (corpus intact): {e}", flush=True)
+    except Exception as e:  # noqa: BLE001 — derived index: never fails the CURATION
+        # ...but a stale index silently blinds production recall — new notes exist
+        # yet never surface (it cost two invisible days, 2026-07-04..06) — so this
+        # SCREAMS instead of warning into a log nobody reads. Curation still exits
+        # 0: the corpus + manifest landed; only the derived index is behind.
+        print(f"[curate] ERROR index rebuild failed (corpus intact): {e}", flush=True)
+        notify_alert(title="[recall curate] index_rebuild_failed",
+                     body=(f"{ctx.slug}: {type(e).__name__}: {e} — production recall "
+                           f"is serving a STALE index until a rebuild succeeds "
+                           f"(recall build --project "
+                           f"{ctx.project_knowledge_dir.parent.parent})"),
+                     priority="urgent")
 
     ok = Outcome(kind="curated", reason="ok",
                  detail=manifest.summary if manifest else "", exit_code=0)

@@ -133,6 +133,44 @@ class SentenceTransformerEmbedder:
         return [v.tolist() for v in vecs]
 
 
+class DaemonEmbedder:
+    """Embeddings served by the warm localhost daemon
+    (``scripts/recall_embedder_daemon.py``) instead of a fresh in-process model.
+    Curation-triggered index rebuilds used to load a SECOND 0.6B model while the
+    daemon already held the GPU — the CUDA OOM that silently froze the index for
+    two days (2026-07-04..06). Duck-types ``SentenceTransformerEmbedder`` (.dim +
+    .embed); one POST per text (the daemon has no batch endpoint) is fine at
+    corpus scale. Raises at construction when the daemon is down or unhealthy —
+    callers fall back to the in-process embedder (the GPU is free then)."""
+
+    def __init__(self, host: str | None = None, port: str | int | None = None,
+                 timeout: float = 30.0):
+        import json
+        import urllib.request
+        self._base = "http://{}:{}".format(
+            host or os.environ.get("RECALL_EMBED_HOST", "127.0.0.1"),
+            port or os.environ.get("RECALL_EMBED_PORT", "8973"))
+        self._timeout = timeout
+        with urllib.request.urlopen(f"{self._base}/healthz", timeout=2.0) as r:
+            health = json.loads(r.read())
+        if not health.get("ok") or not health.get("dim"):
+            raise RuntimeError(f"embedder daemon unhealthy: {health}")
+        self.dim = int(health["dim"])
+
+    def embed(self, texts: list[str], *, is_query: bool = False) -> list[list[float]]:
+        import json
+        import urllib.request
+        out: list[list[float]] = []
+        for t in texts:
+            req = urllib.request.Request(
+                f"{self._base}/embed",
+                data=json.dumps({"text": t, "is_query": is_query}).encode(),
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=self._timeout) as r:
+                out.append(json.loads(r.read())["embedding"])
+        return out
+
+
 class CrossEncoderReranker:
     """``Qwen3-Reranker-0.6B`` — a long-context (32K) cross-encoder that scores
     (query, passage) pairs jointly, far more precise than bi-encoder cosine for

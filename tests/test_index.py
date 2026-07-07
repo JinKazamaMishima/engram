@@ -490,3 +490,58 @@ def test_pre_validity_index_degrades_to_no_label(tmp_path):
     finally:
         conn.close()
     assert hits and hits[0].valid_to == "" and hits[0].historical is False
+
+
+# ---- DaemonEmbedder (warm-daemon embeddings for index rebuilds) -----------
+
+class _FakeResp:
+    def __init__(self, obj):
+        import json as _j
+        self._b = _j.dumps(obj).encode()
+
+    def read(self):
+        return self._b
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_daemon_embedder_probes_health_and_embeds_passages(monkeypatch):
+    import json as _j
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        url = req if isinstance(req, str) else req.full_url
+        calls.append(url)
+        if url.endswith("/healthz"):
+            return _FakeResp({"ok": True, "dim": 3})
+        body = _j.loads(req.data)
+        assert body["is_query"] is False        # index rebuilds embed PASSAGES bare
+        assert body["text"]
+        return _FakeResp({"embedding": [1.0, 0.0, 0.0], "dim": 3})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    from recall.index import DaemonEmbedder
+    emb = DaemonEmbedder()
+    assert emb.dim == 3                          # dim from /healthz, not hardcoded
+    vecs = emb.embed(["alpha", "beta"])
+    assert vecs == [[1.0, 0.0, 0.0]] * 2
+    assert len(calls) == 3                       # 1 health + 2 embeds
+
+
+def test_daemon_embedder_raises_when_daemon_down(monkeypatch):
+    # Constructor must raise so _rebuild_indices falls back to the in-process
+    # embedder (daemon down == GPU free); a silent empty embedder would write a
+    # broken index.
+    def dead(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", dead)
+    import pytest as _pytest
+
+    from recall.index import DaemonEmbedder
+    with _pytest.raises(Exception):
+        DaemonEmbedder()

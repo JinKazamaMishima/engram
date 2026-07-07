@@ -564,3 +564,77 @@ def test_supersession_never_overwrites_existing_valid_to(tmp_path, monkeypatch):
     assert out.kind == "curated", out
     old = KnowledgeNote.parse((proj / "docs" / "knowledge" / "old-way.md").read_text())
     assert old.valid_to == "2026-05-15"            # curator's date wins
+
+
+# ---- index rebuild: daemon-first embedding + scream-on-failure ------------
+
+def _fake_fire_ctx(tmp_path):
+    from types import SimpleNamespace
+    return SimpleNamespace(slug="proj",
+                           project_knowledge_dir=tmp_path / "proj" / "docs" / "knowledge",
+                           project_index_path=tmp_path / "idx" / "proj.sqlite",
+                           global_dir=tmp_path / "global",
+                           global_index_path=tmp_path / "idx" / "global.sqlite")
+
+
+def test_rebuild_indices_prefers_the_warm_daemon(tmp_path, monkeypatch):
+    # Loading a second in-process model while the daemon holds the GPU is the
+    # CUDA OOM that silently froze the index 2026-07-04..06 — daemon first.
+    import recall.index as rindex
+    daemon = object()
+    monkeypatch.setattr(rindex, "DaemonEmbedder", lambda: daemon)
+    monkeypatch.setattr(rindex, "SentenceTransformerEmbedder",
+                        lambda: (_ for _ in ()).throw(
+                            AssertionError("must not load an in-process model")))
+    used = []
+    monkeypatch.setattr(rindex, "build_index",
+                        lambda d, p, e: used.append(e) or 1)
+    out = curate._rebuild_indices(_fake_fire_ctx(tmp_path))
+    assert out == {"proj": 1, "global": 1}
+    assert used == [daemon, daemon]
+
+
+def test_rebuild_indices_falls_back_when_daemon_down(tmp_path, monkeypatch):
+    import recall.index as rindex
+    inproc = object()
+    monkeypatch.setattr(rindex, "DaemonEmbedder",
+                        lambda: (_ for _ in ()).throw(OSError("refused")))
+    monkeypatch.setattr(rindex, "SentenceTransformerEmbedder", lambda: inproc)
+    used = []
+    monkeypatch.setattr(rindex, "build_index",
+                        lambda d, p, e: used.append(e) or 2)
+    out = curate._rebuild_indices(_fake_fire_ctx(tmp_path))
+    assert out == {"proj": 2, "global": 2}
+    assert used == [inproc, inproc]
+
+
+def test_rebuild_failure_screams_but_curation_stands(tmp_path, monkeypatch):
+    # A failed rebuild must NOT fail the curation (corpus + manifest landed; the
+    # index is derived) — but it must SCREAM: the silent WARN here is what let
+    # production recall serve a stale index for two invisible days.
+    alerts = []
+    monkeypatch.setattr(
+        curate, "notify_alert",
+        lambda *, title, body, priority: alerts.append((title, body, priority)) or True)
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.delenv("RECALL_GLOBAL_DIR", raising=False)
+    proj = tmp_path / "proj"
+    (proj / "docs" / "knowledge").mkdir(parents=True, exist_ok=True)
+    tdir = _transcript(tmp_path / "transcripts")
+
+    def boom(ctx):
+        raise RuntimeError("CUDA out of memory")
+
+    out = curate.run(["--project-dir", str(proj), "--date", TARGET.isoformat(),
+                      "--transcript-dir", str(tdir)],
+                     invoke_claude=_fake_claude(), rebuild_indices=boom,
+                     autocommit=lambda ctx, m: [],
+                     compute_neighbors=lambda ctx: [],
+                     compute_surprise=lambda ctx, created: {},
+                     today_et=TARGET)
+    assert out.kind == "curated" and out.exit_code == 0     # curation stands
+    assert len(alerts) == 1                                  # exactly one scream
+    title, body, priority = alerts[0]
+    assert priority == "urgent"
+    assert "index_rebuild_failed" in title
+    assert "STALE" in body and "CUDA out of memory" in body
