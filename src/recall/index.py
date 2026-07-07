@@ -136,39 +136,102 @@ class SentenceTransformerEmbedder:
 class DaemonEmbedder:
     """Embeddings served by the warm localhost daemon
     (``scripts/recall_embedder_daemon.py``) instead of a fresh in-process model.
-    Curation-triggered index rebuilds used to load a SECOND 0.6B model while the
-    daemon already held the GPU — the CUDA OOM that silently froze the index for
-    two days (2026-07-04..06). Duck-types ``SentenceTransformerEmbedder`` (.dim +
-    .embed); one POST per text (the daemon has no batch endpoint) is fine at
-    corpus scale. Raises at construction when the daemon is down or unhealthy —
-    callers fall back to the in-process embedder (the GPU is free then)."""
+    The daemon is the machine's SINGLE embedding authority: loading a second
+    0.6B model beside it is the CUDA OOM that silently froze the index for two
+    days (2026-07-04..06) and starved it again 2026-07-07. Duck-types
+    ``SentenceTransformerEmbedder`` (.dim + .embed); posts texts in batches of
+    ``BATCH`` per request. Raises at construction when the daemon is down OR
+    degraded (healthz probes real inference + device now) — callers fall back
+    to the in-process embedder (the GPU is free then)."""
+
+    BATCH = 8         # texts per POST — the daemon encodes a request in one padded
+                      # batch, so long notes spike VRAM with the batch size; 8 keeps
+                      # the spike modest (the daemon also retries per-text on OOM)
+    TIMEOUT = 120.0   # generous: a contended GPU should yield a LATE answer, not a
+                      # timeout that strands a half-built index (2026-07-07)
 
     def __init__(self, host: str | None = None, port: str | int | None = None,
-                 timeout: float = 30.0):
+                 timeout: float | None = None):
         import json
         import urllib.request
         self._base = "http://{}:{}".format(
             host or os.environ.get("RECALL_EMBED_HOST", "127.0.0.1"),
             port or os.environ.get("RECALL_EMBED_PORT", "8973"))
-        self._timeout = timeout
-        with urllib.request.urlopen(f"{self._base}/healthz", timeout=2.0) as r:
-            health = json.loads(r.read())
+        self._timeout = float(timeout if timeout is not None else
+                              os.environ.get("RECALL_EMBED_TIMEOUT", self.TIMEOUT))
+        import urllib.error
+        try:
+            with urllib.request.urlopen(f"{self._base}/healthz", timeout=5.0) as r:
+                health = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # A degraded daemon answers 503 WITH a diagnostic body (device drift,
+            # probe failure) — surface it instead of a bare HTTP error, so callers
+            # can tell degraded (daemon up, needs a restart) from down.
+            try:
+                health = json.loads(e.read())
+            except Exception:  # noqa: BLE001 — non-JSON error body
+                health = {"ok": False, "error": f"HTTP {e.code}"}
         if not health.get("ok") or not health.get("dim"):
             raise RuntimeError(f"embedder daemon unhealthy: {health}")
         self.dim = int(health["dim"])
 
     def embed(self, texts: list[str], *, is_query: bool = False) -> list[list[float]]:
         import json
+        import urllib.error
         import urllib.request
         out: list[list[float]] = []
-        for t in texts:
+        for i in range(0, len(texts), self.BATCH):
+            chunk = list(texts[i:i + self.BATCH])
             req = urllib.request.Request(
                 f"{self._base}/embed",
-                data=json.dumps({"text": t, "is_query": is_query}).encode(),
+                data=json.dumps({"texts": chunk, "is_query": is_query}).encode(),
                 headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=self._timeout) as r:
-                out.append(json.loads(r.read())["embedding"])
+            try:
+                with urllib.request.urlopen(req, timeout=self._timeout) as r:
+                    out.extend(json.loads(r.read())["embeddings"])
+            except urllib.error.HTTPError as e:
+                # Surface the daemon's diagnostic body — a bare "HTTP 500" hid
+                # the real cause (CUDA OOM) the first time this path fired.
+                try:
+                    detail = json.loads(e.read()).get("error", "")
+                except Exception:  # noqa: BLE001 — non-JSON error body
+                    detail = ""
+                raise RuntimeError(
+                    f"daemon /embed failed (HTTP {e.code}): {detail}") from e
         return out
+
+
+def best_embedder(*, alert_degraded: bool = False
+                  ) -> DaemonEmbedder | SentenceTransformerEmbedder:
+    """Daemon-first embedder factory — the ONE way pipeline code should obtain an
+    embedder. The warm daemon is the machine's single embedding authority; every
+    in-process load beside it risks the OOM that took the index down twice
+    (2026-07-04..06 silent, 2026-07-07 starved). In-process only when the daemon
+    is unavailable — which is exactly when the GPU is free.
+
+    ``alert_degraded=True``: scream on the alert channel when the daemon is UP
+    but unhealthy (e.g. serving off its warm device) — unattended callers (the
+    nightly cycle) want that page; interactive CLI calls don't.
+    ``RECALL_NO_DAEMON=1`` skips the daemon entirely (hermetic tests must never
+    talk to a live daemon). Raises ImportError when neither the daemon nor the
+    local ML stack exists — callers keep their keyword-only / best-effort paths."""
+    if not os.environ.get("RECALL_NO_DAEMON"):
+        try:
+            return DaemonEmbedder()
+        except Exception as e:  # noqa: BLE001 — any daemon trouble -> in-process
+            if alert_degraded and "daemon unhealthy" in str(e):
+                try:
+                    from recall.notify import notify_alert
+                    notify_alert(
+                        "recall embedder DEGRADED",
+                        f"{e}\nDaemon is up but failed its healthz inference/device "
+                        "probe — restart: systemctl --user restart recall-embedder",
+                        priority="urgent")
+                except Exception:  # noqa: BLE001 — alerting is best-effort
+                    pass
+            print(f"[recall] embedder daemon unavailable ({e}) — in-process model",
+                  file=sys.stderr)
+    return SentenceTransformerEmbedder()
 
 
 class CrossEncoderReranker:

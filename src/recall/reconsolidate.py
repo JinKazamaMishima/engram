@@ -157,8 +157,8 @@ def _compute_candidates(ctx: ReconContext) -> dict:
     try:
         import numpy as np
 
-        from recall.index import SentenceTransformerEmbedder, _extract_links
-        emb = SentenceTransformerEmbedder()
+        from recall.index import _extract_links, best_embedder
+        emb = best_embedder(alert_degraded=True)
         vecs = np.asarray(emb.embed([f"{n.description}\n\n{n.body}"
                                      for n in notes]), dtype="float32")
         sims = vecs @ vecs.T          # cosine (vectors are L2-normalized)
@@ -239,9 +239,9 @@ def _invoke_claude(ctx: ReconContext, env: dict[str, str],
 
 def _rebuild_index(ctx: ReconContext) -> int:
     """Rebuild the scope's derived index from its (now-consolidated) corpus."""
-    from recall.index import SentenceTransformerEmbedder, build_index
+    from recall.index import best_embedder, build_index
     return build_index(ctx.corpus_dir, ctx.index_path,
-                       SentenceTransformerEmbedder())
+                       best_embedder(alert_degraded=True))
 
 
 def _autocommit(ctx: ReconContext, manifest: CurationManifest) -> str | None:
