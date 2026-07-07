@@ -579,8 +579,10 @@ def _fake_fire_ctx(tmp_path):
 
 def test_rebuild_indices_prefers_the_warm_daemon(tmp_path, monkeypatch):
     # Loading a second in-process model while the daemon holds the GPU is the
-    # CUDA OOM that silently froze the index 2026-07-04..06 — daemon first.
+    # CUDA OOM that silently froze the index 2026-07-04..06 — daemon first
+    # (via best_embedder; conftest's hermetic RECALL_NO_DAEMON is lifted here).
     import recall.index as rindex
+    monkeypatch.delenv("RECALL_NO_DAEMON", raising=False)
     daemon = object()
     monkeypatch.setattr(rindex, "DaemonEmbedder", lambda: daemon)
     monkeypatch.setattr(rindex, "SentenceTransformerEmbedder",
@@ -596,6 +598,7 @@ def test_rebuild_indices_prefers_the_warm_daemon(tmp_path, monkeypatch):
 
 def test_rebuild_indices_falls_back_when_daemon_down(tmp_path, monkeypatch):
     import recall.index as rindex
+    monkeypatch.delenv("RECALL_NO_DAEMON", raising=False)
     inproc = object()
     monkeypatch.setattr(rindex, "DaemonEmbedder",
                         lambda: (_ for _ in ()).throw(OSError("refused")))

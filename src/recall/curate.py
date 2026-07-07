@@ -396,9 +396,9 @@ def _compute_neighbors(ctx: FireContext) -> list[dict]:
     if not any(Path(p).exists() for _, p in scopes):
         return []
     try:
-        from recall.index import SentenceTransformerEmbedder, search_corpora
+        from recall.index import best_embedder, search_corpora
         query = ctx.bundle_text[:_SIMILAR_QUERY_MAX_CHARS]
-        vec = SentenceTransformerEmbedder().embed([query], is_query=False)[0]
+        vec = best_embedder(alert_degraded=True).embed([query], is_query=False)[0]
         hits = search_corpora(scopes, query, query_vector=vec, k=12)
     except Exception as e:  # noqa: BLE001 — dedup hint; never fail the run
         print(f"[curate] WARN neighbor precompute failed: {e}", flush=True)
@@ -439,8 +439,8 @@ def _compute_surprise(ctx: FireContext,
     try:
         import numpy as np
 
-        from recall.index import SentenceTransformerEmbedder
-        emb = SentenceTransformerEmbedder()
+        from recall.index import best_embedder
+        emb = best_embedder(alert_degraded=True)
         for scope, notes in todo.items():
             new_slugs = by_scope[scope]
             vecs = np.asarray(emb.embed([f"{n.description}\n\n{n.body}"
@@ -538,12 +538,9 @@ def _rebuild_indices(ctx: FireContext) -> dict[str, int]:
     freezing production recall on a stale index (2026-07-04..06). In-process is
     now only the daemon-down fallback (the GPU is free then). Lazy imports keep
     torch out of the wrapper's import path (and the tests)."""
-    from recall.index import DaemonEmbedder, SentenceTransformerEmbedder, build_index
-    try:
-        emb = DaemonEmbedder()
-        print("[curate] index embeddings via the warm daemon", flush=True)
-    except Exception:  # noqa: BLE001 — daemon down: the GPU is free for in-process
-        emb = SentenceTransformerEmbedder()
+    from recall.index import best_embedder, build_index
+    emb = best_embedder(alert_degraded=True)
+    print(f"[curate] index embeddings via {type(emb).__name__}", flush=True)
     out = {ctx.slug: build_index(ctx.project_knowledge_dir,
                                  ctx.project_index_path, emb)}
     out[config.GLOBAL_SCOPE] = build_index(ctx.global_dir,

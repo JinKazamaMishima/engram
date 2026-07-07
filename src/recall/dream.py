@@ -243,8 +243,8 @@ def _recombination_pairs(ctx: DreamContext,
 
         import numpy as np
 
-        from recall.index import SentenceTransformerEmbedder
-        emb = SentenceTransformerEmbedder()
+        from recall.index import best_embedder
+        emb = best_embedder(alert_degraded=True)
         notes = [corpus[s][0] for s in slugs]
         vecs = np.asarray(emb.embed([f"{n.description}\n\n{n.body}"
                                      for n in notes]), dtype="float32")
@@ -377,8 +377,8 @@ def _cf_corroboration_worklist(ctx: DreamContext,
     try:
         import numpy as np
 
-        from recall.index import SentenceTransformerEmbedder
-        emb = SentenceTransformerEmbedder()
+        from recall.index import best_embedder
+        emb = best_embedder(alert_degraded=True)
         cf_vecs = np.asarray(
             emb.embed([f"{fm.get('description', '')}\n{fm.get('pivot', '')}\n{body}"
                        for fm, body, _ in open_cfs]), dtype="float32")
@@ -870,8 +870,9 @@ def run(argv: list[str] | None = None, *,
 
 
 def _rebuild_index(ctx: DreamContext) -> int:
-    from recall.index import SentenceTransformerEmbedder, build_index
-    return build_index(ctx.corpus_dir, ctx.index_path, SentenceTransformerEmbedder())
+    from recall.index import best_embedder, build_index
+    return build_index(ctx.corpus_dir, ctx.index_path,
+                       best_embedder(alert_degraded=True))
 
 
 def _autocommit(ctx: DreamContext, promoted: list) -> str | None:

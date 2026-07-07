@@ -520,8 +520,9 @@ def test_daemon_embedder_probes_health_and_embeds_passages(monkeypatch):
             return _FakeResp({"ok": True, "dim": 3})
         body = _j.loads(req.data)
         assert body["is_query"] is False        # index rebuilds embed PASSAGES bare
-        assert body["text"]
-        return _FakeResp({"embedding": [1.0, 0.0, 0.0], "dim": 3})
+        assert body["texts"] == ["alpha", "beta"]   # batched: one POST, not per-text
+        return _FakeResp({"embeddings": [[1.0, 0.0, 0.0]] * len(body["texts"]),
+                          "dim": 3})
 
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     from recall.index import DaemonEmbedder
@@ -529,7 +530,7 @@ def test_daemon_embedder_probes_health_and_embeds_passages(monkeypatch):
     assert emb.dim == 3                          # dim from /healthz, not hardcoded
     vecs = emb.embed(["alpha", "beta"])
     assert vecs == [[1.0, 0.0, 0.0]] * 2
-    assert len(calls) == 3                       # 1 health + 2 embeds
+    assert len(calls) == 2                       # 1 health + 1 batched embed
 
 
 def test_daemon_embedder_raises_when_daemon_down(monkeypatch):

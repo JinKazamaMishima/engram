@@ -78,21 +78,27 @@ def _cmd_build(args) -> int:
         else:
             print(f"[recall] corpus dir does not exist: {corpus}", file=sys.stderr)
             return 1
-    # Only load the (heavy) embedding model when there's something to embed AND the
-    # local ML stack is present — otherwise build a keyword-only index so recall
-    # works with zero external deps (semantic needs a later rebuild with models).
+    # Only obtain an embedder when there's something to embed AND one is available —
+    # otherwise build a keyword-only index so recall works with zero external deps
+    # (semantic needs a later rebuild with models). best_embedder is daemon-first:
+    # this command is the alert's own remediation, and a second in-process model
+    # beside the warm daemon can OOM the card — the manual rebuild must not
+    # reproduce the failure it exists to fix (2026-07-07 incident).
     has_notes = any(p.name.lower() != "readme.md" for p in corpus.glob("*.md"))
     embedder = None
+    mode = "keyword-only"
     if has_notes:
         try:
-            from recall.index import SentenceTransformerEmbedder
-            embedder = SentenceTransformerEmbedder()
+            from recall.index import DaemonEmbedder, best_embedder
+            embedder = best_embedder()
+            mode = ("keyword+semantic (daemon)"
+                    if isinstance(embedder, DaemonEmbedder)
+                    else "keyword+semantic (in-process)")
         except ImportError:
             print("[recall] semantic models not installed — building a keyword-only "
                   "index (FTS5). Install the ML extras for semantic search.",
                   file=sys.stderr)
     n = build_index(corpus, db, embedder)
-    mode = "keyword+semantic" if embedder is not None else "keyword-only"
     print(f"[recall] indexed {n} notes from {corpus} -> {db}  "
           f"(scope: {label}, {mode})")
     return 0
@@ -126,8 +132,8 @@ def _cmd_query(args) -> int:
     qvec = None
     if not args.no_vec:
         try:
-            from recall.index import SentenceTransformerEmbedder
-            qvec = SentenceTransformerEmbedder().embed([args.text], is_query=True)[0]
+            from recall.index import best_embedder
+            qvec = best_embedder().embed([args.text], is_query=True)[0]
         except ImportError:
             print("[recall] semantic models not installed — keyword-only search "
                   "(pass --no-vec to silence this).", file=sys.stderr)
@@ -252,12 +258,12 @@ def _cmd_similar(args) -> int:
     """Nearest existing notes to a blob of text (passage-side embedding) — for
     pre-create dedup: 'is there already a note like this?'"""
     from recall import index
-    from recall.index import SentenceTransformerEmbedder
+    from recall.index import best_embedder
     scopes = _query_scopes(args)
     if not any(Path(db).exists() for _, db in scopes):
         print("[recall] no index yet — run `recall build` first.", file=sys.stderr)
         return 1
-    vec = SentenceTransformerEmbedder().embed([args.text], is_query=False)[0]
+    vec = best_embedder().embed([args.text], is_query=False)[0]
     hits = index.search_corpora(scopes, args.text, query_vector=vec, k=args.k)
     for i, h in enumerate(hits, 1):
         print(f"{i}. [{h.score:.4f}] ({h.corpus}) {h.slug} — {h.description}")
@@ -319,8 +325,8 @@ def _cmd_eval(args) -> int:
 
     def _qfn():
         if embedder["e"] is None:
-            from recall.index import SentenceTransformerEmbedder
-            embedder["e"] = SentenceTransformerEmbedder()
+            from recall.index import best_embedder
+            embedder["e"] = best_embedder()
         emb = embedder["e"]
         return lambda t: emb.embed([t], is_query=True)[0]
 
@@ -329,7 +335,7 @@ def _cmd_eval(args) -> int:
             reranker["r"] = _rerank_scorer()
         return reranker["r"]
 
-    _SWEEP_KW = {"rrf_k": "rrf_k", "recency_w": "w_recency",
+    _SWEEP_KW = {"rrf_k": "rrf_k", "recency_w": "w_recency",  # noqa: N806 — const-style local
                  "salience_w": "w_salience", "retention_w": "w_retention",
                  "ppr_decay": "ppr_decay"}
     rows = []
