@@ -68,6 +68,14 @@ REPO = Path(os.environ.get("RECALL_REPO") or Path(__file__).resolve().parents[2]
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
 ENGRAM_MODEL = os.environ.get("ENGRAM_MODEL", "opus[1m]")
 ENGRAM_EFFORT = os.environ.get("ENGRAM_EFFORT", "max")   # max always; downgrade via /effort
+# The SDK's stdio transport caps ONE stream-json line at 1 MiB by default
+# (claude_agent_sdk .../transport/subprocess_cli.py _DEFAULT_MAX_BUFFER_SIZE). A single
+# tool result carrying a base64 image (e.g. Read on a screenshot) can exceed that in one
+# message and crash the whole transport — "JSON message exceeded maximum buffer size of
+# 1048576 bytes" — killing the session (seen on a 765 KB full-page PNG → ~1.02 MB base64).
+# Raise the ceiling generously so realistic image/tool payloads pass; env-tunable
+# (ENGRAM_CLI_MAX_BUFFER_MB) for the rare giant read.
+CLI_MAX_BUFFER_SIZE = int(float(os.environ.get("ENGRAM_CLI_MAX_BUFFER_MB", "64")) * 1024 * 1024)
 # Like Claude Code: Engram operates in the directory it was launched from (override
 # with ENGRAM_CWD). The recall memory hook is global (~/.claude/settings.json), so
 # loading "user" settings (below) means memory follows Engram into any folder.
@@ -671,6 +679,9 @@ class AgentSDKDriver(ModelDriver):
             can_use_tool=self._can_use_tool,   # interactive-tool interception (plan / questions)
             hooks=self._hooks(),           # lifecycle hooks (PreCompact → provisional curation)
             stderr=self._stderr.append,
+            # Raise the stdio line ceiling so one base64 image in a tool result can't
+            # overflow the transport and crash the session (see CLI_MAX_BUFFER_SIZE).
+            max_buffer_size=CLI_MAX_BUFFER_SIZE,
         )
         if self.effort:
             opts["effort"] = self.effort
@@ -1030,6 +1041,7 @@ class AgentSDKDriver(ModelDriver):
             cwd=str(self.cwd),
             cli_path=self.cli_path,
             stderr=self._stderr.append,
+            max_buffer_size=CLI_MAX_BUFFER_SIZE,   # base64 images must not overflow the stdio line (see _options)
         )
         if spec and spec.tools:
             opts["allowed_tools"] = list(spec.tools)
