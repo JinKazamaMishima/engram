@@ -21,6 +21,7 @@ Telegram Engram. (Ported from the proven ``infra/telegram/agent_bridge.py``.)
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -50,6 +51,7 @@ from claude_agent_sdk import (  # noqa: E402 — after the env strip, on purpose
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    HookEventMessage,
     HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
@@ -230,17 +232,40 @@ SUBAGENT_DEFS = {
 
 @dataclass
 class Event:
-    """One streamed unit of a turn. ``kind``: 'text' | 'tool' | 'status'. ``data``
-    is an optional structured payload for richer kinds a front-end may render
-    beyond the text (e.g. 'todos'/'task' panels) — None for the plain
+    """One streamed unit of a turn. ``kind``: 'text' | 'tool' | 'status' | 'recall'.
+    ``data`` is an optional structured payload for richer kinds a front-end may
+    render beyond the text (e.g. 'todos'/'task' panels) — None for the plain
     kinds, so every existing constructor and consumer keeps working. Model-
-    agnostic: a future LocalModelDriver emits the same shapes."""
+    agnostic: a future LocalModelDriver emits the same shapes. 'recall' carries the
+    per-turn memory provenance (which notes the inject hook surfaced; '' = it ran
+    and surfaced none) so the front-end can make memory visible turn by turn."""
     kind: str
     text: str
     data: Optional[dict] = None
 
 
 # --- presentation helpers (model-agnostic; shared by every front-end) ---------
+
+def _recall_line(msg) -> Optional[str]:
+    """The operator-visible recall provenance from a UserPromptSubmit hook_response
+    (``include_hook_events`` streams them): the ``systemMessage`` the inject hook
+    printed, minus its ``🧠 recalled:`` prefix — i.e. the ``corpus:slug`` list that
+    fed this turn. Returns '' when the hook ran but surfaced nothing (a real
+    zero-hit — the miss-detector cares about the difference), and None when the
+    event isn't a UserPromptSubmit hook_response at all. Fail-soft: a hook whose
+    output isn't the expected JSON reads as '' (ran, nothing to show)."""
+    if (getattr(msg, "subtype", "") != "hook_response"
+            or getattr(msg, "hook_event_name", "") != "UserPromptSubmit"):
+        return None
+    out = ((getattr(msg, "data", {}) or {}).get("output") or "").strip()
+    if not out:
+        return ""
+    try:
+        sysmsg = str(json.loads(out).get("systemMessage") or "")
+    except Exception:  # noqa: BLE001 — someone else's hook / non-JSON output
+        return ""
+    return sysmsg.removeprefix("🧠 recalled:").strip()
+
 
 def _tool_label(block) -> str:
     """UI label for a tool-use block. A sub-agent delegation (the ``Agent`` tool —
@@ -682,6 +707,11 @@ class AgentSDKDriver(ModelDriver):
             # Raise the stdio line ceiling so one base64 image in a tool result can't
             # overflow the transport and crash the session (see CLI_MAX_BUFFER_SIZE).
             max_buffer_size=CLI_MAX_BUFFER_SIZE,
+            # Stream hook lifecycle events: the recall inject hook's response carries
+            # WHICH notes it surfaced, and _stream turns that into the per-turn
+            # provenance line (Event 'recall'). Absence of the event is itself signal
+            # — the front-end renders "hook silent", the injection-outage tell.
+            include_hook_events=True,
         )
         if self.effort:
             opts["effort"] = self.effort
@@ -1253,6 +1283,13 @@ class AgentSDKDriver(ModelDriver):
                     name = self._task_names.get(msg.task_id, "sub-agent")
                     yield self._task_upd(msg.task_id, status=status)
                     yield Event("text", f"\n\n> ✗ *{name} {status}*\n\n")
+            elif isinstance(msg, HookEventMessage):
+                # Subclass of SystemMessage — must be matched BEFORE it. The only one
+                # rendered is the recall inject hook's response: the front-end shows
+                # which memory notes fed this turn (memory made visible per turn).
+                line = _recall_line(msg)
+                if line is not None:
+                    yield Event("recall", line)
             elif isinstance(msg, SystemMessage):
                 data = getattr(msg, "data", {}) or {}
                 if self._fork_next and data.get("session_id"):

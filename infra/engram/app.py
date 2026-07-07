@@ -65,6 +65,7 @@ SLASH_CMDS = [
     ("/sessions", "resume another of this folder's sessions"),
     ("/fork", "branch this conversation (original kept)"),
     ("/export", "save this conversation as markdown"),
+    ("/copy", "copy my last reply to the clipboard  (or ctrl+y)"),
     ("/status", "show session · model · effort"),
     ("/paste", "attach a clipboard image"),
     ("/exit", "quit Engram"),
@@ -83,6 +84,32 @@ STATE_CMDS = ("/new", "/effort", "/model", "/paste", "/context", "/rewind",
 # Task tool). These mirror Claude Code's built-ins — confirm the exact names the CLI
 # exposes with /context's `agents` list, and adjust here if they differ.
 SUBAGENTS = ("Explore", "Plan", "general-purpose")
+
+# Corpus label of the shared soul as it appears on the inject hook's wire format
+# (recall_inject._format_system_message; == recall config.GLOBAL_SCOPE).
+GLOBAL_SCOPE = "global"
+
+
+def render_recall_line(line: str | None) -> str:
+    """Markup for the per-turn memory-provenance line. ``line`` is the inject hook's
+    ``corpus:slug`` list ('' = the hook ran and surfaced nothing — an honest zero;
+    None = it never fired — the injection-outage tell). Soul notes keep a ``soul:``
+    prefix; project notes drop theirs (this project is the default context). Long
+    lists cap at 3 slugs + a count. Pure (unit-testable without Textual)."""
+    if line is None:
+        body = "[dim]silent — no injection this turn[/dim]"
+    elif not line:
+        body = "no notes"
+    else:
+        names = []
+        for entry in (e.strip() for e in line.split(",")):
+            if not entry:
+                continue
+            corpus, _, slug = entry.partition(":")
+            names.append(f"soul:{slug}" if corpus == GLOBAL_SCOPE else slug or corpus)
+        shown = ", ".join(names[:3]) + (f"  +{len(names) - 3}" if len(names) > 3 else "")
+        body = f"{len(names)} note{'s' if len(names) != 1 else ''} · {escape(shown)}"
+    return f"◆ recall · {body}"
 
 
 def render_tasks_line(todos: list, tasks: list) -> str:
@@ -330,6 +357,7 @@ class EngramApp(App):
     }
     .plancard { border: round $secondary 50%; margin: 0 0 1 0; padding: 0 1; }
     .interact-hint { color: $secondary; text-style: italic; padding: 0 1; margin: 0 0 1 0; }
+    .recall-line { color: $secondary; padding: 0 1; margin: 0 0 1 0; }
     #perception {
         display: none;                 /* shown only when ENGRAM_PERCEIVE is on */
         height: auto; margin: 0 2; padding: 0 1;
@@ -370,6 +398,12 @@ class EngramApp(App):
         # interaction can BREAK it — text after the card renders below it, never glued above.
         self._interact: dict | None = None          # {future, list} while a card is open
         self._interact_open = False
+        # The SDK spawns each permission callback as its OWN task, so parallel
+        # AskUserQuestion calls (the model often sends one per question) would race
+        # for the single _interact slot — cards stack, only the last one answers,
+        # the rest wedge. The lock serializes them: ask → answer → next.
+        self._interact_lock = asyncio.Lock()
+        self._recall_shown = False                  # provenance line rendered this turn?
         self._cur_md = None
         self._cur_stream = None
         self._cur_last = ""
@@ -644,10 +678,16 @@ class EngramApp(App):
         else:
             self._status("no image in the clipboard (drop a file, or copy a screenshot first)")
 
-    def _copy_text(self, text: str) -> None:
-        """Put text on the system clipboard so it pastes OUTSIDE the terminal too:
-        OSC52 (works over SSH) plus a local clipboard tool (Wayland/X11/macOS)."""
-        self.copy_to_clipboard(text)                      # OSC52
+    def copy_to_clipboard(self, text: str) -> None:
+        """EVERY copy in the app lands here — ours (Ctrl+Y, /copy) AND Textual's own:
+        the Screen binds ctrl+c → screen.copy_text for drag-selections, which calls
+        this and nothing else. Base Textual only emits OSC52, which terminals like
+        GNOME/VTE silently gate — the historic "I copied but got nothing" bug — so
+        chase it with a real clipboard tool (Wayland/X11/macOS) and always confirm
+        on the status line (silent success is indistinguishable from silent failure)."""
+        super().copy_to_clipboard(text)                   # OSC52 (works over SSH)
+        if not text:
+            return
         for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"],
                      ["xsel", "--clipboard", "--input"], ["pbcopy"]):
             try:
@@ -655,17 +695,28 @@ class EngramApp(App):
                     break
             except (FileNotFoundError, OSError, subprocess.SubprocessError):
                 continue
+        self._status(f"📋 copied {len(text)} chars to the clipboard")
+
+    def _copy_text(self, text: str) -> None:
+        self.copy_to_clipboard(text)
 
     def action_copy_selection(self) -> None:
-        """Ctrl+C — copy the current text selection (drag anywhere in the app to select)
-        to the system clipboard. Never quits (quit is Ctrl+Q; Ctrl+Y copies the last reply)."""
+        """Ctrl+C — copy the current selection: text selected INSIDE the prompt box
+        first, else the screen drag-selection. Never quits (quit is Ctrl+Q; Ctrl+Y
+        copies the last reply). Reached when the prompt has focus (its _on_key routes
+        ctrl+c here) or when nothing is selected (Screen's own ctrl+c SkipActions)."""
+        sel = ""
         try:
-            sel = self.screen.get_selected_text()
-        except Exception:   # noqa: BLE001 — selection is best-effort
-            sel = None
+            sel = self.query_one("#prompt", PromptArea).selected_text
+        except Exception:  # noqa: BLE001 — selection is best-effort
+            pass
+        if not sel:
+            try:
+                sel = self.screen.get_selected_text() or ""
+            except Exception:   # noqa: BLE001
+                sel = ""
         if sel:
             self._copy_text(sel)
-            self._status(f"📋 copied {len(sel)} chars to the clipboard")
         else:
             self._status("nothing selected — drag to select, then Ctrl+C  ·  "
                          "Ctrl+Y = last reply  ·  Ctrl+Q = quit")
@@ -960,6 +1011,9 @@ class EngramApp(App):
             return
         if text == "/status":
             self._status(self._status_line())
+            return
+        if text == "/copy":            # read-only, safe mid-reply (copies the PREVIOUS reply)
+            self.action_copy_reply()
             return
         # /mode — toggle, or set explicitly. Like shift+tab it recycles the client when
         # idle (the new mode governs the next turn) and ARMS mid-reply instead of
@@ -1292,12 +1346,16 @@ class EngramApp(App):
         driver maps onto the SDK wire result. Runs on the app's event loop (the SDK spawns
         the permission callback there), so it mounts widgets and awaits a Future the UI
         resolves. Never raises — a broken card must not wedge the turn; it degrades to a
-        sensible default (approve nothing / no preference)."""
+        sensible default (approve nothing / no preference). Serialized: the SDK runs each
+        permission callback as its own task, so parallel AskUserQuestion calls arrive
+        CONCURRENTLY — without the lock they'd all mount at once and clobber the single
+        _interact slot (stacked cards, only the last answerable, the rest wedged)."""
         try:
-            await self._break_stream()      # finalize pre-card text so the card lands below it
-            if req.get("kind") == "plan":
-                return await self._interact_plan(req.get("plan") or "")
-            return await self._interact_question(req.get("questions") or [])
+            async with self._interact_lock:
+                await self._break_stream()  # finalize pre-card text so the card lands below it
+                if req.get("kind") == "plan":
+                    return await self._interact_plan(req.get("plan") or "")
+                return await self._interact_question(req.get("questions") or [])
         except Exception:  # noqa: BLE001 — identity of the failure doesn't matter; don't wedge
             return {"approved": False, "message": "(the interaction UI failed; use your judgment)"}
         finally:
@@ -1416,6 +1474,14 @@ class EngramApp(App):
     def _interact_cancel(self) -> None:
         self._resolve_interact({"kind": "cancel"})
 
+    # ---- per-turn recall provenance (memory made visible) ----
+    async def _add_recall_line(self, line: str | None) -> None:
+        """One dim line under the prompt showing which memory notes fed this turn —
+        so it's legible when Engram is grounded in a real note vs winging it, and a
+        zero/silent turn is the retrieval miss-detector."""
+        self._recall_shown = True
+        await self._add(Static(render_recall_line(line), classes="recall-line"))
+
     # ---- streaming Markdown, segmentable so a mid-turn card renders in order ----
     async def _ensure_stream(self) -> None:
         """Open a fresh streaming Markdown block if none is active (lazy — so a turn that
@@ -1447,6 +1513,9 @@ class EngramApp(App):
         self._cur_md = None
         self._cur_stream = None
         self._cur_last = ""
+        # Sub-agent turns run their own CLI (no hook events here) — suppress the
+        # provenance line for them rather than falsely reporting "silent".
+        self._recall_shown = agent is not None
         acc: list[str] = []
         tools: list[str] = []
         wrote_any = False
@@ -1455,7 +1524,12 @@ class EngramApp(App):
             source = (self.driver.run_subagent(*agent) if agent
                       else self.driver.query(text, prepend=prepend))
             async for ev in source:
-                if ev.kind == "text":
+                if ev.kind == "recall":
+                    if not self._recall_shown:      # first response wins (one hook wired)
+                        await self._add_recall_line(ev.text)
+                elif ev.kind == "text":
+                    if not self._recall_shown:      # text arrived, no hook event ever did
+                        await self._add_recall_line(None)
                     await self._ensure_stream()     # (re)open a block; a card may have broken it
                     sep = _seam(self._cur_last, ev.text)   # paragraph break so blocks don't glue
                     if sep:
