@@ -173,6 +173,7 @@ _last_activity = 0.0
 _stderr_ring: list[str] = []
 _pending: list[dict] = []
 _drain_task: Optional[asyncio.Task] = None
+_queued_ack_sent = False    # one ack per busy period — never spam a multi-part send
 
 
 # ---------------------------------------------------------------------------
@@ -570,8 +571,9 @@ def _busy() -> bool:
 
 
 def _clear_pending() -> None:
-    global _pending, _drain_task
+    global _pending, _drain_task, _queued_ack_sent
     _pending = []
+    _queued_ack_sent = False
     if _drain_task is not None and not _drain_task.done():
         _drain_task.cancel()
     _drain_task = None
@@ -596,10 +598,11 @@ async def _drain_after_delay() -> None:
 
 async def _flush_pending() -> None:
     """Combine all buffered fragments into one prompt and start a single turn."""
-    global _turn_task, _pending
+    global _turn_task, _pending, _queued_ack_sent
     if not _pending or _busy():
         return
     frags, _pending = _pending, []
+    _queued_ack_sent = False          # next busy period gets its own (single) ack
     texts = [f["text"] for f in frags if f["text"]]
     paths = [p for f in frags for p in f["paths"]]
     prompt = "\n\n".join(texts)
@@ -787,13 +790,26 @@ async def handle_message(update: dict) -> None:
         await send("🔒 bridge is locked — /unlock first")
         return
 
-    await send_typing()
+    if not _busy():
+        await send_typing()
     paths = await _ingest_attachments(msg) if has_media else []
     frag_text = text or caption
     if not frag_text and not paths:
         await send("⚠️ I got an attachment but couldn't download it — try resending.")
         return
     _pending.append({"text": frag_text, "paths": paths})
+    if _busy():
+        # The one-message-behind confusion (operator report, 2026-07-07): a message that lands
+        # mid-turn waits SILENTLY for the whole in-flight turn (minutes on a build
+        # turn), then the old turn's reply arrives looking like the answer to the
+        # new message. Say so, once — and don't show "typing…" for a reply that
+        # isn't about this message.
+        global _queued_ack_sent
+        if not _queued_ack_sent:
+            _queued_ack_sent = True
+            await send("⏳ still writing the reply to your previous message — "
+                       "got this one, it's queued next (the reply above/next is "
+                       "for the earlier message).")
     _arm_drain()
 
 
