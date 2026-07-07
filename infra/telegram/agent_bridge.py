@@ -5,9 +5,12 @@ Lets you talk to Engram about the `recall` repo from your phone. Holds ONE
 persistent ``ClaudeSDKClient`` so the conversation has memory across messages;
 each ``client.query()`` continues the same session, a new client is a new thread.
 
-It loads the FULL recall project brain (CLAUDE.md + skills + the recall hook) via
-``setting_sources=["project"]``, so every message auto-injects relevant curated
-knowledge from the corpus + soul exactly like the terminal session. Runs on the
+It loads the recall project brain (CLAUDE.md + skills) via
+``setting_sources=["project"]`` and wires the recall-injection hook EXPLICITLY
+into the SDK options — project scope excludes the user-level
+~/.claude/settings.json, where a terminal install typically registers that
+hook, so without this wiring bridge sessions would silently get no corpus
+recall on their turns. Runs on the
 Claude **subscription** (no API key — see the env strip below); supports ``/new`` /
 ``/end`` plus auto-resume of the last thread across a service restart.
 
@@ -23,9 +26,11 @@ Config (env, normally from ~/.config/recall/telegram-agent.env via systemd):
   CLAUDE_BIN                     — claude CLI path (default: found on PATH)
   RECALL_AGENT_IDLE_SECS         — release the warm client after N idle secs (default 1800)
   RECALL_AGENT_EFFORT            — reasoning effort (default max; low|medium|high|xhigh|max)
-  RECALL_AGENT_MODEL             — model per turn (default opus[1m])
+  RECALL_AGENT_MODEL             — initial model (default opus[1m]); switch live with /model
+  RECALL_INJECT_HOOK             — recall-injection hook script (default
+                                   <repo>/scripts/recall_inject.py; empty disables)
 
-Built-in commands (no model call): /new /end /cancel /lock /unlock /status /ping.
+Built-in commands (no model call): /new /end /cancel /lock /unlock /status /ping /model.
 """
 from __future__ import annotations
 
@@ -55,6 +60,7 @@ from claude_agent_sdk import (  # noqa: E402  (after the env strip on purpose)
     AssistantMessage,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    HookMatcher,
     ResultMessage,
     SystemMessage,
     TextBlock,
@@ -70,6 +76,13 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN") or shutil.which("claude") or "claude"
 # The recall CLI used to curate an ended session in the background (brick 2).
 # Default: the console script beside this interpreter (the bridge's own venv).
 RECALL_BIN = os.environ.get("RECALL_BIN") or str(Path(sys.executable).with_name("recall"))
+# The recall-injection hook: the SAME script a terminal install's UserPromptSubmit
+# hook runs, wired explicitly into the SDK options because
+# setting_sources=["project"] excludes the user settings where that hook is
+# registered. Empty -> disabled.
+RECALL_INJECT = os.environ.get("RECALL_INJECT_HOOK",
+                               str(REPO / "scripts" / "recall_inject.py"))
+INJECT_TIMEOUT = 15        # generous; the script's own daemon budget is 0.6s
 IDLE_SECS = int(os.environ.get("RECALL_AGENT_IDLE_SECS", "1800"))
 
 
@@ -92,7 +105,18 @@ DISALLOWED_TOOLS: list[str] = _csv_env("RECALL_AGENT_DISALLOWED_TOOLS", "")
 # phone-Engram would silently fall back to the CLI defaults instead of the operator's
 # configured effort/model. Default to sensible values: max effort + Opus 1M context.
 AGENT_EFFORT = os.environ.get("RECALL_AGENT_EFFORT", "max")        # low|medium|high|xhigh|max
-AGENT_MODEL = os.environ.get("RECALL_AGENT_MODEL", "opus[1m]")
+AGENT_MODEL = os.environ.get("RECALL_AGENT_MODEL", "opus[1m]")  # /model swaps this live
+
+# Models offered by /model for discoverability; free-form still works (the name is
+# passed straight to the CLI on the next reconnect). Mirrors the TUI's list so the
+# phone and terminal switch between the same aliases. opus[1m] = the 1M window.
+MODELS = (
+    ("opus[1m]", "Opus 4.8 · 1M context (default)"),
+    ("opus",     "Opus 4.8 · 200K"),
+    ("sonnet",   "Sonnet 4.6"),
+    ("fable",    "Fable 5"),
+    ("haiku",    "Haiku 4.5 · fastest"),
+)
 
 OFFSET_FILE = STATE_DIR / "last_update_id"
 LOCK_FILE = STATE_DIR / "bridge.lock"
@@ -143,6 +167,7 @@ BOT_USERNAME = ""
 # --- conversation state ------------------------------------------------------
 _client: Optional[ClaudeSDKClient] = None
 _session_id: Optional[str] = None
+_current_model: str = AGENT_MODEL   # mutable; /model swaps it, _build_options reads it on reconnect
 _turn_task: Optional[asyncio.Task] = None
 _last_activity = 0.0
 _stderr_ring: list[str] = []
@@ -415,6 +440,33 @@ def _collect_stderr(line: str) -> None:
         del _stderr_ring[:-80]
 
 
+async def _recall_inject_hook(input_data, tool_use_id, context):  # noqa: ARG001
+    """UserPromptSubmit hook: run the same recall_inject.py a terminal install
+    uses and pass its JSON through (additionalContext -> silent model context).
+    The script is already fail-open; this wrapper fail-opens too ({} = inject
+    nothing), so a recall hiccup can never block a phone turn. The
+    operator-visible systemMessage has no Telegram surface — log it instead so
+    injection stays observable."""
+    if not RECALL_INJECT:
+        return {}
+    try:
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(AGENT_CWD))
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, RECALL_INJECT,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, env=env)
+        out, _ = await asyncio.wait_for(
+            proc.communicate(json.dumps(input_data).encode()),
+            timeout=INJECT_TIMEOUT)
+        payload = json.loads(out) if out.strip() else {}
+    except Exception as exc:  # noqa: BLE001 — recall must never block a turn
+        log.warning("recall inject hook failed (fail-open): %s", exc)
+        return {}
+    if payload.get("systemMessage"):
+        log.info("%s", payload["systemMessage"])
+    return payload
+
+
 def _build_options(resume_id: Optional[str]) -> ClaudeAgentOptions:
     opts = dict(
         system_prompt={"type": "preset", "preset": "claude_code", "append": PERSONA},
@@ -425,10 +477,12 @@ def _build_options(resume_id: Optional[str]) -> ClaudeAgentOptions:
         resume=resume_id,
         stderr=_collect_stderr,
     )
+    if RECALL_INJECT:
+        opts["hooks"] = {"UserPromptSubmit": [HookMatcher(hooks=[_recall_inject_hook])]}
     if AGENT_EFFORT:
         opts["effort"] = AGENT_EFFORT
-    if AGENT_MODEL:
-        opts["model"] = AGENT_MODEL
+    if _current_model:
+        opts["model"] = _current_model
     if ALLOWED_TOOLS:
         opts["allowed_tools"] = ALLOWED_TOOLS
     if DISALLOWED_TOOLS:
@@ -494,6 +548,19 @@ async def run_turn(text: str) -> str:
         raise
 
 
+async def _set_model(name: str) -> None:
+    """Switch the model for subsequent turns. Recycles the warm client so the next
+    turn reconnects with the new model, keeping the session id so the SAME
+    conversation continues — mirrors core.AgentSDKDriver.set_model. (The recycle is
+    the mechanism: a live model swap on a connected client isn't reliable, so we drop
+    the client and let run_turn's resume path rebuild it under the new model.)"""
+    global _current_model
+    _current_model = name
+    await _disconnect_client()
+    await send(f"🔀 model → **{name}** — same conversation continues "
+               "(resumes on your next message)")
+
+
 # ---------------------------------------------------------------------------
 # Command + message handling
 # ---------------------------------------------------------------------------
@@ -554,6 +621,21 @@ def _matches_cmd(text: str, name: str) -> bool:
     if BOT_USERNAME and text == f"/{name}@{BOT_USERNAME}":
         return True
     return False
+
+
+def _cmd_arg(text: str, name: str) -> Optional[str]:
+    """Like _matches_cmd but for a command that takes an argument: return the arg
+    string (possibly '') if `text` invokes /name (optionally @bot), else None.
+    '/model' -> '', '/model fable' -> 'fable', '/status' -> None."""
+    heads = [f"/{name}"]
+    if BOT_USERNAME:
+        heads.append(f"/{name}@{BOT_USERNAME}")
+    for head in heads:
+        if text == head:
+            return ""
+        if text.startswith(head + " "):
+            return text[len(head) + 1:].strip()
+    return None
 
 
 async def _process_turn(text: str) -> None:
@@ -634,7 +716,8 @@ async def handle_message(update: dict) -> None:
             "  /new    — end this conversation and start fresh\n"
             "  /end    — end this conversation\n"
             "  /cancel — stop the current reply\n"
-            "  /status — locked? busy? active session\n"
+            "  /status — locked? busy? model? active session\n"
+            "  /model  — switch model (opus[1m] · opus · fable · …)\n"
             "  /lock /unlock — pause/resume inbound\n"
             "  /ping   — health check"
         )
@@ -645,9 +728,22 @@ async def handle_message(update: dict) -> None:
     if _matches_cmd(text, "status"):
         await send(
             f"recall chat ok | locked={LOCK_FILE.exists()} | busy={_busy()} | "
+            f"model={_current_model} | "
             f"session={'yes' if (_session_id or _client) else 'none'} | "
             f"{BOT_LABEL} | cwd={AGENT_CWD}"
         )
+        return
+    model_arg = _cmd_arg(text, "model")
+    if model_arg is not None:
+        if not model_arg:
+            listing = "\n".join(f"  `{n}` — {d}" for n, d in MODELS)
+            await send(f"current model: **{_current_model}**\n\n{listing}\n\n"
+                       "usage: /model <name>  — e.g. `/model fable` or `/model opus[1m]`")
+            return
+        if _busy():
+            await send("⏳ a reply's in flight — /cancel first, then switch model")
+            return
+        await _set_model(model_arg)
         return
     if _matches_cmd(text, "lock"):
         LOCK_FILE.write_text(datetime.now(timezone.utc).isoformat())
@@ -756,7 +852,7 @@ async def main() -> int:
     offset = await asyncio.to_thread(seed_offset_if_missing)
     try:
         await send(f"✅ Engram online — @{BOT_USERNAME} ready. Just talk to me. "
-                   f"(/new /end /status /cancel /lock)")
+                   f"(/new /end /status /model /cancel /lock)")
     except Exception:  # noqa: BLE001
         pass
 

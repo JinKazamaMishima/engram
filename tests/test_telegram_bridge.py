@@ -103,6 +103,69 @@ def test_build_options_pins_effort_and_model():
 
 
 @requires_sdk
+def test_cmd_arg_parses_model_switch():
+    bridge.BOT_USERNAME = ""
+    assert bridge._cmd_arg("/model", "model") == ""            # bare -> show/list
+    assert bridge._cmd_arg("/model fable", "model") == "fable"  # arg -> switch target
+    assert bridge._cmd_arg("/model  opus[1m] ", "model") == "opus[1m]"  # trimmed
+    assert bridge._cmd_arg("/status", "model") is None         # different command
+    assert bridge._cmd_arg("/modelfoo", "model") is None       # not a prefix match
+
+
+@requires_sdk
+def test_build_options_reflects_switched_model():
+    # /model recycles the client onto a new model; _build_options must read the live
+    # value, not the frozen startup default. Guard the module global for order-independence.
+    saved = bridge._current_model
+    try:
+        bridge._current_model = "fable"
+        assert bridge._build_options(None).model == "fable"
+    finally:
+        bridge._current_model = saved
+
+
+@requires_sdk
+def test_build_options_wires_recall_inject_hook():
+    # setting_sources=["project"] excludes the user settings where a terminal
+    # install's UserPromptSubmit hook lives — the bridge must wire injection itself
+    # or phone sessions silently get no corpus recall.
+    o = bridge._build_options(None)
+    assert o.hooks and "UserPromptSubmit" in o.hooks
+    assert bridge._recall_inject_hook in o.hooks["UserPromptSubmit"][0].hooks
+
+
+@requires_sdk
+def test_recall_inject_hook_passes_script_json_through(tmp_path, monkeypatch):
+    import asyncio
+    import json as _json
+    stub = tmp_path / "stub_inject.py"
+    payload = {"suppressOutput": True, "systemMessage": "🧠 recalled: recall:x",
+               "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                      "additionalContext": "## Recalled"}}
+    stub.write_text("import sys, json\n"
+                    "hook = json.load(sys.stdin)\n"           # must be valid hook JSON
+                    "assert 'prompt' in hook\n"
+                    f"print(json.dumps({payload!r}))\n")
+    monkeypatch.setattr(bridge, "RECALL_INJECT", str(stub))
+    out = asyncio.run(bridge._recall_inject_hook({"prompt": "where is x?"}, None, {}))
+    assert out == payload
+    assert _json.dumps(out)  # round-trips
+
+
+@requires_sdk
+def test_recall_inject_hook_fails_open(tmp_path, monkeypatch):
+    import asyncio
+    # Script explodes -> {} (inject nothing), never an exception up to the SDK.
+    boom = tmp_path / "boom.py"
+    boom.write_text("raise SystemExit(3)\n")
+    monkeypatch.setattr(bridge, "RECALL_INJECT", str(boom))
+    assert asyncio.run(bridge._recall_inject_hook({"prompt": "hi there"}, None, {})) == {}
+    # Disabled (empty path) -> {} without spawning anything.
+    monkeypatch.setattr(bridge, "RECALL_INJECT", "")
+    assert asyncio.run(bridge._recall_inject_hook({"prompt": "hi there"}, None, {})) == {}
+
+
+@requires_sdk
 def test_session_curation_cmd_targets_the_ended_session():
     # brick 2: /new and /end fire this argv to curate the ended session in the
     # background — the recall CLI, --session <id>, scoped to AGENT_CWD, committing.
