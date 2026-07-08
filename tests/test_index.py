@@ -231,7 +231,8 @@ def test_link_expansion_surfaces_linked_neighbor(tmp_path):
     try:
         qv = emb.embed(["alpha widget"], is_query=True)[0]
         wl = [h.slug for h in index.search(conn, "alpha widget", query_vector=qv,
-                                           k=3, link_decay=1.0, link_seed=5)]
+                                           k=3, link_decay=1.0, link_seed=5,
+                                           sem_floor=0.0)]
         nl = [h.slug for h in index.search(conn, "alpha widget", query_vector=qv,
                                            k=3, link_decay=0.0)]
         assert "beta" in wl          # injected as alpha's 1-hop neighbor
@@ -283,7 +284,8 @@ def test_ppr_arm_wired_into_search_lifts_connected_note(tmp_path):
         assert "gamma" not in index._link_neighbors(conn, ["alpha"])
         qv = emb.embed(["alpha widget"], is_query=True)[0]
         ppr = [h.slug for h in index.search(conn, "alpha widget", query_vector=qv,
-                                            k=4, link_decay=0.0, ppr_decay=1.0)]
+                                            k=4, link_decay=0.0, ppr_decay=1.0,
+                                            sem_floor=0.0)]
         # the graph-connected 2-hop note outranks the disconnected, equally-
         # irrelevant one — only PPR's spreading activation can do this.
         assert "gamma" in ppr and ppr.index("gamma") < ppr.index("delta")
@@ -546,3 +548,121 @@ def test_daemon_embedder_raises_when_daemon_down(monkeypatch):
     from recall.index import DaemonEmbedder
     with _pytest.raises(Exception):
         DaemonEmbedder()
+
+
+# ---- T2 evidence floor ----------------------------------------------------
+
+def _floor_corpus(tmp_path):
+    """Two semantically disjoint notes + an index built with FakeEmbedder."""
+    kd = tmp_path / "k"; kd.mkdir()
+    _note(kd, "gpu-daemon-oom", "embedder daemon gpu oom retry",
+          "The embedder daemon retries per-text on gpu oom and logs the 500.")
+    _note(kd, "kosher-supplier-feeds", "supermarket supplier feeds sync",
+          "Supplier feeds sync nightly into the supermarket inventory.")
+    db = tmp_path / "i.sqlite"
+    emb = FakeEmbedder()
+    assert index.build_index(kd, db, emb) == 2
+    return db, emb
+
+
+def test_floor_drops_far_note_and_k_is_a_max(tmp_path):
+    db, emb = _floor_corpus(tmp_path)
+    conn = index._connect(db, read_only=True)
+    try:
+        q = "embedder daemon gpu oom retry"
+        qv = emb.embed([q], is_query=True)[0]
+        # floor off: both notes fill the quota (current behavior)
+        both = index.search(conn, q, query_vector=qv, k=5, sem_floor=0.0)
+        assert len(both) == 2
+        # floor on: the far note dies; k becomes a max, not a quota
+        floored = index.search(conn, q, query_vector=qv, k=5,
+                               sem_floor=0.35, kw_floor=-999.0)
+        assert [h.slug for h in floored] == ["gpu-daemon-oom"]
+        assert floored[0].cos >= 0.35          # evidence stamped on the Hit
+    finally:
+        conn.close()
+
+
+def test_floor_can_return_zero_hits(tmp_path):
+    db, emb = _floor_corpus(tmp_path)
+    conn = index._connect(db, read_only=True)
+    try:
+        qv = emb.embed(["totally unrelated cooking recipe"], is_query=True)[0]
+        hits = index.search(conn, "totally unrelated cooking recipe",
+                            query_vector=qv, k=5,
+                            sem_floor=0.99, kw_floor=-999.0)
+        assert hits == []                      # nothing vouched -> inject nothing
+    finally:
+        conn.close()
+
+
+def test_floor_keyword_rescue(tmp_path):
+    db, emb = _floor_corpus(tmp_path)
+    conn = index._connect(db, read_only=True)
+    try:
+        q = "gpu daemon"
+        qv = emb.embed([q], is_query=True)[0]
+        # sem floor set impossibly high, but ANY keyword match vouches
+        # (kw_floor=0: bm25 is negative for every match) -> FTS-matched note
+        # survives via the rescue arm; the unmatched note still dies.
+        hits = index.search(conn, q, query_vector=qv, k=5,
+                            sem_floor=0.99, kw_floor=0.0)
+        assert [h.slug for h in hits] == ["gpu-daemon-oom"]
+        assert hits[0].bm25 < 0                # keyword evidence stamped
+    finally:
+        conn.close()
+
+
+def test_floor_judges_graph_neighbors_by_own_cosine(tmp_path):
+    # A linked neighbor enters via the graph arm with NO direct match evidence;
+    # the universal cosine judges it on its own distance to the query.
+    kd = tmp_path / "k"; kd.mkdir()
+    _note(kd, "gpu-daemon-oom", "embedder daemon gpu oom retry",
+          "Daemon retries per-text on gpu oom. See [[kosher-supplier-feeds]].")
+    _note(kd, "kosher-supplier-feeds", "supermarket supplier feeds sync",
+          "Supplier feeds sync nightly into the supermarket inventory.")
+    db = tmp_path / "i.sqlite"
+    emb = FakeEmbedder()
+    assert index.build_index(kd, db, emb) == 2
+    conn = index._connect(db, read_only=True)
+    try:
+        q = "embedder daemon gpu oom retry"
+        qv = emb.embed([q], is_query=True)[0]
+        # link arm on, floor off: the neighbor rides in on the graph arm
+        linked = index.search(conn, q, query_vector=qv, k=5,
+                              link_decay=0.5, link_seed=5, sem_floor=0.0)
+        assert {h.slug for h in linked} == {"gpu-daemon-oom",
+                                            "kosher-supplier-feeds"}
+        # link arm on, floor on: the semantically-far neighbor dies anyway
+        floored = index.search(conn, q, query_vector=qv, k=5,
+                               link_decay=0.5, link_seed=5,
+                               sem_floor=0.35, kw_floor=-999.0)
+        assert [h.slug for h in floored] == ["gpu-daemon-oom"]
+    finally:
+        conn.close()
+
+
+def test_floor_skipped_in_keyword_only_mode(tmp_path):
+    # Daemon-down fallback: no query vector -> the gate must NOT apply
+    # (degraded recall must not also go mute).
+    db, _emb = _floor_corpus(tmp_path)
+    conn = index._connect(db, read_only=True)
+    try:
+        hits = index.search(conn, "supplier feeds", query_vector=None, k=5,
+                            sem_floor=0.99, kw_floor=-999.0)
+        assert hits and hits[0].slug == "kosher-supplier-feeds"
+    finally:
+        conn.close()
+
+
+def test_floor_flows_through_search_corpora(tmp_path):
+    db, emb = _floor_corpus(tmp_path)
+    q = "embedder daemon gpu oom retry"
+    qv = emb.embed([q], is_query=True)[0]
+    scopes = [("proj", db)]
+    both = index.search_corpora(scopes, q, query_vector=qv, k=5, sem_floor=0.0)
+    assert len(both) == 2
+    floored = index.search_corpora(scopes, q, query_vector=qv, k=5,
+                                   sem_floor=0.35, kw_floor=-999.0)
+    assert [h.slug for h in floored] == ["gpu-daemon-oom"]
+    assert floored[0].cos > 0                  # stamps survive cross-scope fusion

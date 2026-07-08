@@ -58,6 +58,7 @@ def evaluate(cases: list[dict], scopes: list[tuple[str, Path]], *, k: int = 5,
              w_recency: float | None = None,
              w_salience: float | None = None, w_retention: float | None = None,
              half_life_days: float | None = None,
+             sem_floor: float | None = None, kw_floor: float | None = None,
              now=None) -> dict:
     """Run cases against the scopes; return aggregate + per-case metrics.
     ``query_vector_fn`` None → keyword-only. ``reranker`` set → fuse a deeper
@@ -72,7 +73,9 @@ def evaluate(cases: list[dict], scopes: list[tuple[str, Path]], *, k: int = 5,
                         ("link_decay", link_decay), ("ppr_decay", ppr_decay),
                         ("w_recency", w_recency),
                         ("w_salience", w_salience), ("w_retention", w_retention),
-                        ("half_life_days", half_life_days), ("now", now)):
+                        ("half_life_days", half_life_days),
+                        ("sem_floor", sem_floor), ("kw_floor", kw_floor),
+                        ("now", now)):
         if _val is not None:
             sc_kw[_name] = _val
     rec_k: list[float] = []

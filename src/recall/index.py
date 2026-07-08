@@ -16,6 +16,7 @@ import math
 import os
 import re
 import sqlite3
+import struct
 import sys
 from dataclasses import dataclass
 from datetime import date
@@ -70,6 +71,31 @@ PPR_DECAY = _env_float("RECALL_PPR_DECAY", 0.0)
 PPR_ALPHA = _env_float("RECALL_PPR_ALPHA", 0.15)   # teleport/restart probability
 PPR_ITERS = int(_env_float("RECALL_PPR_ITERS", 40))
 PPR_SEED = int(_env_float("RECALL_PPR_SEED", 10))  # restart only from the top-N hits
+# --- T2 evidence floor: relevance gate on ABSOLUTE arm evidence ---------------
+# RRF + min-max normalized scores are rank-RELATIVE (the top hit is 1.0 by
+# construction, junk or not), so the floor judges candidates on absolute
+# evidence instead: true cos(query, note), computed for EVERY fused candidate —
+# whatever arm surfaced it, so graph-arm neighbors are judged fairly. k becomes
+# a MAX, not a quota: weak candidates drop, 0..k notes inject. Hybrid-path
+# only: the keyword-only fallback (daemon down) stays unfiltered — degraded
+# recall must not also go mute. SEM_FLOOR=0 disables the gate entirely.
+# 0.40 is DOUBLY eval-earned (2026-07-08): (a) blind set (floor_sweep.json) —
+# positives 82.7%→84.0% (junk dropping lets targets into top-5), junk notes on
+# negatives −30%; (b) a 96-real-prompt stress replay (floor_stress_replay.py) —
+# at 0.45 the 0.41–0.45 band killed ~15 LOAD-BEARING notes (brick3 on "how does
+# context work now?", warm-daemon on "check systems after restart", pr-gate on
+# "commit and mirror"), at 0.40 zero flagged casualties while conversational
+# turns ("commit please") and off-domain chat correctly mute to zero injection.
+# 0.50+ is the blind-set cliff (situational −3, oblique −5). The 0.40–0.45 band
+# is where junk and gold OVERLAP: prefer the conservative edge, leave the tail
+# to PPR/T3. Retune BOTH evals after any embedder swap.
+SEM_FLOOR = _env_float("RECALL_SEM_FLOOR", 0.40)
+# Keyword-rescue floor (bm25 ≤ KW_FLOOR vouches a candidate past the sem floor).
+# OFF by default and experimental: FTS5 bm25 is ADDITIVE over OR-ed terms, so a
+# many-token junk query out-magnitudes the exact-identifier match this was meant
+# to rescue (blind negatives ran −4.4..−21.6 — no separating threshold exists).
+# Hit.bm25 still carries the evidence for observability.
+KW_FLOOR = _env_float("RECALL_KW_FLOOR", -1e9)
 _WIKILINK_RE = re.compile(r"\[\[([a-z0-9][a-z0-9-]*)\]\]")
 
 # Function words stripped from FTS5 MATCH queries — they carry no retrieval
@@ -271,6 +297,8 @@ class Hit:
     kind: str = ""     # note kind (e.g. "identity"/"achievement"); "" for domain notes
     body: str = ""     # full note body — fed to the reranker (snippet is display-only)
     valid_to: str = ""  # ISO date the fact STOPPED being true; "" = still true
+    cos: float = 0.0   # absolute semantic evidence, cos(query, note); 0.0 = unknown
+    bm25: float = 0.0  # FTS5 bm25 of the keyword match (negative = better); 0.0 = no match
 
     @property
     def historical(self) -> bool:
@@ -435,14 +463,17 @@ def _fts_match(text: str) -> str | None:
     return " OR ".join(f'"{t}"' for t in dict.fromkeys(toks[:24]))
 
 
-def _fts_ranked(conn: sqlite3.Connection, text: str, pool: int) -> list[str]:
+def _fts_ranked(conn: sqlite3.Connection, text: str,
+                pool: int) -> list[tuple[str, float]]:
+    """Keyword arm: (slug, bm25) best-first. The absolute bm25 (negative =
+    better) rides along as floor evidence instead of being discarded."""
     match = _fts_match(text)
     if not match:
         return []
     rows = conn.execute(
-        "SELECT slug FROM notes_fts WHERE notes_fts MATCH ? "
+        "SELECT slug, bm25(notes_fts) FROM notes_fts WHERE notes_fts MATCH ? "
         "ORDER BY bm25(notes_fts) LIMIT ?", (match, pool)).fetchall()
-    return [r[0] for r in rows]
+    return [(r[0], float(r[1])) for r in rows]
 
 
 def _vec_ranked(conn: sqlite3.Connection, query_vec: list[float],
@@ -457,6 +488,37 @@ def _vec_ranked(conn: sqlite3.Connection, query_vec: list[float],
         # after a model swap) -> degrade to keyword-only, never fail the query.
         return []
     return [r[0] for r in rows]
+
+
+def _semantic_evidence(conn: sqlite3.Connection, query_vector: list[float],
+                       slugs: list[str]) -> dict[str, float]:
+    """True cos(query, note) for every candidate slug, straight from the stored
+    embeddings — one batched fetch, no model call. This is the floor's absolute
+    evidence: it covers candidates from ANY arm (keyword, vec, link, PPR), so a
+    graph neighbor is judged by its real distance to the query, not by the arm
+    that surfaced it. Missing embeddings (keyword-only index rows) are absent
+    from the result — the caller treats absent as not-vouched. Fail-open: any
+    error returns {} and the caller must then skip flooring, never the query."""
+    if not slugs:
+        return {}
+    try:
+        qn = math.sqrt(sum(x * x for x in query_vector)) or 1.0
+        ph = ",".join("?" * len(slugs))
+        rows = conn.execute(
+            f"SELECT n.slug, v.embedding FROM vec_notes v "
+            f"JOIN notes n ON n.id = v.note_id WHERE n.slug IN ({ph})",
+            slugs).fetchall()
+        out: dict[str, float] = {}
+        for slug, blob in rows:
+            vec = struct.unpack(f"<{len(blob) // 4}f", blob)
+            if len(vec) != len(query_vector):
+                return {}
+            dot = sum(a * b for a, b in zip(query_vector, vec))
+            vn = math.sqrt(sum(x * x for x in vec)) or 1.0
+            out[slug] = dot / (qn * vn)
+        return out
+    except (sqlite3.Error, struct.error):
+        return {}
 
 
 def _rrf(ranked_lists: list[list[str]], k_out: int, *,
@@ -623,10 +685,16 @@ def search(conn: sqlite3.Connection, query_text: str, *,
            ppr_decay: float = PPR_DECAY,
            w_recency: float = W_RECENCY, w_salience: float = W_SALIENCE,
            w_retention: float = W_RETENTION, half_life_days: float = HALF_LIFE_DAYS,
+           sem_floor: float = SEM_FLOOR, kw_floor: float = KW_FLOOR,
            now: date | None = None) -> list[Hit]:
     """Hybrid recall over ONE index. Keyword (FTS5) always; semantic (vec) added
     when a ``query_vector`` is supplied; fused with RRF. With no vector it
     degrades to keyword-only — the recall hook's fallback when the daemon is down.
+
+    T2 evidence floor (hybrid path only): after fusion, a candidate survives iff
+    its ABSOLUTE evidence vouches — cos(query, note) ≥ ``sem_floor`` or a strong
+    keyword match (bm25 ≤ ``kw_floor``). Applied before the top-k slice, so k is
+    a MAX, not a quota (0..k hits return). ``sem_floor=0`` disables the gate.
 
     Then: (1) ``[[wikilink]]`` 1-hop expansion injects neighbors of the top
     ``link_seed`` fused hits at ``link_decay`` × the top score; (2) relevance is
@@ -634,7 +702,9 @@ def search(conn: sqlite3.Connection, query_text: str, *,
     (Generative-Agents style; all OFF by default). Retention is FSRS R(t,S) keyed
     on use (``last_used`` + ``stability``) — the principled successor to recency.
     ``corpus_label`` stamps provenance; ``now`` is injectable for tests."""
-    arms = [_fts_ranked(conn, query_text, pool)]
+    fts = _fts_ranked(conn, query_text, pool)
+    bm: dict[str, float] = dict(fts)
+    arms: list[list[str]] = [[s for s, _ in fts]]
     arm_w = [arm_weights[0] if arm_weights else 1.0]
     if query_vector is not None:
         arms.append(_vec_ranked(conn, query_vector, pool))
@@ -665,6 +735,17 @@ def search(conn: sqlite3.Connection, query_text: str, *,
     fused = _rrf(arms, pool, rrf_k=rrf_k, weights=arm_w)
     if not fused:
         return []
+    # Universal semantic evidence for every fused candidate (any arm) — one
+    # batched fetch; also stamped onto Hits (observability + the stress replay).
+    cos: dict[str, float] = {}
+    if query_vector is not None:
+        cos = _semantic_evidence(conn, query_vector, [s for s, _ in fused])
+        if sem_floor > 0 and cos:  # fail-open: no evidence map -> no flooring
+            fused = [(s, sc) for s, sc in fused
+                     if cos.get(s, -1.0) >= sem_floor
+                     or (s in bm and bm[s] <= kw_floor)]  # absent = never vouches
+            if not fused:
+                return []
     base: dict[str, float] = dict(fused)
     mn = min(base.values())
     span = (max(base.values()) - mn) or 1.0
@@ -703,7 +784,8 @@ def search(conn: sqlite3.Connection, query_text: str, *,
             snippet = snippet[:240].rstrip() + "…"
         hits.append(Hit(slug=slug, description=desc, snippet=snippet,
                         score=final, corpus=corpus_label, kind=kind, body=full,
-                        valid_to=valid_to))
+                        valid_to=valid_to,
+                        cos=cos.get(slug, 0.0), bm25=bm.get(slug, 0.0)))
     return hits
 
 
@@ -716,6 +798,7 @@ def search_corpora(scopes: list[tuple[str, Path]], query_text: str, *,
                    w_recency: float = W_RECENCY, w_salience: float = W_SALIENCE,
                    w_retention: float = W_RETENTION,
                    half_life_days: float = HALF_LIFE_DAYS,
+                   sem_floor: float = SEM_FLOOR, kw_floor: float = KW_FLOOR,
                    now: date | None = None) -> list[Hit]:
     """Fused hybrid recall across MULTIPLE indices — e.g. a project corpus plus
     the shared global/"soul" corpus. Each scope is ``(label, db_path)``; a
@@ -738,7 +821,8 @@ def search_corpora(scopes: list[tuple[str, Path]], query_text: str, *,
                           ppr_decay=ppr_decay,
                           w_recency=w_recency, w_salience=w_salience,
                           w_retention=w_retention,
-                          half_life_days=half_life_days, now=now)
+                          half_life_days=half_life_days,
+                          sem_floor=sem_floor, kw_floor=kw_floor, now=now)
         finally:
             conn.close()
         ranked_lists.append([(label, h.slug) for h in hits])
@@ -749,7 +833,7 @@ def search_corpora(scopes: list[tuple[str, Path]], query_text: str, *,
         h = per_scope[key]
         out.append(Hit(slug=h.slug, description=h.description, snippet=h.snippet,
                        score=score, corpus=h.corpus, kind=h.kind, body=h.body,
-                       valid_to=h.valid_to))
+                       valid_to=h.valid_to, cos=h.cos, bm25=h.bm25))
     return out
 
 
