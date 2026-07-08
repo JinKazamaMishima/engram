@@ -15,7 +15,7 @@ passed is dropped, so a reversed fact never rides in as current.
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -70,12 +70,28 @@ def _note_line(cwd: Path, scope: str, slug: str, today: str) -> Optional[str]:
     return f"- **{slug}** — {note.description}"
 
 
-def _turn_line(row: dict) -> str:
+def _stamp(row: dict, clock: datetime) -> str:
+    """Local-time stamp for a buffer row: '12:08' if same-day as ``clock``,
+    'Jul 7 16:21' otherwise — so a conversation spanning days SHOWS it, and
+    'earlier in context' can never masquerade as 'earlier today'. Fail-open to
+    '' (no stamp) on a missing/malformed ts."""
+    try:
+        dt = datetime.fromisoformat(str(row["ts"])).astimezone()
+        if dt.date() == clock.date():
+            return dt.strftime("%H:%M")
+        return f"{dt.strftime('%b')} {dt.day} {dt.strftime('%H:%M')}"
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _turn_line(row: dict, clock: datetime) -> str:
     role = _ROLE.get(row.get("role"), "?")
     text = str(row.get("text") or "").strip().replace("\n", " ")
     if len(text) > _PER_TURN_CAP:
         text = text[:_PER_TURN_CAP].rstrip() + " …"
-    return f"[{role}] {text}"
+    ts = _stamp(row, clock)
+    tag = f"[{role} @ {ts}]" if ts else f"[{role}]"
+    return f"{tag} {text}"
 
 
 def build_working_memory(buffer, cwd: Path, *, turns: int = WM_TURNS,
@@ -90,10 +106,16 @@ def build_working_memory(buffer, cwd: Path, *, turns: int = WM_TURNS,
     try:
         if buffer is None or not getattr(buffer, "enabled", False):
             return ""
-        today = (now or datetime.now(timezone.utc).date()).isoformat()
+        # The wall clock is part of the grounding: a Brick-3 conversation spans
+        # days, and without a per-turn NOW the model narrates time from its
+        # position in context ("this morning" for yesterday's work). ``clock``
+        # drives the NOW header + per-turn stamps; ``now`` (a date) still
+        # overrides for the validity check, keeping the old test seam.
+        clock = datetime.now().astimezone()
+        today = (now or clock.date()).isoformat()
 
         tail = buffer.tail(turns)          # oldest→newest; excludes the live turn
-        turn_lines = [_turn_line(r) for r in tail]
+        turn_lines = [_turn_line(r, clock) for r in tail]
 
         note_lines: list[str] = []
         for scope, slug in _recent_slugs(Path(cwd), notes):
@@ -111,8 +133,10 @@ def build_working_memory(buffer, cwd: Path, *, turns: int = WM_TURNS,
         # the remainder. Within each, keep the most valuable and drop from the
         # weak end (oldest turn / lowest-activation note).
         header = ("<working-memory>\n"
-                  "Recent context for THIS conversation, re-grounded from source "
-                  "each turn — trust it over any summary if they disagree.\n")
+                  f"NOW: {clock.strftime('%a %Y-%m-%d %H:%M %Z')}. Recent context "
+                  "for THIS conversation, re-grounded from source each turn — "
+                  "trust it over any summary if they disagree. Turn stamps are "
+                  "local time: date-stamped turns are NOT from today.\n")
         footer = "\n</working-memory>"
         room = max(0, budget - len(header) - len(footer))
 
