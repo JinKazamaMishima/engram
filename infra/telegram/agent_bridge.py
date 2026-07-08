@@ -477,6 +477,12 @@ def _build_options(resume_id: Optional[str]) -> ClaudeAgentOptions:
         cli_path=CLAUDE_BIN,
         resume=resume_id,
         stderr=_collect_stderr,
+        # One base64 image in a tool result (e.g. Read on a Telegram photo) must
+        # not overflow the SDK's 1 MiB stdio line and kill the bridge — same
+        # crash class the harness fixed in core.py (CLI_MAX_BUFFER_SIZE; 64 MiB
+        # default, ENGRAM_CLI_MAX_BUFFER_MB tunes).
+        max_buffer_size=int(float(os.environ.get(
+            "ENGRAM_CLI_MAX_BUFFER_MB", "64")) * 1024 * 1024),
     )
     if RECALL_INJECT:
         opts["hooks"] = {"UserPromptSubmit": [HookMatcher(hooks=[_recall_inject_hook])]}
