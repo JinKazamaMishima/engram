@@ -6,9 +6,10 @@ truncation, and the fail-open contract.
     .venv/bin/python infra/engram/tests/test_working_set.py
 """
 import os
+import re
 import sys
 import tempfile
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -58,8 +59,9 @@ def test_recent_turns_rendered_newest_survives():
         block = ws.build_working_memory(b, Path(d), notes=0)
         assert "<working-memory>" in block and "</working-memory>" in block
         assert "## Recent turns" in block
-        assert "[OPERATOR] second question" in block
-        assert "[ENGRAM] second answer" in block
+        # rows appended NOW render a same-day time-only stamp: [OPERATOR @ HH:MM]
+        assert re.search(r"\[OPERATOR @ \d{2}:\d{2}\] second question", block)
+        assert re.search(r"\[ENGRAM @ \d{2}:\d{2}\] second answer", block)
         # roles are relabeled, not raw
         assert "[user]" not in block and "assistant]" not in block.split("ENGRAM")[0]
     print("✓ recent turns rendered with OPERATOR/ENGRAM labels, newest present")
@@ -141,8 +143,8 @@ def test_notes_budget_keeps_top_activated():
         with tempfile.TemporaryDirectory() as bd:
             b = _buf(bd, [("user", "hi")])
             # budget with room for header + turn + exactly ONE note
-            block = ws.build_working_memory(b, cwd, budget=250, now=date(2026, 7, 4))
-        assert len(block) <= 250
+            block = ws.build_working_memory(b, cwd, budget=380, now=date(2026, 7, 4))
+        assert len(block) <= 380
         assert "note-c" in block                 # last activated = highest priority
         assert "note-a" not in block             # weakest dropped first
     print("✓ note budget keeps the top-activated note, drops the weakest")
@@ -167,6 +169,32 @@ def test_fail_open_on_broken_corpus():
     print("✓ malformed note skipped; block still builds (fail-open per-note)")
 
 
+def test_now_header_and_cross_day_stamps():
+    # The block must carry a NOW wall-clock line, and a turn from ANOTHER day
+    # must render a date-bearing stamp — a conversation spanning days SHOWS it.
+    with tempfile.TemporaryDirectory() as d:
+        b = _buf(d, [("user", "old question"), ("assistant", "fresh answer")])
+        block = ws.build_working_memory(b, Path(d), notes=0)
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        assert "NOW: " in block and today in block.split("\n")[1]
+    clock = datetime.now().astimezone()
+    old_ts = (clock - timedelta(days=3)).isoformat()
+    line = ws._turn_line({"role": "user", "text": "x", "ts": old_ts}, clock)
+    assert re.match(r"\[OPERATOR @ [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}\] x", line)
+    line2 = ws._turn_line({"role": "assistant", "text": "y",
+                           "ts": clock.isoformat()}, clock)
+    assert re.match(r"\[ENGRAM @ \d{2}:\d{2}\] y", line2)
+    print("✓ NOW header present; other-day turns date-stamped, same-day time-only")
+
+
+def test_stamp_fails_open_without_ts():
+    clock = datetime.now().astimezone()
+    assert ws._turn_line({"role": "user", "text": "x"}, clock) == "[OPERATOR] x"
+    assert ws._turn_line({"role": "user", "text": "x", "ts": "garbage"},
+                         clock) == "[OPERATOR] x"
+    print("✓ missing/malformed ts → plain role tag, never a crash")
+
+
 def main() -> int:
     test_empty_when_no_buffer()
     test_recent_turns_rendered_newest_survives()
@@ -175,6 +203,8 @@ def main() -> int:
     test_notes_from_activation_validity_filtered()
     test_notes_budget_keeps_top_activated()
     test_fail_open_on_broken_corpus()
+    test_now_header_and_cross_day_stamps()
+    test_stamp_fails_open_without_ts()
     print("\nALL PASS")
     return 0
 
