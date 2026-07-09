@@ -2,6 +2,9 @@
 # Engram installer — bootstrap. Ensures Python 3.12+, uv, a virtualenv, and the
 # base package, then hands off to the interactive setup wizard which walks you
 # through login, your data folder, and which tiers to install.
+#
+#   ./install.sh          guided setup (re-runs reuse your previous answers)
+#   ./install.sh --yes    non-interactive: accept every default
 set -euo pipefail
 cd "$(dirname "$0")"   # portable: no GNU-only `readlink -f` (run from the repo root)
 

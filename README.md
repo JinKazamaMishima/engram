@@ -202,20 +202,28 @@ bridge, the TUI) and each becomes an independent memory unit:
 ```sh
 git clone https://github.com/JinKazamaMishima/engram.git
 cd engram
-./install.sh
+./install.sh          # guided setup — re-runs reuse your previous answers
+./install.sh --yes    # non-interactive: accept every default
 ```
 
 The guided installer walks you through, step by step:
 
-1. **Preflight** — checks Python, and detects GPU vs CPU.
-2. **Log in to Anthropic** — installs the `claude` CLI if needed and runs the
-   login (subscription browser sign-in *or* an API key).
+1. **Preflight** — checks Python, detects GPU vs CPU, and shows whether you're
+   already signed in to Anthropic.
+2. **Log in to Anthropic** — if you're already signed in, this is a one-key
+   confirmation. Otherwise it offers to install the `claude` CLI and runs
+   `claude auth login` (browser sign-in that returns you straight to setup —
+   no full Claude Code session opens in your terminal), *or* takes an API key
+   and verifies it against the API.
 3. **Choose your data folder** — where *your* memory corpus, indices, sessions,
    and any enrolled face data live (default `~/.local/share/recall`). This never
    leaves your machine.
 4. **Pick your tiers** — memory brain / + assistant / + Sensorium / + Telegram.
 5. **Models, skills, hook, and (optional) background services** — each explained,
    each skippable.
+6. **Verified finish** — the closing summary checks (not assumes) that auth,
+   skills, the hook, and the index actually landed, with the exact command for
+   anything still pending.
 
 ### Manual install (memory brain only)
 
