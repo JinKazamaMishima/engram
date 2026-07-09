@@ -140,12 +140,85 @@ async def test_query_prunes_terminal_tasks():
     print("✓ query() prunes finished sub-agents at the turn boundary; live ones stay")
 
 
+WF_PROGRESS = [
+    {"type": "workflow_phase", "index": 1, "title": "Scan"},
+    {"type": "workflow_agent", "index": 1, "label": "scan a", "phaseIndex": 1,
+     "phaseTitle": "Scan", "model": "claude-sonnet-4-6", "state": "done"},
+    {"type": "workflow_agent", "index": 2, "label": "scan b", "phaseIndex": 1,
+     "phaseTitle": "Scan", "model": "claude-opus-4-8", "state": "progress"},
+]
+
+
+async def test_workflow_task_labeled_backgrounded_and_snapshotted():
+    d = AgentSDKDriver(store=None)
+    d._client = FakeClient([
+        TaskStartedMessage(subtype="task_started",
+                           data={"task_type": "local_workflow",
+                                 "workflow_name": "audit-routes"},
+                           task_id="wf1", description="audit the routes",
+                           uuid="u", session_id="s", tool_use_id="tu9"),
+        TaskProgressMessage(subtype="task_progress",
+                            data={"workflow_progress": WF_PROGRESS},
+                            task_id="wf1", description="Scan: scan b",
+                            usage={"total_tokens": 40100, "tool_uses": 3,
+                                   "duration_ms": 900},
+                            uuid="u", session_id="s", last_tool_name="scan b"),
+        AM(TextBlock(text="running — I'll report back")),
+        RESULT(),
+    ])
+    evs = [ev async for ev in d._stream("hi")]
+    # Named + flagged as a workflow and tracked as BACKGROUND — the run outlives
+    # the turn by design, so it must never hold the prompt open via `pending`.
+    assert d.tasks["wf1"]["name"] == "⚙ audit-routes", d.tasks
+    assert d.tasks["wf1"]["workflow"] is True
+    assert "wf1" in d._bg_tasks and d.has_background_tasks
+    launch = [e for e in evs if e.kind == "text" and "workflow" in e.text]
+    assert launch and "audit-routes" in launch[0].text
+    # The progress heartbeat snapshots the phase/agent tree for the panel.
+    snap = d.tasks["wf1"]["wf"]
+    assert snap["done"] == 1 and snap["total"] == 2 and snap["phase"] == "Scan"
+    assert snap["phases"][0]["agents"][1]["state"] == "progress"
+    assert any("1/2 agents" in e.text for e in evs if e.kind == "status")
+    print("✓ workflow task: ⚙-named, background-tracked, phase/agent tree snapshotted")
+
+
+def test_workflow_snapshot_shapes():
+    from core import workflow_snapshot
+    assert workflow_snapshot([]) == {"phases": [], "done": 0, "total": 0,
+                                     "phase": ""}
+    snap = workflow_snapshot([{"type": "workflow_agent", "label": "solo",
+                               "phaseTitle": "Fix", "state": "done"}])
+    assert snap["total"] == snap["done"] == 1 and snap["phase"] == "Fix"
+    print("✓ workflow_snapshot: empty + phase-less agent lists both hold shape")
+
+
+def test_workflow_tool_label():
+    from core import _tool_label
+    blk = ToolUseBlock(id="t", name="Workflow", input={
+        "script": "export const meta = {\n  name: 'find-bugs',\n"})
+    assert _tool_label(blk) == "Workflow→find-bugs"
+    assert _tool_label(ToolUseBlock(id="t2", name="Workflow", input={})) == "Workflow"
+    print("✓ Workflow tool-use labels with the script's meta name")
+
+
+def test_render_tasks_line_workflow():
+    line = render_tasks_line([], [
+        {"name": "⚙ audit-routes", "status": "running", "workflow": True,
+         "tokens": 40100, "wf": {"phase": "Scan", "done": 1, "total": 2}}])
+    assert "⚙ audit-routes ⏳ Scan 1/2 40k" in line, line
+    print("✓ panel renderer: workflow row shows phase + agents done/total")
+
+
 async def main() -> int:
     await test_todowrite_yields_todos_event()
     await test_task_registry_and_events()
     test_render_tasks_line()
     test_render_tasks_line_nine_done_collapse()
     await test_query_prunes_terminal_tasks()
+    await test_workflow_task_labeled_backgrounded_and_snapshotted()
+    test_workflow_snapshot_shapes()
+    test_workflow_tool_label()
+    test_render_tasks_line_workflow()
     print("\nALL PASS")
     return 0
 
