@@ -64,3 +64,72 @@ def test_format_context_future_valid_to_not_historical():
     hits = [Hit("expiring", "true until the far future", "s", 0.9, "proj",
                 valid_to="2099-01-01")]
     assert "HISTORICAL" not in recall_inject._format_context(hits)
+
+
+# ---- the always-on rules tier + registration warning ----------------------
+
+def test_drop_rule_hits():
+    # kind:rule notes are already injected by the always-on tier — a retrieval
+    # slot spent on one is wasted.
+    hits = [Hit("keep-me", "a fact", "s", 0.9, "proj"),
+            Hit("rule-x", "a directive", "s", 0.8, "global", "rule")]
+    assert [h.slug for h in recall_inject._drop_rule_hits(hits)] == ["keep-me"]
+
+
+def test_machine_run_predicate(monkeypatch):
+    for k in list(__import__("os").environ):
+        if k.startswith(recall_inject.EXEMPT_ENV_PREFIXES):
+            monkeypatch.delenv(k)
+    assert not recall_inject._machine_run()
+    monkeypatch.setenv("RECALL_CURATE_OUT", "/tmp/x")
+    assert recall_inject._machine_run()
+
+
+def test_rules_context_fails_open(monkeypatch):
+    # Any explosion in the rules tier must yield None, never an exception —
+    # a recall hook can never block prompt submission.
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/definitely/not/there")
+    monkeypatch.setenv("RECALL_GLOBAL_DIR", "/also/not/there")
+    assert recall_inject._rules_context() is None
+
+
+def test_registration_warning_fires_in_unregistered_git_repo(tmp_path, monkeypatch):
+    repo = tmp_path / "somerepo"
+    (repo / ".git").mkdir(parents=True)
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo))
+    ctx, visible = recall_inject._registration_warning("sess-1")
+    assert ctx and "recall register" in ctx
+    assert visible and "somerepo" in visible
+    # Same session again: the model context line persists (it must survive
+    # compaction), the operator nudge does not repeat.
+    ctx2, visible2 = recall_inject._registration_warning("sess-1")
+    assert ctx2 and visible2 is None
+
+
+def test_registration_warning_silent_when_registered(tmp_path, monkeypatch):
+    repo = tmp_path / "somerepo"
+    (repo / ".git").mkdir(parents=True)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "projects.txt").write_text(f"{repo}\n")
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(data))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(repo))
+    assert recall_inject._registration_warning("s") == (None, None)
+
+
+def test_registration_warning_silent_outside_git(tmp_path, monkeypatch):
+    plain = tmp_path / "notrepo"
+    plain.mkdir()
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(plain))
+    assert recall_inject._registration_warning("s") == (None, None)
+
+
+def test_registration_warning_silent_inside_data_root(tmp_path, monkeypatch):
+    # The soul repo itself lives under the data root — never nag there.
+    soul = tmp_path / "data" / "global"
+    (soul / ".git").mkdir(parents=True)
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(soul))
+    assert recall_inject._registration_warning("s") == (None, None)

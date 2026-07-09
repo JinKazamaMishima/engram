@@ -32,6 +32,7 @@ WorkingDirectory=__ENGRAM_HOME__
 Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 EnvironmentFile=-%h/.config/recall/telegram.env
+ExecStart=-__ENGRAM_HOME__/.venv/bin/recall doctor --notify
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall curate-sessions-all --commit
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall consolidate-all --commit
 ExecStart=__ENGRAM_HOME__/.venv/bin/recall dream-all --counterfactual --commit

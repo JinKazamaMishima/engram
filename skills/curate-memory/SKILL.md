@@ -98,7 +98,11 @@ kebab-case `[a-z0-9-]` and **equals the frontmatter `name`**:
 name: <kebab-slug>                 # MUST equal the filename stem
 description: "<one specific, self-contained line>"   # REQUIRED retrieval field (embedded + FTS-indexed). ALWAYS double-quote — see below
 tags: [tag-a, tag-b]               # lowercase; aid keyword recall
-kind: identity | achievement | lesson    # global notes only; omit for project notes
+kind: identity | achievement | lesson    # global notes only; omit for project notes.
+#                                  #   NEVER `kind: rule` — standing rules are
+#                                  #   operator-promoted by hand only; the wrapper
+#                                  #   FAILS the whole run if any manifest note
+#                                  #   (created OR updated) carries kind: rule.
 first_seen: <YYYY-MM-DD>
 last_updated: <YYYY-MM-DD>         # = RECALL_CURATE_DATE
 sources: [<YYYY-MM-DD>, ...]       # dates that contributed; append on updates

@@ -37,6 +37,13 @@ Tools: **Read, Glob, Grep, Write, Edit** only (no Bash, no network).
 
 # Procedure
 
+**Hands off `kind: rule` notes.** Standing rules are operator-promoted and
+operator-edited ONLY: never merge, supersede, link-edit, annotate, or otherwise
+touch a note whose frontmatter says `kind: rule` (the precomputed worklist
+excludes them, but if one slips into a pair anyway, skip that entry and say so
+in the manifest summary). The wrapper FAILS the whole run if any manifest note
+carries `kind: rule`.
+
 ## 1. Duplicate pairs — merge by SUPERSEDING in place (never delete)
 Read BOTH notes. Act only if they are genuinely the **same insight** (high cosine
 often just means *related* — that's a link, §2, not a merge). To merge, pick the
