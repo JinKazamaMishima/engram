@@ -42,6 +42,7 @@ from zoneinfo import ZoneInfo
 from recall import config, dynamics
 from recall import transcripts as T
 from recall.notify import notify_alert
+from recall.rules import RULE_KIND
 from recall.schema import (
     CurationManifest,
     CurationSchemaError,
@@ -694,11 +695,25 @@ def validate_manifest_against(
                                         f"{note_path} is absent", exit_code=1,
                                  alert_priority="urgent")
         try:
-            KnowledgeNote.parse(note_path.read_text(), expect_slug=edit.slug)
+            note = KnowledgeNote.parse(note_path.read_text(),
+                                       expect_slug=edit.slug)
         except CurationSchemaError as e:
             return None, Outcome(kind="failed", reason="note_schema_error",
                                  detail=f"note {edit.slug!r} malformed: {e}",
                                  exit_code=1, alert_priority="urgent")
+        if note.kind == RULE_KIND:
+            # Standing rules are the operator-promoted, always-injected channel
+            # that steers the machine writers themselves — a machine may neither
+            # author nor edit one. Failing the whole run (vs skipping the note)
+            # is deliberate: a curator that tried to write a rule is misbehaving,
+            # and a wrong rule is worse than a lost run.
+            return None, Outcome(kind="failed", reason="machine_authored_rule",
+                                 detail=f"note {edit.slug!r} ({edit.action}, "
+                                        f"{edit.scope}) carries kind: rule — "
+                                        f"standing rules are operator-promoted "
+                                        f"only; machine writers may not create "
+                                        f"or edit them", exit_code=1,
+                                 alert_priority="urgent")
     return manifest, None
 
 

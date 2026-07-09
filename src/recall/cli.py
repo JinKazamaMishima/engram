@@ -403,6 +403,9 @@ def _cmd_projects(args) -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Subcommands that own their own arg parsing get the raw remainder.
+    if argv and argv[0] == "doctor":
+        from recall import doctor
+        return doctor.main(argv[1:])
     if argv and argv[0] == "curate":
         from recall import curate
         return curate.main(argv[1:])

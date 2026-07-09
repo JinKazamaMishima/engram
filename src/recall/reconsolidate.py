@@ -35,7 +35,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from recall import config, index
+from recall import config, index, rules
 from recall.curate import (
     CLAUDE_BIN,
     CLAUDE_TIMEOUT_S,
@@ -155,7 +155,11 @@ def _compute_candidates(ctx: ReconContext) -> dict:
     """All-pairs cosine over the scope's notes -> duplicate pairs, missing-link
     candidates, and stale flags. Lazy torch import AFTER the trivial-corpus guard;
     best-effort -> empty lists (a worklist hint, never a hard dependency)."""
-    notes = [n for n, _ in index._load_notes(ctx.corpus_dir)]
+    # kind:rule notes are operator-owned: the machine may never dup-merge,
+    # link-annotate, or stale-flag one (the wrapper would fail the run — see
+    # validate_manifest_against), so keep them out of the worklist entirely.
+    notes = [n for n, _ in index._load_notes(ctx.corpus_dir)
+             if n.kind != rules.RULE_KIND]
     empty = {"scope": ctx.scope, "duplicate_pairs": [], "link_candidates": [],
              "stale": []}
     if len(notes) < 2:

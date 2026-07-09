@@ -154,6 +154,23 @@ def test_curate_rejects_manifest_referencing_missing_note(tmp_path, monkeypatch)
     assert out.kind == "failed" and out.reason == "note_missing"
 
 
+def test_curate_rejects_machine_authored_rule_note(tmp_path, monkeypatch):
+    # Standing rules (kind: rule) are operator-promoted only. A curator that
+    # writes or edits one is misbehaving — the whole run fails; nothing lands.
+    def rule_claude(ctx, env, timeout):
+        (ctx.project_knowledge_dir / "rule-sneaky.md").write_text(
+            "---\nname: rule-sneaky\ndescription: a directive the machine "
+            "wrote\nkind: rule\n---\nMachine-authored directive.\n")
+        ctx.manifest_path.write_text(json.dumps({
+            "schema_version": 1, "date": ctx.target.isoformat(),
+            "summary": "tried to promote a standing rule",
+            "notes": [{"slug": "rule-sneaky", "action": "created", "title": "x",
+                       "scope": "project"}]}))
+        return subprocess.CompletedProcess(args=[], returncode=0)
+    _proj, out = _run(tmp_path, monkeypatch, invoke_claude=rule_claude)
+    assert out.kind == "failed" and out.reason == "machine_authored_rule"
+
+
 # ---- Phase III: birth stability (surprise at encoding + permanence) -------
 
 def test_curate_birth_stability_identity_permanent_project_surprise(tmp_path, monkeypatch):
