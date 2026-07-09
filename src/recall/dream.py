@@ -50,12 +50,20 @@ from recall.curate import (
     Outcome,
     _et_clock,
     _git_commit_scoped,
+    run_claude_with_backoff,
     validate_manifest_against,
 )
 from recall.notify import notify_alert
 from recall.schema import CurationManifest, CurationSchemaError, KnowledgeNote, set_frontmatter_keys
 
 _DREAM_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
+# Dreaming is the deep creative pass (counterfactual / blind-variation-selective-
+# retention over 0.30-0.60 cosine note pairs) — pin it to Opus 4.8 at the 1M
+# window at xhigh effort. (Bump RECALL_DREAM_EFFORT to max if the counterfactuals
+# want more depth; xhigh stays clear of the 900s per-call timeout on a heavy
+# night.) Model + effort are env-overridable.
+DREAM_MODEL = os.environ.get("RECALL_DREAM_MODEL", "claude-opus-4-8[1m]")
+DREAM_EFFORT = os.environ.get("RECALL_DREAM_EFFORT", "xhigh")
 
 # Recombination band: pair a fresh memory with an older one whose cosine sits in
 # [LO, HI] — wider/further than reconsolidate's 0.60–0.80 link band, because a
@@ -442,11 +450,12 @@ def _build_env(ctx: DreamContext) -> dict[str, str]:
 def _invoke_claude(ctx: DreamContext, env: dict[str, str],
                    timeout_s: int = CLAUDE_TIMEOUT_S
                    ) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run(
+    return run_claude_with_backoff(
         [CLAUDE_BIN, "-p", "/dream",
+         "--model", DREAM_MODEL, "--effort", DREAM_EFFORT,
          "--add-dir", str(config.data_root()),
          "--allowedTools", *_DREAM_ALLOWED_TOOLS],
-        env=env, cwd=str(ctx.repo), timeout=timeout_s, check=False)
+        env=env, cwd=str(ctx.repo), timeout=timeout_s)
 
 
 def _stamp_hypothesis_defaults(ctx: DreamContext, manifest: CurationManifest) -> int:

@@ -27,9 +27,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
+import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -48,9 +51,76 @@ from recall.schema import (
 
 CLAUDE_BIN = os.environ.get("RECALL_CLAUDE_BIN") or shutil.which("claude") or "claude"
 CLAUDE_TIMEOUT_S = 900
+# Curation is a bounded extraction/dedup task, not deep reasoning — run it on
+# Sonnet 5 (the top Sonnet, 1M-context) at xhigh effort, which has far more
+# headroom than Opus during peak hours so it rarely eats the 529 that pages the
+# operator. Model + effort are env-overridable for A/B or rollback without a
+# redeploy.
+CURATE_MODEL = os.environ.get("RECALL_CURATE_MODEL", "claude-sonnet-5")
+CURATE_EFFORT = os.environ.get("RECALL_CURATE_EFFORT", "xhigh")
 ET = ZoneInfo("America/New_York")
 _CURATE_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
 _SIMILAR_QUERY_MAX_CHARS = 8000   # cap the bundle text embedded for dedup lookup
+
+# A `claude` failure whose output matches this is a TRANSIENT upstream capacity
+# signal (HTTP 429/529/5xx, "Overloaded", rate-limit) — the kind a 529 literally
+# tells you to "try again in a moment" for. run_claude_with_backoff rides these
+# out; every other nonzero exit (bad flag, auth, missing bin) is returned/raised
+# at once so a real fault still fails fast and still pages.
+_TRANSIENT_RE = re.compile(
+    r"(?:\b(?:429|529|502|503|504)\b|overload|rate[ _-]?limit"
+    r"|service[ _-]?unavailable|temporarily unavailable)", re.IGNORECASE)
+
+
+def _emit(data: bytes, stream) -> None:
+    """Write captured child output to the parent stream so journalctl still shows
+    the skill's reasoning even though we capture to inspect it. Robust under
+    pytest, which may swap sys.stdout for an object with no .buffer."""
+    if not data:
+        return
+    try:
+        stream.buffer.write(data)
+        stream.flush()
+    except (AttributeError, ValueError):
+        stream.write(data.decode("utf-8", "replace"))
+        stream.flush()
+
+
+def run_claude_with_backoff(
+    argv: list[str], *, env: dict[str, str], cwd: str, timeout: int,
+    attempts: int = 4, base_delay: float = 5.0, max_delay: float = 60.0,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
+    sleep: Callable[[float], None] = time.sleep,
+    jitter: Callable[[], float] = random.random,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run `claude` and transparently retry ONLY the transient-overload class
+    (see _TRANSIENT_RE) with exponential backoff + jitter, so the nightly memory
+    cycle rides out an Anthropic capacity blip instead of failing and paging the
+    operator. Non-transient nonzero exits return immediately (no wasted retries,
+    real faults still fail fast). TimeoutExpired / FileNotFoundError propagate to
+    the caller's existing handlers — a timeout or a missing binary is not a thing
+    a retry fixes. Output is captured to be inspected, then re-emitted each
+    attempt so the journal keeps the skill's stdout/stderr."""
+    last: subprocess.CompletedProcess[bytes] | None = None
+    for attempt in range(1, attempts + 1):
+        cp = runner(argv, env=env, cwd=cwd, timeout=timeout,
+                    check=False, capture_output=True)
+        _emit(cp.stdout, sys.stdout)
+        _emit(cp.stderr, sys.stderr)
+        last = cp
+        if cp.returncode == 0:
+            return cp
+        blob = ((cp.stdout or b"") + b"\n" + (cp.stderr or b"")).decode(
+            "utf-8", "replace")
+        if attempt < attempts and _TRANSIENT_RE.search(blob):
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            delay += jitter() * base_delay   # decorrelate concurrent retries
+            print(f"[claude] transient upstream error (attempt {attempt}/{attempts}); "
+                  f"retrying in {delay:.1f}s", flush=True)
+            sleep(delay)
+            continue
+        return cp
+    return last  # type: ignore[return-value]  # attempts >= 1, so last is set
 
 
 # ---- result / outcome types ----------------------------------------------
@@ -374,11 +444,12 @@ def _invoke_claude(ctx: FireContext, env: dict[str, str],
     project dir (so the project corpus is in cwd). The recall data root is
     granted via --add-dir so the skill can read the bundle and write global
     notes + the manifest, which live outside cwd."""
-    return subprocess.run(
+    return run_claude_with_backoff(
         [CLAUDE_BIN, "-p", "/curate-memory",
+         "--model", CURATE_MODEL, "--effort", CURATE_EFFORT,
          "--add-dir", str(config.data_root()),
          "--allowedTools", *_CURATE_ALLOWED_TOOLS],
-        env=env, cwd=str(ctx.project_dir), timeout=timeout_s, check=False)
+        env=env, cwd=str(ctx.project_dir), timeout=timeout_s)
 
 
 def _note_dir(ctx: FireContext, scope: str) -> Path:

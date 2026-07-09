@@ -43,12 +43,18 @@ from recall.curate import (
     Outcome,
     _et_clock,
     _git_commit_scoped,
+    run_claude_with_backoff,
     validate_manifest_against,
 )
 from recall.notify import notify_alert
 from recall.schema import CurationManifest
 
 _RECON_ALLOWED_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"]
+# Reconsolidation is a careful merge/dedup pass over an existing corpus scope —
+# pin it to Opus 4.8 at the 1M window (agentic runs that read many notes, so keep
+# the large context) at xhigh effort. Model + effort are env-overridable.
+RECON_MODEL = os.environ.get("RECALL_RECON_MODEL", "claude-opus-4-8[1m]")
+RECON_EFFORT = os.environ.get("RECALL_RECON_EFFORT", "xhigh")
 # Thresholds are calibrated to Qwen3-Embedding's (compressed) cosine range — on a
 # real 41-note corpus, max pairwise ≈ 0.79, p95 ≈ 0.61, median ≈ 0.43. So DUP at
 # 0.80 only fires on a genuine near-twin (related notes top out ~0.79 and should
@@ -230,11 +236,12 @@ def _invoke_claude(ctx: ReconContext, env: dict[str, str],
                    ) -> subprocess.CompletedProcess[bytes]:
     """Run the reconsolidation skill scoped to the corpus's repo, granting the
     recall data root (candidates sidecar + manifest live there)."""
-    return subprocess.run(
+    return run_claude_with_backoff(
         [CLAUDE_BIN, "-p", "/reconsolidate-memory",
+         "--model", RECON_MODEL, "--effort", RECON_EFFORT,
          "--add-dir", str(config.data_root()),
          "--allowedTools", *_RECON_ALLOWED_TOOLS],
-        env=env, cwd=str(ctx.repo), timeout=timeout_s, check=False)
+        env=env, cwd=str(ctx.repo), timeout=timeout_s)
 
 
 def _rebuild_index(ctx: ReconContext) -> int:
