@@ -278,7 +278,48 @@ def _tool_label(block) -> str:
         sub = inp.get("subagent_type") or inp.get("subagentType") or "?"
         desc = (inp.get("description") or "").strip()
         return f"{name}→{sub}" + (f": {desc}" if desc else "")
+    if name == "Workflow":
+        script = str((getattr(block, "input", None) or {}).get("script") or "")
+        m = re.search(r"name:\s*['\"]([A-Za-z0-9_-]+)", script)
+        return f"Workflow→{m.group(1)}" if m else "Workflow"
     return name
+
+
+def workflow_snapshot(wp: list) -> dict:
+    """Collapse one ``task_progress`` message's ``workflow_progress`` list into the
+    panel/detail snapshot: ordered phases, each with its agents' label/state/model.
+    The runtime re-sends the FULL tree on every heartbeat, so each snapshot
+    REPLACES the previous one (point-in-time, like the task-registry copies).
+    Shape (all keys always present): {phases: [{title, agents: [{label, state,
+    model}]}], done, total, phase} — ``phase`` is where work currently is (the
+    last streamed agent's phase)."""
+    phases: list[dict] = []
+    by_title: dict[str, dict] = {}
+    cur_phase = ""
+    for e in wp or []:
+        if e.get("type") == "workflow_phase":
+            title = e.get("title") or f"phase {e.get('index', '?')}"
+            if title not in by_title:
+                p = {"title": title, "agents": []}
+                phases.append(p)
+                by_title[title] = p
+        elif e.get("type") == "workflow_agent":
+            title = e.get("phaseTitle") or "…"
+            p = by_title.get(title)
+            if p is None:
+                p = {"title": title, "agents": []}
+                phases.append(p)
+                by_title[title] = p
+            p["agents"].append({
+                "label": e.get("label") or f"agent {e.get('index', '?')}",
+                "state": e.get("state") or "…",
+                "model": _model_family(e.get("model")) or ""})
+            cur_phase = title
+    agents = [a for p in phases for a in p["agents"]]
+    return {"phases": phases,
+            "done": sum(1 for a in agents if a["state"] == "done"),
+            "total": len(agents),
+            "phase": cur_phase or (phases[-1]["title"] if phases else "")}
 
 
 def session_curation_cmd(sid: str, cwd: Path, provisional: bool = False) -> list[str]:
@@ -1211,10 +1252,26 @@ class AgentSDKDriver(ModelDriver):
                             bg_launches.add(block.id)
                         yield Event("tool", _tool_label(block))
             elif isinstance(msg, TaskStartedMessage):
-                name = (getattr(msg, "data", {}) or {}).get("subagent_type") or "sub-agent"
+                data = getattr(msg, "data", {}) or {}
+                is_wf = data.get("task_type") == "local_workflow"
+                name = (f"⚙ {data.get('workflow_name') or 'workflow'}" if is_wf
+                        else data.get("subagent_type") or "sub-agent")
                 self._task_names[msg.task_id] = name
                 saw_task = True
-                if getattr(msg, "tool_use_id", None) in bg_launches:
+                if is_wf:
+                    # A dynamic workflow runs OUTSIDE the conversation and outlives
+                    # the turn by design — the model's own turn ends with "running,
+                    # I'll report back", and the completion notification re-invokes
+                    # it. Track it like a background sub-agent so the prompt stays
+                    # responsive for the whole run; the idle drain (or whichever
+                    # stream is open) paints progress and the final report.
+                    self._bg_tasks.add(msg.task_id)
+                    bg_started = True
+                    yield Event("text",
+                                f"\n\n> ⚙ *workflow "
+                                f"**{data.get('workflow_name') or 'unnamed'}** "
+                                f"launched — {msg.description}*\n\n")
+                elif getattr(msg, "tool_use_id", None) in bg_launches:
                     # Launched with run_in_background: it OUTLIVES this turn by design,
                     # so it must NOT hold the turn open via `pending` (that hold + its
                     # 180s idle timeout was the "detached; result wasn't captured"
@@ -1230,12 +1287,26 @@ class AgentSDKDriver(ModelDriver):
                                         f"{msg.description}*\n\n")
                 yield self._task_upd(msg.task_id, name=name, desc=msg.description,
                                      status="running",
-                                     background=msg.task_id in self._bg_tasks)
+                                     background=msg.task_id in self._bg_tasks,
+                                     workflow=True if is_wf else None)
             elif isinstance(msg, TaskProgressMessage):
-                bits = f"🛰 {self._task_names.get(msg.task_id, 'sub-agent')}"
+                name = self._task_names.get(msg.task_id, "sub-agent")
+                tot = (getattr(msg, "usage", None) or {}).get("total_tokens")
+                wp = (getattr(msg, "data", {}) or {}).get("workflow_progress")
+                if wp:
+                    # Workflow heartbeat: the full phase/agent tree rides every
+                    # progress message — snapshot it for the panel + /workflows.
+                    snap = workflow_snapshot(wp)
+                    bits = (f"{name} · {snap['phase']}"
+                            f" · {snap['done']}/{snap['total']} agents")
+                    if tot:
+                        bits += f" · {tot:,} tok"
+                    yield Event("status", bits)          # ephemeral — status line only
+                    yield self._task_upd(msg.task_id, tokens=tot, wf=snap)
+                    continue
+                bits = f"🛰 {name}"
                 if getattr(msg, "last_tool_name", None):
                     bits += f" · {msg.last_tool_name}"
-                tot = (getattr(msg, "usage", None) or {}).get("total_tokens")
                 if tot:
                     bits += f" · {tot:,} tok"
                 yield Event("status", bits)              # ephemeral — status line only
@@ -1474,22 +1545,39 @@ class AgentSDKDriver(ModelDriver):
                             bg_launches.add(block.id)
                         yield Event("tool", _tool_label(block))
             elif isinstance(msg, TaskStartedMessage):
-                # A follow-up turn may delegate AGAIN. The drain has no turn to hold
-                # open, so sync or background, track it as background and keep
-                # listening until it finishes too.
-                name = (getattr(msg, "data", {}) or {}).get("subagent_type") or "sub-agent"
+                # A follow-up turn may delegate AGAIN (a sub-agent or a whole
+                # workflow). The drain has no turn to hold open, so sync or
+                # background, track it as background and keep listening.
+                data = getattr(msg, "data", {}) or {}
+                is_wf = data.get("task_type") == "local_workflow"
+                name = (f"⚙ {data.get('workflow_name') or 'workflow'}" if is_wf
+                        else data.get("subagent_type") or "sub-agent")
                 self._task_names[msg.task_id] = name
                 self._bg_tasks.add(msg.task_id)
                 bg = getattr(msg, "tool_use_id", None) in bg_launches
-                yield Event("text", f"\n\n> 🛰 *delegated to **{name}**"
-                                    f"{' (background)' if bg else ''} — {msg.description}*\n\n")
+                mark = "⚙ *workflow" if is_wf else "🛰 *delegated to"
+                yield Event("text", f"\n\n> {mark} **{name.removeprefix('⚙ ')}**"
+                                    f"{' (background)' if bg and not is_wf else ''}"
+                                    f" — {msg.description}*\n\n")
                 yield self._task_upd(msg.task_id, name=name, desc=msg.description,
-                                     status="running", background=bg)
+                                     status="running", background=bg,
+                                     workflow=True if is_wf else None)
             elif isinstance(msg, TaskProgressMessage):
-                bits = f"🛰 {self._task_names.get(msg.task_id, 'sub-agent')}"
+                name = self._task_names.get(msg.task_id, "sub-agent")
+                tot = (getattr(msg, "usage", None) or {}).get("total_tokens")
+                wp = (getattr(msg, "data", {}) or {}).get("workflow_progress")
+                if wp:
+                    snap = workflow_snapshot(wp)
+                    bits = (f"{name} · {snap['phase']}"
+                            f" · {snap['done']}/{snap['total']} agents")
+                    if tot:
+                        bits += f" · {tot:,} tok"
+                    yield Event("status", bits)
+                    yield self._task_upd(msg.task_id, tokens=tot, wf=snap)
+                    continue
+                bits = f"🛰 {name}"
                 if getattr(msg, "last_tool_name", None):
                     bits += f" · {msg.last_tool_name}"
-                tot = (getattr(msg, "usage", None) or {}).get("total_tokens")
                 if tot:
                     bits += f" · {tot:,} tok"
                 yield Event("status", bits)

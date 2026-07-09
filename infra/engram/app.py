@@ -59,6 +59,8 @@ SLASH_CMDS = [
     ("/model", "switch model  (e.g. opus[1m], sonnet)"),
     ("/mode", "toggle plan ↔ regular  (or shift+tab)"),
     ("/ultracode", "toggle multi-agent workflow orchestration"),
+    ("/workflows", "workflow runs this session — phases + agents"),
+    ("/fleet", "parallel Engram sessions across repos  (/fleet <path> [task])"),
     ("/agent", "delegate to a sub-agent  (e.g. /agent Explore <task>)"),
     ("/context", "show context-window usage"),
     ("/rewind", "restore files to before an earlier message"),
@@ -73,7 +75,7 @@ SLASH_CMDS = [
 # Commands that take an argument: selecting one completes the text and waits (for
 # /effort it then offers the levels; for /agent, the sub-agent names); the rest
 # submit immediately on select.
-ARG_CMDS = {"/effort", "/model", "/agent"}
+ARG_CMDS = {"/effort", "/model", "/agent", "/fleet"}
 # State-changing commands — they touch the driver / warm client, so they must not
 # run while a reply is streaming (mid-turn they're blocked, never queued). /context
 # is read-only but pokes the warm client (a control request), so it's gated too.
@@ -133,6 +135,17 @@ def render_tasks_line(todos: list, tasks: list) -> str:
             n_done += 1
         elif status in ("failed", "stopped", "killed"):
             n_dead += 1
+        elif t.get("workflow"):
+            # A dynamic-workflow run: show where it is in its phase/agent tree
+            # (the wf snapshot rides every progress heartbeat — see
+            # core.workflow_snapshot); /workflows expands the full tree.
+            w = t.get("wf") or {}
+            bit = f"⚙ {t.get('name', 'workflow').removeprefix('⚙ ')} ⏳"
+            if w.get("total"):
+                bit += f" {w.get('phase', '')} {w['done']}/{w['total']}"
+            if t.get("tokens"):
+                bit += f" {int(t['tokens']) // 1000}k"
+            parts.append(bit)
         else:
             bit = f"🛰 {t.get('name', 'sub-agent')} ⏳"
             if t.get("tokens"):
@@ -336,6 +349,7 @@ class EngramApp(App):
     #status { height: 1; color: $secondary; text-style: italic; padding: 0 2; }
     #chips { height: auto; color: $accent; padding: 0 2; }
     #queued { height: auto; color: $warning; text-style: italic; padding: 0 2; }
+    #fleet { height: auto; color: $accent; padding: 0 2; }
     #tasks { height: auto; color: $secondary; padding: 0 2; }
     #cmdmenu {
         display: none;
@@ -391,6 +405,7 @@ class EngramApp(App):
         self._fallback_shown = False                # one-time notice when the model rotates
         self._todos: list = []                      # last TodoWrite list (persists across turns)
         self._tasks_snapshot: list = []             # last sub-agent registry snapshot
+        self._fleet = None                          # Fleet (lazy — created on first /fleet)
         self._perception = None                     # PerceptionBridge (opt-in: ENGRAM_PERCEIVE=1)
         # Interactive tools (plan approval · option questions). The driver calls
         # self._handle_interaction through its on_interaction seam; a live card parks the
@@ -418,6 +433,7 @@ class EngramApp(App):
         yield Static("", id="status")
         yield Static("", id="chips")
         yield Static("", id="queued")
+        yield Static("", id="fleet")        # live fleet-member strip (⚑ per repo)
         yield Static("", id="tasks")        # live todo + sub-agent panel
         yield OptionList(id="cmdmenu")
         yield Static("", id="perception")   # live senses HUD (shown when ENGRAM_PERCEIVE on)
@@ -854,6 +870,14 @@ class EngramApp(App):
                 self._perception.stop()
             except Exception:  # noqa: BLE001
                 pass
+        if self._fleet is not None:
+            # Members disconnect + release their folder locks; each member's own
+            # evict_on_shutdown isn't fired here — their buffers are covered by
+            # the nightly sweep, same as a terminal that closed without /end.
+            try:
+                await self._fleet.shutdown()
+            except Exception:  # noqa: BLE001 — teardown must never wedge quit
+                pass
         try:
             await self.driver.disconnect()
         except Exception:  # noqa: BLE001
@@ -1126,6 +1150,10 @@ class EngramApp(App):
             await self._do_fork()
         elif text == "/export":
             await self._do_export()
+        elif text == "/workflows":
+            await self._show_workflows()
+        elif text.startswith("/fleet"):
+            await self._handle_fleet(text[len("/fleet"):].strip())
 
     async def _show_rewind(self) -> None:
         """List this session's file checkpoints (one per typed prompt, newest first)
@@ -1312,6 +1340,105 @@ class EngramApp(App):
                 escape(render_tasks_line(self._todos, self._tasks_snapshot)))
         except Exception:  # noqa: BLE001 — panel not mounted (teardown); skip
             pass
+
+    async def _show_workflows(self) -> None:
+        """Expand this session's workflow runs — each phase with its agents'
+        states, from the latest progress snapshot (core.workflow_snapshot)."""
+        runs = [t for t in self._tasks_snapshot if t.get("workflow")]
+        if not runs:
+            await self._add(Static(
+                "[dim]no workflow runs this session — /ultracode on (or say "
+                "“use a workflow”) and give me something big[/dim]"))
+            return
+        lines = ["**Workflow runs this session**"]
+        for t in runs:
+            mark = {"running": "⏳", "completed": "✓"}.get(
+                t.get("status"), f"✗ {t.get('status', '?')}")
+            head = (f"- **{str(t.get('name', '?')).removeprefix('⚙ ')}** {mark}"
+                    f" — {t.get('desc', '')}")
+            if t.get("tokens"):
+                head += f" · {int(t['tokens']) // 1000}k tok"
+            lines.append(head)
+            for p in (t.get("wf") or {}).get("phases", []):
+                done = sum(1 for a in p["agents"] if a["state"] == "done")
+                lines.append(f"  - {p['title']} ({done}/{len(p['agents'])})")
+                for a in p["agents"][:10]:
+                    m = {"done": "✓", "failed": "✗"}.get(a["state"], "⏳")
+                    row = f"    - {m} {a['label']}"
+                    if a.get("model"):
+                        row += f" · {a['model']}"
+                    lines.append(row)
+                if len(p["agents"]) > 10:
+                    lines.append(f"    - … +{len(p['agents']) - 10} more")
+        await self._add(Markdown("\n".join(lines)))
+
+    # ---- fleet: parallel Engram sessions across repos (/fleet) ----------------
+
+    def _get_fleet(self):
+        if self._fleet is None:
+            from fleet import Fleet
+            self._fleet = Fleet(on_change=self._render_fleet)
+        return self._fleet
+
+    def _render_fleet(self) -> None:
+        """Refresh the ⚑ fleet strip above the prompt (fail-soft on teardown)."""
+        try:
+            from fleet import render_fleet_line
+            rows = self._fleet.rows() if self._fleet else []
+            self.query_one("#fleet", Static).update(
+                escape(render_fleet_line(rows)))
+        except Exception:  # noqa: BLE001 — panel not mounted (teardown); skip
+            pass
+
+    async def _handle_fleet(self, args: str) -> None:
+        """/fleet — spawn/list/view/msg/kill parallel Engram sessions:
+        ``/fleet <path> [task…]`` spawn · ``/fleet`` list · ``/fleet view <name>``
+        peek · ``/fleet msg <name> <text>`` steer · ``/fleet kill <name>``."""
+        fleet = self._get_fleet()
+        parts = args.split(maxsplit=1)
+        sub = parts[0] if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not sub:
+            rows = fleet.rows()
+            if not rows:
+                await self._add(Static(
+                    "[dim]no fleet members — /fleet <path> [task] spawns a "
+                    "parallel Engram session in that repo (its own session, memory, and "
+                    "recall injection)[/dim]"))
+                return
+            lines = ["**Fleet**"]
+            for r in rows:
+                lines.append(f"- **{r['name']}** ({r['dir']}) — {r['status']}"
+                             + (f", {r['pending']} queued" if r['pending'] else "")
+                             + (f" · {r['last']}" if r.get("last") else "")
+                             + (f" · {r['error']}" if r.get("error") else ""))
+            await self._add(Markdown("\n".join(lines)))
+        elif sub == "kill" and rest:
+            self._status(await fleet.kill(rest.split()[0]))
+        elif sub == "view" and rest:
+            name = rest.split()[0]
+            m = fleet.members.get(name)
+            if m is None:
+                self._status(f"no fleet member '{name}'")
+                return
+            await self._add(Static(f"[b]▌ fleet · {escape(name)} — {m.status} "
+                                   f"({escape(str(m.cwd))})[/b]"))
+            await self._add(Markdown(m.tail() or "*(nothing yet)*",
+                                     classes="plancard"))
+        elif sub == "msg" and rest:
+            bits = rest.split(maxsplit=1)
+            if len(bits) < 2:
+                self._status("usage: /fleet msg <name> <message>")
+                return
+            self._status(fleet.send(bits[0], bits[1]))
+        else:
+            # `/fleet <path> [task…]` — spawn. The path is the first token.
+            member, note = fleet.spawn(sub, task=rest)
+            if member is None:
+                self._status(note)
+            else:
+                await self._add(Static(f"[dim]{escape(note)}[/dim]"))
+                self._render_fleet()
 
     def _render_queue(self) -> None:
         """The pending type-ahead strip above the prompt — previews of queued msgs."""
