@@ -81,6 +81,14 @@ DREAM_S0 = float(os.environ.get("RECALL_DREAM_S0", "1.0"))            # hypothes
 # Unmeasured taste (no m1 score) keeps the base TTL exactly (no pre-palate regression).
 DREAM_TASTE_TTL_LO = float(os.environ.get("RECALL_DREAM_TASTE_TTL_LO", "0.5"))  # 0->LO*base
 DREAM_TASTE_TTL_HI = float(os.environ.get("RECALL_DREAM_TASTE_TTL_HI", "2.0"))  # 1->HI*base
+# Palate m3: the chase — a lucky find becomes a SUSTAINED pursuit instead of a one-night
+# spark. Tonight's best-tasted conjectures (>= MIN) enrol as open "pursuits"; a later night
+# develops each ONE hop further along its `pursue` axis, then re-scores the result (which may
+# itself be chased). A pursuit is dropped once its conjecture graduates/discards or it has
+# been chased TTL nights without resolving — so the chase converges rather than looping.
+DREAM_PURSUE_MIN = float(os.environ.get("RECALL_DREAM_PURSUE_MIN", "0.66"))  # taste bar to chase
+DREAM_PURSUE_MAX = int(os.environ.get("RECALL_DREAM_PURSUE_MAX", "3"))       # max open pursuits
+DREAM_PURSUE_TTL = int(os.environ.get("RECALL_DREAM_PURSUE_TTL", "3"))       # nights to cool
 # Counterfactual (L1) seeds — a single charged, forkable episode from today's
 # experience (not a pair). "Forkable" = the note names a decision / cause / outcome
 # to intervene on; "charged" = surprising enough to be worth re-processing. A KNOWN-low
@@ -131,6 +139,7 @@ class DreamContext:
     session_log_path: Path
     state_file: Path
     palate_trace: Path
+    pursuits_path: Path
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -174,7 +183,8 @@ def _resolve(args: argparse.Namespace, target: date) -> DreamContext:
         digest_path=config.subconscious_dir(label) / "digest" / f"{target.isoformat()}.md",
         session_log_path=ddir / "sessions" / f"{target.isoformat()}.md",
         state_file=ddir / "done.json",
-        palate_trace=config.data_root() / "palate" / f"{label}.jsonl")
+        palate_trace=config.data_root() / "palate" / f"{label}.jsonl",
+        pursuits_path=ddir / "pursuits.json")
 
 
 # ---- idempotency ---------------------------------------------------------
@@ -438,7 +448,7 @@ def _cf_corroboration_worklist(ctx: DreamContext,
 
 
 def _materialize_worklist(ctx: DreamContext, pairs: list[dict], cf_seeds: list[dict],
-                          cf_corrob: list[dict],
+                          cf_corrob: list[dict], pursuit_cards: list[dict],
                           corpus: dict[str, tuple[KnowledgeNote, Path]]) -> None:
     config.ensure_dirs(ctx.subconscious_dir, ctx.worklist_path.parent,
                        ctx.manifest_path.parent, ctx.verdicts_path.parent,
@@ -455,7 +465,7 @@ def _materialize_worklist(ctx: DreamContext, pairs: list[dict], cf_seeds: list[d
     ctx.worklist_path.write_text(json.dumps(
         {"date": ctx.target.isoformat(), "scope": ctx.scope,
          "pairs": work, "counterfactuals": cf, "corroborate": cf_corrob,
-         "palate_lenses": list(PALATE_LENSES)},
+         "pursuits": pursuit_cards, "palate_lenses": list(PALATE_LENSES)},
         indent=2))
 
 
@@ -585,6 +595,84 @@ def apply_taste(ctx: DreamContext, manifest: CurationManifest | None,
             "parents": [str(p).strip() for p in parents if str(p).strip()]})
         n += 1
     return n
+
+
+# ---- Palate (m3): the chase — carry a high-taste thread across nights ------
+
+def _read_pursuits(path: Path) -> list[dict]:
+    """Open pursuits — high-taste conjectures still being developed. Best-effort: a missing
+    or garbled store is a quiet no-op (the chase is optional; never fails the run)."""
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [p for p in data if isinstance(p, dict) and p.get("slug")]
+
+
+def _write_pursuits(path: Path, items: list[dict]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(items, indent=2))
+    except OSError:
+        pass
+
+
+def _plan_pursuits(ctx: DreamContext) -> tuple[list[dict], list[dict]]:
+    """Palate m3 — advance the open pursuits before tonight's dream. Drop any whose conjecture
+    graduated (promoted), was discarded, or has cooled (chased >= TTL); keep the rest, bump
+    their chase count, and build a card the skill will develop one hop further. Pure read of
+    the subconscious — returns ``(cards_to_chase, next_store)``; the caller persists on a real
+    run so a dry-run or a burned night never ages a pursuit."""
+    cards: list[dict] = []
+    keep: list[dict] = []
+    for p in _read_pursuits(ctx.pursuits_path):
+        slug = str(p.get("slug") or "").strip()
+        note_path = ctx.subconscious_dir / f"{slug}.md"
+        if not note_path.exists():
+            continue                                        # conjecture gone — drop
+        try:
+            fm, body = _split_fm(note_path.read_text())
+        except CurationSchemaError:
+            continue
+        if str(fm.get("status") or "unverified").strip() in ("promoted", "discarded"):
+            continue                                        # thread resolved — stop chasing
+        if _as_int(p.get("chased"), 0) >= DREAM_PURSUE_TTL:
+            continue                                        # cooled — retire
+        keep.append({**p, "chased": _as_int(p.get("chased"), 0) + 1})
+        cards.append({"slug": slug, "description": str(fm.get("description") or ""),
+                      "pursue": str(p.get("pursue") or ""),
+                      "parents": _cf_parents(fm), "body": body})
+    return cards, keep
+
+
+def _record_pursuits(ctx: DreamContext, taste_entries: list[dict],
+                     manifest: CurationManifest | None) -> None:
+    """Palate m3 — after taste, enrol tonight's best-tasted NEW conjectures (taste >= MIN) as
+    open pursuits to develop later. Dedup by slug against the store; keep the highest-taste up
+    to MAX. Fail-open: enrolment is optional and never fatal."""
+    wrote = {n.slug for n in manifest.notes} if manifest else set()
+    fresh = sorted(
+        ({"slug": str(t.get("slug") or "").strip(), "pursue": str(t.get("pursue") or "").strip(),
+          "taste": round(_clamp01(t.get("taste")), 3), "born": ctx.target.isoformat(),
+          "chased": 0}
+         for t in taste_entries
+         if str(t.get("slug") or "").strip() in wrote
+         and _clamp01(t.get("taste")) >= DREAM_PURSUE_MIN),
+        key=lambda p: -p["taste"])
+    if not fresh:
+        return
+    store = _read_pursuits(ctx.pursuits_path)
+    seen = {str(p.get("slug")) for p in store}
+    for p in fresh:
+        if p["slug"] not in seen:
+            store.append(p)
+            seen.add(p["slug"])
+    store.sort(key=lambda p: -_clamp01(p.get("taste")))
+    _write_pursuits(ctx.pursuits_path, store[:DREAM_PURSUE_MAX])
 
 
 # ---- the bleed membrane: corroboration, promotion, decay -----------------
@@ -899,9 +987,11 @@ def run(argv: list[str] | None = None, *,
     pairs = compute_pairs(ctx, corpus)
     cf_seeds = compute_cf_seeds(ctx, corpus) if args.counterfactual else []
     cf_corrob = compute_cf_corrob(ctx, corpus) if args.counterfactual else []
+    pursuit_cards, pursuits_next = _plan_pursuits(ctx)
     if args.dry_run:
         print(f"[dream] DRY-RUN {ctx.label} {target}: {len(pairs)} pair(s), "
               f"{len(cf_seeds)} counterfactual(s), {len(cf_corrob)} to-corroborate, "
+              f"{len(pursuit_cards)} to-chase, "
               f"{len(bleed_summary['promoted'])} would-promote", flush=True)
         return Outcome(kind="skipped", reason="dry_run",
                        detail="dry-run only; no skill call", exit_code=0)
@@ -923,11 +1013,11 @@ def run(argv: list[str] | None = None, *,
         return o
 
     manifest = None
-    if pairs or cf_seeds or cf_corrob:
-        _materialize_worklist(ctx, pairs, cf_seeds, cf_corrob, corpus)
+    if pairs or cf_seeds or cf_corrob or pursuit_cards:
+        _materialize_worklist(ctx, pairs, cf_seeds, cf_corrob, pursuit_cards, corpus)
         print(f"[dream] invoking claude for {ctx.label} {target} "
               f"({len(pairs)} recombination pair(s), {len(cf_seeds)} counterfactual(s), "
-              f"{len(cf_corrob)} to-corroborate)", flush=True)
+              f"{len(cf_corrob)} to-corroborate, {len(pursuit_cards)} to-chase)", flush=True)
         try:
             cp = invoke_claude(ctx, _build_env(ctx), CLAUDE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
@@ -959,6 +1049,11 @@ def run(argv: list[str] | None = None, *,
         taste_entries = _read_taste(ctx.taste_path)
         if taste_entries:
             apply_taste(ctx, manifest, taste_entries)
+        # Palate m3: age the pursuits we chased tonight (persist the advanced store), then
+        # enrol tonight's best-tasted new conjectures as pursuits for a later night to
+        # develop — the cross-night chase that turns a lucky find into a sustained thread.
+        _write_pursuits(ctx.pursuits_path, pursuits_next)
+        _record_pursuits(ctx, taste_entries, manifest)
         # Stage 3 of corroboration: consume the skill's confirm/refute rulings on open
         # what-ifs. Promotions share tonight's bleed cap (bleed ran first, above), so we
         # fold them into bleed_summary for the digest, index rebuild, notify and commit.
