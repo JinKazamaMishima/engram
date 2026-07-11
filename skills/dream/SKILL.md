@@ -31,7 +31,7 @@ memories you were given; do not fabricate beyond what the pair actually suggests
 
 | Env var | Meaning |
 |---|---|
-| `RECALL_DREAM_WORKLIST` | JSON `{pairs:[{seed,older,cos}], counterfactuals:[{seed:{slug,description,body,kind},charge}], corroborate:[{cf:{slug,description,pivot,predicts,parents,body}, candidates:[{slug,description,body}]}], palate_lenses:[<lens>…]}` — READ. `pairs`→§A, `counterfactuals`→§B, `corroborate`→§C, `palate_lenses`→§E; any list may be empty. |
+| `RECALL_DREAM_WORKLIST` | JSON `{pairs:[{seed,older,cos}], counterfactuals:[{seed:{slug,description,body,kind},charge}], corroborate:[{cf:{slug,description,pivot,predicts,parents,body}, candidates:[{slug,description,body}]}], pursuits:[{slug,description,pursue,parents,body}], palate_lenses:[<lens>…]}` — READ. `pairs`→§A, `counterfactuals`→§B, `corroborate`→§C, `pursuits`→§F, `palate_lenses`→§E; any list may be empty. |
 | `RECALL_DREAM_VERDICTS` | Path to WRITE your §C corroboration rulings (JSON array) — WRITE (omit / empty if you ruled on nothing) |
 | `RECALL_DREAM_TASTE` | Path to WRITE your §E palate judgments (JSON array, one entry per note you wrote) — WRITE (omit / empty on a quiet night) |
 | `RECALL_DREAM_SUBCONSCIOUS` | Dir to write hypothesis notes into — WRITE `<slug>.md` here |
@@ -43,10 +43,11 @@ Tools: **Read, Glob, Grep, Write, Edit** only. No Bash, no network.
 
 # Procedure
 
-**Read** `$RECALL_DREAM_WORKLIST` first. It has three worklists — `pairs` (§A),
-`counterfactuals` (§B), and `corroborate` (§C — open what-ifs to rule on) — plus
-`palate_lenses` (§E). Any may be empty; do each that is present. Then §E — judge, by your
-own taste, every note you wrote. Finally write ONE manifest (§D) covering every note you wrote.
+**Read** `$RECALL_DREAM_WORKLIST` first. It has four worklists — `pairs` (§A),
+`counterfactuals` (§B), `corroborate` (§C — open what-ifs to rule on), and `pursuits`
+(§F — open threads to develop one hop further) — plus `palate_lenses` (§E). Any may be empty;
+do each that is present. Then §E — judge, by your own taste, every note you wrote. Finally
+write ONE manifest (§D) covering every note you wrote.
 
 ## §A — Recombination pairs (blend)
 
@@ -151,6 +152,31 @@ actually surfaced today before acting. `confirm` graduates the what-if into the 
 retires it; `unrelated` leaves it waiting. You judge; the wrapper acts — never promote anything
 yourself.
 
+## §F — Chase: develop an open pursuit
+
+The `pursuits` list holds high-taste conjectures from earlier nights worth carrying further —
+each with the `pursue` axis it most wants to grow along. For each, take the conjecture and push
+it ONE hop down that axis using TONIGHT's fresh memories: a sharper restatement, a consequence,
+a testable prediction, a transfer to a new domain. **Write** one new `kind: hypothesis` note
+that extends the thread:
+
+```markdown
+---
+name: <new-kebab-slug>                    # a NEW slug — the next link in the chain
+description: "<how the thread advances, one self-contained line>"
+kind: hypothesis
+parents: [<pursued-conjecture-slug>, <a-fresh-note-slug>]   # the thread + tonight's material
+confidence: 0.4
+---
+How this develops the pursued conjecture along its `pursue` axis, grounded in the fresh memory.
+Link [[<pursued-conjecture-slug>]]. It goes in the manifest (§D) and gets scored in §E like any
+note — a chased link can be pursued again, or cool and retire on its own.
+```
+
+If a pursuit has nowhere real to go tonight, **skip it** — a chase that has run its course is
+fine; the wrapper retires it. One hop per pursuit; never fabricate beyond what the thread and
+tonight's memory support.
+
 ## §D — The manifest
 
 For **§A and §B**: keep `description` self-contained and **double-quoted** (it almost
@@ -224,6 +250,9 @@ from what reality went on to reward. Judge honestly; a forgettable conjecture ea
 - Palate (§E): taste is a *judgment*, not a vote — it never promotes anything and never
   gates a note out of quarantine. Score only notes you actually wrote; don't confuse `taste`
   (worth keeping) with `confidence` (likely true).
+- Chase (§F): ONE hop per pursuit, parented to the pursued conjecture + a fresh memory; skip a
+  thread with nowhere real to go rather than forcing it. Don't re-chase a conjecture the
+  wrapper didn't hand you — it decides what stays open.
 
 # The spirit
 

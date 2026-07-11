@@ -668,3 +668,68 @@ def test_low_taste_retires_early_but_unmeasured_keeps_base(tmp_path, monkeypatch
     assert summary["retired"] == 1
     assert str(dream._split_fm((sub / "meh.md").read_text())[0].get("status")) == "discarded"
     assert str(dream._split_fm((sub / "unscored.md").read_text())[0].get("status")) == "unverified"
+
+
+# ---- Palate m3: the cross-night chase -------------------------------------
+
+def _pursuit_taste(slug, taste, pursue="novelty"):
+    return {"slug": slug, "taste": taste, "pursue": pursue,
+            "axes": [{"lens": pursue, "weight": 0.9, "score": taste}], "why": "w"}
+
+
+def test_record_pursuits_enrolls_only_top_taste(tmp_path, monkeypatch):
+    """After taste, only conjectures at/above the chase bar (MIN) enrol as open pursuits."""
+    _setup(tmp_path, monkeypatch)
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    entries = [_pursuit_taste("hot", 0.9), _pursuit_taste("warm", 0.7),
+               _pursuit_taste("cold", 0.2)]                # cold < MIN -> excluded
+    dream._record_pursuits(ctx, entries, _manifest_of("hot", "warm", "cold"))
+    got = {p["slug"]: p for p in dream._read_pursuits(ctx.pursuits_path)}
+    assert set(got) == {"hot", "warm"}
+    assert got["hot"]["chased"] == 0 and got["hot"]["born"] == TARGET.isoformat()
+
+
+def test_record_pursuits_caps_and_dedups(tmp_path, monkeypatch):
+    """Keep the highest-taste up to MAX, and never enrol the same conjecture twice."""
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(dream, "DREAM_PURSUE_MAX", 2)
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    entries = [_pursuit_taste(f"h{i}", 0.70 + i / 100) for i in range(4)]
+    dream._record_pursuits(ctx, entries, _manifest_of("h0", "h1", "h2", "h3"))
+    assert [p["slug"] for p in dream._read_pursuits(ctx.pursuits_path)] == ["h3", "h2"]
+    dream._record_pursuits(ctx, [_pursuit_taste("h3", 0.99)], _manifest_of("h3"))
+    assert [p["slug"] for p in dream._read_pursuits(ctx.pursuits_path)].count("h3") == 1
+
+
+def test_plan_pursuits_prunes_ages_and_cards(tmp_path, monkeypatch):
+    """Before the dream: drop graduated/discarded/cooled/missing pursuits; keep the live ones,
+    bump their chase count, and hand the skill a card to develop."""
+    _setup(tmp_path, monkeypatch)
+    sub = config.subconscious_dir("global")
+    _hyp(sub, "live", status="unverified")
+    _hyp(sub, "graduated", status="promoted")
+    _hyp(sub, "cooled", status="unverified")
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    dream._write_pursuits(ctx.pursuits_path, [
+        {"slug": "live", "pursue": "novelty", "taste": 0.9, "born": "2026-06-01", "chased": 0},
+        {"slug": "graduated", "pursue": "x", "taste": 0.8, "born": "2026-06-01", "chased": 0},
+        {"slug": "cooled", "pursue": "x", "taste": 0.8, "born": "2026-06-01",
+         "chased": dream.DREAM_PURSUE_TTL},
+        {"slug": "gone", "pursue": "x", "taste": 0.8, "born": "2026-06-01", "chased": 0}])
+    cards, nxt = dream._plan_pursuits(ctx)
+    assert [c["slug"] for c in cards] == ["live"]          # only the live thread is chased
+    assert cards[0]["pursue"] == "novelty" and cards[0]["parents"] == ["p-a", "p-b"]
+    assert [p["slug"] for p in nxt] == ["live"] and nxt[0]["chased"] == 1   # aged one night
+
+
+def test_pursuit_roundtrip_record_then_plan(tmp_path, monkeypatch):
+    """A high-taste conjecture recorded one night surfaces as a chase card the next."""
+    _setup(tmp_path, monkeypatch)
+    sub = config.subconscious_dir("global")
+    _hyp(sub, "spark", status="unverified")
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    dream._record_pursuits(ctx, [_pursuit_taste("spark", 0.9, pursue="elegance")],
+                           _manifest_of("spark"))
+    cards, nxt = dream._plan_pursuits(ctx)
+    assert [c["slug"] for c in cards] == ["spark"] and cards[0]["pursue"] == "elegance"
+    assert nxt[0]["chased"] == 1
