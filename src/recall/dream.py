@@ -76,6 +76,11 @@ DREAM_PROMOTE_N = int(os.environ.get("RECALL_DREAM_PROMOTE_N", "2"))   # corrobo
 DREAM_BLEED_MAX = int(os.environ.get("RECALL_DREAM_BLEED_MAX", "1"))   # max promotions/night/scope
 DREAM_TTL_DAYS = int(os.environ.get("RECALL_DREAM_TTL_DAYS", "30"))    # uncorroborated lifetime
 DREAM_S0 = float(os.environ.get("RECALL_DREAM_S0", "1.0"))            # hypotheses are born fragile
+# Palate m2: taste scales that quarantine lifetime — a conjecture the palate rated
+# highly survives longer to earn corroboration, a low-rated one clears out faster.
+# Unmeasured taste (no m1 score) keeps the base TTL exactly (no pre-palate regression).
+DREAM_TASTE_TTL_LO = float(os.environ.get("RECALL_DREAM_TASTE_TTL_LO", "0.5"))  # 0->LO*base
+DREAM_TASTE_TTL_HI = float(os.environ.get("RECALL_DREAM_TASTE_TTL_HI", "2.0"))  # 1->HI*base
 # Counterfactual (L1) seeds — a single charged, forkable episode from today's
 # experience (not a pair). "Forkable" = the note names a decision / cause / outcome
 # to intervene on; "charged" = surprising enough to be worth re-processing. A KNOWN-low
@@ -632,9 +637,11 @@ def bleed(ctx: DreamContext, corpus: dict[str, tuple[KnowledgeNote, Path]],
                                  "last_updated": ctx.target.isoformat()})
             continue
 
-        # decay: an old, uncorroborated, unblessed hypothesis fades
+        # decay: an old, uncorroborated, unblessed hypothesis fades — Palate m2 lets its
+        # taste scale how long it may wait (a well-rated conjecture earns more chances at
+        # corroboration; a poorly-rated one clears out faster). Unmeasured taste = base TTL.
         age = _age_days(born, ctx.target)
-        if age >= DREAM_TTL_DAYS and corr == 0 and not blessed:
+        if age >= _ttl_for_taste(_as_taste(fm.get("taste"))) and corr == 0 and not blessed:
             _set_keys(path, {"status": "discarded",
                              "last_updated": ctx.target.isoformat()})
             retired += 1
@@ -751,6 +758,29 @@ def _as_int(v, default: int) -> int:
 
 def _as_bool(v) -> bool:
     return str(v).strip().lower() in ("true", "yes", "1", "on")
+
+
+def _as_taste(v) -> float | None:
+    """A hypothesis's palate ``taste`` as a float in [0,1], or None when unstamped/garbled.
+    Unmeasured is NOT zero — it means Palate m1 never scored this note (pre-palate or a
+    quiet skill), and it must keep the base TTL rather than be treated as maximally disliked."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    try:
+        return min(1.0, max(0.0, float(str(v).strip())))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ttl_for_taste(taste: float | None) -> int:
+    """Palate m2 — the quarantine lifetime (days) a hypothesis gets before decay, scaled by
+    its taste. Unmeasured taste keeps the base ``DREAM_TTL_DAYS`` exactly; a measured taste
+    interpolates the multiplier across [LO, HI], so a well-rated conjecture waits longer for
+    corroboration and a poorly-rated one clears out sooner. Never below one day."""
+    if taste is None:
+        return DREAM_TTL_DAYS
+    mult = DREAM_TASTE_TTL_LO + (DREAM_TASTE_TTL_HI - DREAM_TASTE_TTL_LO) * taste
+    return max(1, round(DREAM_TTL_DAYS * mult))
 
 
 def _age_days(ref_iso: str, target: date) -> int:

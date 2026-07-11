@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from recall import config, dream
@@ -615,3 +615,56 @@ def test_palate_end_to_end_persists_from_skill_output(tmp_path, monkeypatch):
     assert float(fm["taste"]) == 0.66 and fm["pursue"] == "elegance"
     ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
     assert json.loads(ctx.palate_trace.read_text().splitlines()[0])["slug"] == "latent-link"
+
+
+# ---- Palate m2: taste-scaled quarantine lifetime --------------------------
+
+def _hyp_tasted(sub_dir, slug, *, taste, first_seen, corroborations=0, blessed="false"):
+    """A quarantined hypothesis carrying a Palate m1 taste score (for m2 decay tests)."""
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    (sub_dir / f"{slug}.md").write_text(
+        f"---\nname: {slug}\ndescription: \"a conjecture: x relates to y\"\n"
+        f"kind: hypothesis\nparents: [p-a, p-b]\nstatus: unverified\n"
+        f"first_seen: {first_seen}\ncorroborations: {corroborations}\nblessed: {blessed}\n"
+        f"stability: 1.0\ntaste: {taste}\n---\nThe conjecture body.\n")
+
+
+def test_ttl_for_taste_scales_symmetrically():
+    """Unmeasured taste keeps the base lifetime; a measured taste stretches or shrinks it."""
+    base = dream.DREAM_TTL_DAYS
+    assert dream._ttl_for_taste(None) == base                      # unmeasured -> unchanged
+    assert dream._ttl_for_taste(0.0) == round(base * dream.DREAM_TASTE_TTL_LO)
+    assert dream._ttl_for_taste(1.0) == round(base * dream.DREAM_TASTE_TTL_HI)
+    assert dream._ttl_for_taste(0.0) < base < dream._ttl_for_taste(1.0)
+    assert dream._as_taste("0.7") == 0.7 and dream._as_taste(None) is None   # parse + sentinel
+
+
+def test_high_taste_survives_past_base_ttl(tmp_path, monkeypatch):
+    """A conjecture aged BEYOND the base 30-day TTL is NOT retired when its taste is high —
+    the palate bought it a longer quarantine to keep earning corroboration."""
+    _setup(tmp_path, monkeypatch)
+    g = config.global_corpus_dir()
+    sub = config.subconscious_dir("global")
+    old = (TARGET - timedelta(days=40)).isoformat()          # past base 30…
+    _hyp_tasted(sub, "loved", taste=0.9, first_seen=old)     # …but taste 0.9 -> ttl ~56d
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    summary = dream.bleed(ctx, dream._load_corpus(g), promote=lambda c, h, r: None)
+    assert summary["retired"] == 0
+    fm, _ = dream._split_fm((sub / "loved.md").read_text())
+    assert str(fm.get("status")) == "unverified"             # survived — not yet at its TTL
+
+
+def test_low_taste_retires_early_but_unmeasured_keeps_base(tmp_path, monkeypatch):
+    """A poorly-rated conjecture clears out before the base TTL; an UNMEASURED one still gets
+    the full base lifetime — no regression for pre-palate hypotheses."""
+    _setup(tmp_path, monkeypatch)
+    g = config.global_corpus_dir()
+    sub = config.subconscious_dir("global")
+    age20 = (TARGET - timedelta(days=20)).isoformat()
+    _hyp_tasted(sub, "meh", taste=0.0, first_seen=age20)     # taste 0 -> ttl 15 -> 20>=15 retire
+    _hyp(sub, "unscored", first_seen=age20)                  # no taste -> base 30 -> survives
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    summary = dream.bleed(ctx, dream._load_corpus(g), promote=lambda c, h, r: None)
+    assert summary["retired"] == 1
+    assert str(dream._split_fm((sub / "meh.md").read_text())[0].get("status")) == "discarded"
+    assert str(dream._split_fm((sub / "unscored.md").read_text())[0].get("status")) == "unverified"
