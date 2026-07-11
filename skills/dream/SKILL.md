@@ -31,8 +31,9 @@ memories you were given; do not fabricate beyond what the pair actually suggests
 
 | Env var | Meaning |
 |---|---|
-| `RECALL_DREAM_WORKLIST` | JSON `{pairs:[{seed,older,cos}], counterfactuals:[{seed:{slug,description,body,kind},charge}], corroborate:[{cf:{slug,description,pivot,predicts,parents,body}, candidates:[{slug,description,body}]}]}` — READ. `pairs`→§A, `counterfactuals`→§B, `corroborate`→§C; any may be empty. |
+| `RECALL_DREAM_WORKLIST` | JSON `{pairs:[{seed,older,cos}], counterfactuals:[{seed:{slug,description,body,kind},charge}], corroborate:[{cf:{slug,description,pivot,predicts,parents,body}, candidates:[{slug,description,body}]}], palate_lenses:[<lens>…]}` — READ. `pairs`→§A, `counterfactuals`→§B, `corroborate`→§C, `palate_lenses`→§E; any list may be empty. |
 | `RECALL_DREAM_VERDICTS` | Path to WRITE your §C corroboration rulings (JSON array) — WRITE (omit / empty if you ruled on nothing) |
+| `RECALL_DREAM_TASTE` | Path to WRITE your §E palate judgments (JSON array, one entry per note you wrote) — WRITE (omit / empty on a quiet night) |
 | `RECALL_DREAM_SUBCONSCIOUS` | Dir to write hypothesis notes into — WRITE `<slug>.md` here |
 | `RECALL_DREAM_MANIFEST` | Path to write your ONE manifest JSON to — WRITE |
 | `RECALL_DREAM_DATE` | ISO date (must equal `manifest.date`) |
@@ -42,9 +43,10 @@ Tools: **Read, Glob, Grep, Write, Edit** only. No Bash, no network.
 
 # Procedure
 
-**Read** `$RECALL_DREAM_WORKLIST` first. It has three lists — `pairs` (§A),
-`counterfactuals` (§B), and `corroborate` (§C — open what-ifs to rule on). Any may be
-empty; do each that is present. Then write ONE manifest (§D) covering every note you wrote.
+**Read** `$RECALL_DREAM_WORKLIST` first. It has three worklists — `pairs` (§A),
+`counterfactuals` (§B), and `corroborate` (§C — open what-ifs to rule on) — plus
+`palate_lenses` (§E). Any may be empty; do each that is present. Then §E — judge, by your
+own taste, every note you wrote. Finally write ONE manifest (§D) covering every note you wrote.
 
 ## §A — Recombination pairs (blend)
 
@@ -170,6 +172,41 @@ wrote (hypotheses and counterfactuals alike):
 
 A quiet night is valid: `"notes": []` with a `summary` saying so. `summary` may never be empty.
 
+## §E — Palate: your taste on what you wrote
+
+Look back at **every note you wrote tonight** (hypotheses and counterfactuals) and judge
+each by **your own taste** — not *is it true?* (that is `confidence`), but *is it worth
+keeping and chasing, by what I value?*
+
+You are **one voice** looking through several **lenses** at once — the worklist's
+`palate_lenses`. This is **not a committee vote**. For each note:
+
+1. **Weight the lenses for THIS conjecture** — how loud each should be here (a
+   safety-shaped conjecture makes `danger` loud; a pure formal analogy makes `elegance`
+   loud). Most conjectures only light up two or three. The weights are yours.
+2. **Score** each weighted lens 0..1 on how well the conjecture satisfies it.
+3. **Integrate** into a single `taste` ∈ 0..1 — one honest weighted pull, not an average
+   of equals.
+4. Name the single **`pursue`** axis — the ONE lens that most wants developing if this
+   thread were chased further.
+
+**Write** a JSON array to `$RECALL_DREAM_TASTE` — one entry per note you wrote, nothing you
+didn't:
+
+```json
+[
+  {"slug": "<note-slug>", "taste": 0.72, "pursue": "novelty",
+   "axes": [{"lens": "novelty", "weight": 0.9, "score": 0.8},
+            {"lens": "mission_fit", "weight": 0.6, "score": 0.5}],
+   "why": "one honest line — what your taste responded to"}
+]
+```
+
+This palate has **no vote over promotion** — reality still decides that by corroboration.
+It only records what *you* found worth keeping, so that over time your taste can be learned
+from what reality went on to reward. Judge honestly; a forgettable conjecture earns a low
+`taste`, and that is useful signal too.
+
 # Hard don'ts
 
 - Do **not** write anywhere except `<slug>.md` in `$RECALL_DREAM_SUBCONSCIOUS` and
@@ -184,6 +221,9 @@ A quiet night is valid: `"notes": []` with a `summary` saying so. `summary` may 
 - Corroboration (§C): rule only on the prediction the note staked; a merely similar episode
   is **unrelated**, never a `confirm`. Cite real `evidence` from the candidates given. You
   never write to the soul or promote anything — the wrapper acts on your verdict.
+- Palate (§E): taste is a *judgment*, not a vote — it never promotes anything and never
+  gates a note out of quarantine. Score only notes you actually wrote; don't confuse `taste`
+  (worth keeping) with `confidence` (likely true).
 
 # The spirit
 

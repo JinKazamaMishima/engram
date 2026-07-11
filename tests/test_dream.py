@@ -12,7 +12,7 @@ from datetime import date
 from pathlib import Path
 
 from recall import config, dream
-from recall.schema import KnowledgeNote
+from recall.schema import CurationManifest, KnowledgeNote
 
 TARGET = date(2026, 6, 24)
 
@@ -517,3 +517,101 @@ def test_dream_rejects_manifest_referencing_missing_hypothesis(tmp_path, monkeyp
         compute_pairs=lambda ctx, corpus: [
             {"seed": "today-note", "older": "old-note", "cos": 0.45}])
     assert out.kind == "failed" and out.reason == "note_missing"
+
+
+# ---- Palate m1: taste scoring + durable trace -----------------------------
+
+def _palate_taste(**over):
+    e = {"slug": "latent-link", "taste": 0.72, "pursue": "novelty",
+         "axes": [{"lens": "novelty", "weight": 0.9, "score": 0.8},
+                  {"lens": "mission_fit", "weight": 0.5, "score": 0.4}],
+         "why": "a genuinely non-obvious transfer"}
+    e.update(over)
+    return e
+
+
+def _manifest_of(*slugs):
+    return CurationManifest.from_dict(
+        {"schema_version": 1, "date": TARGET.isoformat(), "summary": "s",
+         "notes": [{"slug": s, "action": "created", "title": "t", "scope": "global"}
+                   for s in slugs]})
+
+
+def test_palate_read_taste_tolerant(tmp_path):
+    """_read_taste is best-effort: missing/garbled -> [], and non-dict entries are dropped."""
+    assert dream._read_taste(tmp_path / "nope.json") == []
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert dream._read_taste(bad) == []
+    good = tmp_path / "t.json"
+    good.write_text(json.dumps([_palate_taste(), "junk", 3]))
+    assert [t["slug"] for t in dream._read_taste(good)] == ["latent-link"]
+
+
+def test_palate_apply_stamps_frontmatter_and_traces(tmp_path, monkeypatch):
+    """apply_taste stamps the two scalars (taste, pursue) into the quarantined note and
+    appends the full per-lens record to the durable palate trace under the data root."""
+    _setup(tmp_path, monkeypatch)
+    sub = config.subconscious_dir("global")
+    _hyp(sub, "latent-link")
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    n = dream.apply_taste(ctx, _manifest_of("latent-link"), [_palate_taste()])
+    assert n == 1
+    fm, _ = dream._split_fm((sub / "latent-link.md").read_text())
+    assert float(fm["taste"]) == 0.72 and fm["pursue"] == "novelty"
+    lines = ctx.palate_trace.read_text().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["slug"] == "latent-link" and rec["taste"] == 0.72
+    assert rec["parents"] == ["p-a", "p-b"] and len(rec["axes"]) == 2
+
+
+def test_palate_clamps_and_only_scores_notes_written_this_run(tmp_path, monkeypatch):
+    """Out-of-range taste is clamped to [0,1]; an entry naming a slug the manifest never
+    listed is ignored entirely (no stamp, no trace) — taste scores only what was written."""
+    _setup(tmp_path, monkeypatch)
+    sub = config.subconscious_dir("global")
+    _hyp(sub, "latent-link")
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    # not in the manifest -> ignored
+    assert dream.apply_taste(ctx, _manifest_of("other"), [_palate_taste()]) == 0
+    fm, _ = dream._split_fm((sub / "latent-link.md").read_text())
+    assert "taste" not in fm and not ctx.palate_trace.exists()
+    # in the manifest but taste out of range -> clamped
+    assert dream.apply_taste(ctx, _manifest_of("latent-link"),
+                             [_palate_taste(taste=9.9)]) == 1
+    fm, _ = dream._split_fm((sub / "latent-link.md").read_text())
+    assert float(fm["taste"]) == 1.0
+
+
+def _fake_dream_claude_with_taste(hyp_slug="latent-link", parents=("today-note", "old-note")):
+    """Stand-in /dream that writes the §A hypothesis + manifest AND the §E taste file."""
+    base = _fake_dream_claude(hyp_slug, parents)
+
+    def _inner(ctx, env, timeout):
+        cp = base(ctx, env, timeout)
+        Path(env["RECALL_DREAM_TASTE"]).write_text(json.dumps([
+            {"slug": hyp_slug, "taste": 0.66, "pursue": "elegance",
+             "axes": [{"lens": "elegance", "weight": 0.8, "score": 0.7}],
+             "why": "clean shared abstraction"}]))
+        return cp
+    return _inner
+
+
+def test_palate_end_to_end_persists_from_skill_output(tmp_path, monkeypatch):
+    """Full run: the skill writes RECALL_DREAM_TASTE, the wrapper reads it after stamping
+    lifecycle defaults, and both the frontmatter scalars and the trace line land."""
+    _setup(tmp_path, monkeypatch)
+    g = config.global_corpus_dir()
+    _note(g, "today-note", last_used=TARGET.isoformat())
+    _note(g, "old-note")
+    out = _run_global(
+        monkeypatch, invoke_claude=_fake_dream_claude_with_taste(),
+        compute_pairs=lambda ctx, corpus: [
+            {"seed": "today-note", "older": "old-note", "cos": 0.45}])
+    assert out.kind == "dreamed"
+    sub = config.subconscious_dir("global")
+    fm, _ = dream._split_fm((sub / "latent-link.md").read_text())
+    assert float(fm["taste"]) == 0.66 and fm["pursue"] == "elegance"
+    ctx = dream._resolve(dream._parse_args(["--scope", "global"]), TARGET)
+    assert json.loads(ctx.palate_trace.read_text().splitlines()[0])["slug"] == "latent-link"

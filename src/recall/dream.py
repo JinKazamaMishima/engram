@@ -95,6 +95,19 @@ CF_MAX_SEEDS = int(os.environ.get("RECALL_DREAM_CF_MAX_SEEDS", "3"))
 CF_CORROB_LO = float(os.environ.get("RECALL_DREAM_CF_CORROB_LO", "0.45"))
 CF_CORROB_MAX_CAND = int(os.environ.get("RECALL_DREAM_CF_CORROB_MAX_CAND", "3"))
 
+# ---- Palate (m1): an emerging taste over tonight's conjectures -------------
+# A SEED set of value-lenses the dream skill scores each conjecture on. One voice,
+# many lenses, INTEGRATED into a single `taste` pull (not a committee vote), plus the
+# one `pursue` axis that most wants developing next. Taste is DISTINCT from a note's
+# `confidence` (is it TRUE?): it is is-it-WORTH-KEEPING-and-CHASING by its own values.
+# It is telemetry only — it never gates promotion (corroboration stays the soul gate);
+# it records what was found worth keeping so the taste can later be LEARNED from what
+# reality went on to reward (hence "emerging", not a fixed rubric). Env-overridable.
+_DEFAULT_PALATE_LENSES = "novelty,operator_usefulness,truth_rigor,elegance,mission_fit,danger"
+PALATE_LENSES = tuple(
+    x.strip() for x in
+    os.environ.get("RECALL_PALATE_LENSES", _DEFAULT_PALATE_LENSES).split(",") if x.strip())
+
 
 @dataclass(frozen=True)
 class DreamContext:
@@ -108,9 +121,11 @@ class DreamContext:
     worklist_path: Path
     manifest_path: Path
     verdicts_path: Path
+    taste_path: Path
     digest_path: Path
     session_log_path: Path
     state_file: Path
+    palate_trace: Path
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -150,9 +165,11 @@ def _resolve(args: argparse.Namespace, target: date) -> DreamContext:
         worklist_path=ddir / "worklists" / f"{target.isoformat()}.json",
         manifest_path=ddir / "manifests" / f"{target.isoformat()}.json",
         verdicts_path=ddir / "verdicts" / f"{target.isoformat()}.json",
+        taste_path=ddir / "taste" / f"{target.isoformat()}.json",
         digest_path=config.subconscious_dir(label) / "digest" / f"{target.isoformat()}.md",
         session_log_path=ddir / "sessions" / f"{target.isoformat()}.md",
-        state_file=ddir / "done.json")
+        state_file=ddir / "done.json",
+        palate_trace=config.data_root() / "palate" / f"{label}.jsonl")
 
 
 # ---- idempotency ---------------------------------------------------------
@@ -419,7 +436,8 @@ def _materialize_worklist(ctx: DreamContext, pairs: list[dict], cf_seeds: list[d
                           cf_corrob: list[dict],
                           corpus: dict[str, tuple[KnowledgeNote, Path]]) -> None:
     config.ensure_dirs(ctx.subconscious_dir, ctx.worklist_path.parent,
-                       ctx.manifest_path.parent, ctx.verdicts_path.parent)
+                       ctx.manifest_path.parent, ctx.verdicts_path.parent,
+                       ctx.taste_path.parent)
 
     def _card(slug: str) -> dict:
         n = corpus[slug][0]
@@ -431,7 +449,8 @@ def _materialize_worklist(ctx: DreamContext, pairs: list[dict], cf_seeds: list[d
     cf = [{"seed": _card(c["seed"]), "charge": c.get("charge")} for c in cf_seeds]
     ctx.worklist_path.write_text(json.dumps(
         {"date": ctx.target.isoformat(), "scope": ctx.scope,
-         "pairs": work, "counterfactuals": cf, "corroborate": cf_corrob},
+         "pairs": work, "counterfactuals": cf, "corroborate": cf_corrob,
+         "palate_lenses": list(PALATE_LENSES)},
         indent=2))
 
 
@@ -442,6 +461,7 @@ def _build_env(ctx: DreamContext) -> dict[str, str]:
         "RECALL_DREAM_SUBCONSCIOUS": str(ctx.subconscious_dir),
         "RECALL_DREAM_MANIFEST": str(ctx.manifest_path),
         "RECALL_DREAM_VERDICTS": str(ctx.verdicts_path),
+        "RECALL_DREAM_TASTE": str(ctx.taste_path),
         "RECALL_DREAM_DATE": ctx.target.isoformat(),
         "RECALL_DREAM_SCOPE": ctx.scope,
     }
@@ -489,6 +509,76 @@ def _stamp_hypothesis_defaults(ctx: DreamContext, manifest: CurationManifest) ->
                 n += 1
             except (CurationSchemaError, OSError):
                 continue
+    return n
+
+
+# ---- Palate (m1): persist the night's taste on what the skill wrote -------
+
+def _read_taste(path: Path) -> list[dict]:
+    """The skill's §E palate judgments — one entry per note it wrote tonight. Best-effort:
+    a missing or garbled file is a quiet no-op (taste is telemetry, never fails the run)."""
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    return [t for t in data if isinstance(t, dict)] if isinstance(data, list) else []
+
+
+def _clamp01(v) -> float:
+    try:
+        return min(1.0, max(0.0, float(v)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _append_palate_trace(path: Path, rec: dict) -> None:
+    """Append one JSON line to the durable, append-only palate trace (under the data
+    root, never the repo — it is the record a taste model can later be learned
+    from). FAIL-OPEN: a trace write must never break the dream."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as f:
+            f.write(json.dumps(rec, separators=(",", ":"), sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def apply_taste(ctx: DreamContext, manifest: CurationManifest | None,
+                taste_entries: list[dict]) -> int:
+    """Palate m1 — persist tonight's taste. For each entry naming a note THIS run actually
+    wrote, stamp the two scalars later milestones act on (``taste``, ``pursue``) into its
+    subconscious frontmatter and append the full per-lens record to the palate trace. Taste
+    NEVER gates promotion — corroboration stays the only soul gate — it just records what
+    was found worth keeping, so the taste can later be learned from what reality rewarded.
+    Fail-open per entry: a malformed judgment is skipped, never fatal."""
+    wrote = {n.slug for n in manifest.notes} if manifest else set()
+    n = 0
+    for t in taste_entries:
+        slug = str(t.get("slug") or "").strip()
+        if slug not in wrote:
+            continue                       # only score what this run actually wrote
+        path = ctx.subconscious_dir / f"{slug}.md"
+        if not path.exists():
+            continue
+        taste = round(_clamp01(t.get("taste")), 3)
+        pursue = str(t.get("pursue") or "").strip().replace("\n", " ")[:60]
+        _set_keys(path, {"taste": taste, "pursue": pursue})   # fail-open inside
+        try:
+            fm, _b = _split_fm(path.read_text())
+            parents = fm.get("parents") or []
+            if not isinstance(parents, list):
+                parents = [parents]
+        except CurationSchemaError:
+            parents = []
+        _append_palate_trace(ctx.palate_trace, {
+            "date": ctx.target.isoformat(), "scope": ctx.scope, "slug": slug,
+            "taste": taste, "pursue": pursue,
+            "axes": t.get("axes") if isinstance(t.get("axes"), list) else [],
+            "why": str(t.get("why") or "").strip(),
+            "parents": [str(p).strip() for p in parents if str(p).strip()]})
+        n += 1
     return n
 
 
@@ -833,6 +923,12 @@ def run(argv: list[str] | None = None, *,
             _print(fail); _append_session_block(ctx, fail, 0, bleed_summary)
             return fail
         _stamp_hypothesis_defaults(ctx, manifest)
+        # Palate m1: persist the skill's taste judgments on tonight's conjectures —
+        # frontmatter scalars (taste, pursue) + the durable trace. Telemetry only; it
+        # never gates promotion (corroboration stays the soul gate).
+        taste_entries = _read_taste(ctx.taste_path)
+        if taste_entries:
+            apply_taste(ctx, manifest, taste_entries)
         # Stage 3 of corroboration: consume the skill's confirm/refute rulings on open
         # what-ifs. Promotions share tonight's bleed cap (bleed ran first, above), so we
         # fold them into bleed_summary for the digest, index rebuild, notify and commit.
