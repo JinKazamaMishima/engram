@@ -174,3 +174,65 @@ def test_session_curation_cmd_targets_the_ended_session():
     assert "--session" in cmd and "sess-123" in cmd
     assert "--project-dir" in cmd and str(bridge.AGENT_CWD) in cmd
     assert "--commit" in cmd
+
+
+# ---- LiveBuffer bridge parity (tier 1) -------------------------------------
+
+def _tmp_buffer(bridge_mod, tmp_path, monkeypatch):
+    """Point the bridge's LiveBuffer at a tmp dir + a fresh launch id, and its
+    SESSION_FILE at tmp (so _save_session's persistence stays sandboxed)."""
+    from buffer import LiveBuffer  # importable: the bridge put infra/engram on sys.path
+    monkeypatch.setattr(bridge_mod, "_buf_launch_id", "launch-testaaaa")
+    monkeypatch.setattr(bridge_mod, "_buf_convo_id", "launch-testaaaa")
+    monkeypatch.setattr(bridge_mod, "_buffer",
+                        LiveBuffer(tmp_path, lambda: bridge_mod._buf_convo_id))
+    monkeypatch.setattr(bridge_mod, "SESSION_FILE", tmp_path / "session_id")
+    return tmp_path
+
+
+@requires_sdk
+def test_bridge_buffers_rows_and_migrates_on_sid_mint(tmp_path, monkeypatch):
+    """Rows land under the provisional launch id; the sid mint (via
+    _save_session) MIGRATES the file and seq continues — the driver's exact
+    launch->sid semantics, now on the bridge path."""
+    import json as _json
+    _tmp_buffer(bridge, tmp_path, monkeypatch)
+    bridge._buffer.append("user", "hello engram")
+    bridge._buffer.append("assistant", "hello operator")
+    assert (tmp_path / "launch-testaaaa.jsonl").exists()
+    bridge._save_session("sid-12345")                      # mint
+    assert not (tmp_path / "launch-testaaaa.jsonl").exists()
+    rows = [_json.loads(x) for x in
+            (tmp_path / "sid-12345.jsonl").read_text().splitlines()]
+    assert [(r["role"], r["seq"]) for r in rows] == [("user", 1), ("assistant", 2)]
+    bridge._buffer.append("user", "second turn")
+    rows = (tmp_path / "sid-12345.jsonl").read_text().splitlines()
+    assert _json.loads(rows[-1])["seq"] == 3               # seq continued after rekey
+
+
+@requires_sdk
+def test_bridge_new_conversation_leaves_old_file_and_mints_fresh_launch(tmp_path, monkeypatch):
+    """/new (sid->None) must NOT drag the finished conversation's rows into the
+    next one: fresh launch id, old file untouched."""
+    _tmp_buffer(bridge, tmp_path, monkeypatch)
+    bridge._save_session("sid-old")
+    bridge._buffer.append("user", "old convo row")
+    bridge._save_session(None)                             # /new
+    assert (tmp_path / "sid-old.jsonl").exists()           # finished file stays
+    assert bridge._buf_convo_id.startswith("launch-")
+    assert bridge._buf_convo_id != "launch-testaaaa"       # fresh id, not the boot one
+    bridge._buffer.append("user", "new convo row")
+    new_file = tmp_path / f"{bridge._buf_convo_id}.jsonl"
+    assert new_file.exists()
+    assert "old convo row" not in new_file.read_text()
+
+
+@requires_sdk
+def test_bridge_buffer_disabled_is_total_noop(tmp_path, monkeypatch):
+    """Gate off (dir=None): appends and rekeys must be silent no-ops."""
+    from buffer import LiveBuffer
+    monkeypatch.setattr(bridge, "_buffer", LiveBuffer(None, lambda: "x"))
+    monkeypatch.setattr(bridge, "SESSION_FILE", tmp_path / "session_id")
+    bridge._buffer.append("user", "never written")
+    bridge._save_session("sid-x")                          # rekey path must not raise
+    assert list(tmp_path.glob("*.jsonl")) == []
