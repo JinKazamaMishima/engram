@@ -474,6 +474,13 @@ class ModelDriver:
     async def set_permission_mode(self, mode: str) -> None: ...
     async def interrupt(self) -> None: ...
 
+    async def inject(self, text: str) -> bool:
+        """Mid-turn aside (/btw): fold a short operator note into the turn that is
+        streaming RIGHT NOW, without interrupting it. True only if a live turn took
+        the note; False = nothing in flight (send it as a normal message instead).
+        Default: this backend can't steer mid-turn."""
+        return False
+
     async def get_context_usage(self) -> dict:
         """Context-window usage breakdown for the live session. Empty dict if the
         backend can't report it (a future ``LocalModelDriver`` may estimate its own)."""
@@ -699,6 +706,7 @@ class AgentSDKDriver(ModelDriver):
         self.actual_model: Optional[str] = None   # what the SDK reports it's REALLY using
         self.fallback_model: Optional[str] = None  # configured fallback (set in _options)
         self._stderr: list[str] = []
+        self._turn_live = False   # a query() is actively streaming — gates inject()
         # Set by the front-end (app.py) to render plan-approval / option-question UI; see
         # ModelDriver.on_interaction. None → headless defaults in _can_use_tool.
         self.on_interaction = None
@@ -1077,6 +1085,21 @@ class AgentSDKDriver(ModelDriver):
         if self._client is not None:
             await self._client.interrupt()
 
+    async def inject(self, text: str) -> bool:
+        """Fold an operator aside into the turn streaming right now: in streaming-
+        input mode a user message written to the live stdin JOINS the running turn
+        at its next model call, sharing its one true-final ResultMessage (probed on
+        CLI 2.1.195 — see /btw), so neither ``_stream``'s stop condition nor the
+        bridge's ``receive_response()`` is disturbed. The raw text goes to the
+        buffer (an aside IS an operator utterance; log-raw invariant, no prepend).
+        Refused (False) unless a turn is actually live — written to an idle stream
+        the note would START a phantom turn nobody is reading."""
+        if not self._turn_live or self._client is None:
+            return False
+        await self._client.query(text)
+        self._buffer.append("user", text)
+        return True
+
     async def get_context_usage(self) -> dict:
         """Live context-window breakdown for this session — the same data Claude
         Code's own ``/context`` shows (a ``ContextUsageResponse``). ``connect()`` is
@@ -1149,6 +1172,7 @@ class AgentSDKDriver(ModelDriver):
         self._buffer.append("user", text)
         sdk_text = prepend + text
         reply: list[str] = []
+        self._turn_live = True
         try:
             try:
                 await self.connect()
@@ -1183,6 +1207,7 @@ class AgentSDKDriver(ModelDriver):
                 else:
                     raise
         finally:
+            self._turn_live = False
             if reply:
                 self._buffer.append("assistant", "".join(reply))
             self._maybe_evict()   # off-hot-path: only fires once the tail cools

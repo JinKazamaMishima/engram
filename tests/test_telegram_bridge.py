@@ -5,6 +5,8 @@ isn't installed). No network and no SDK connection — importing the bridge only
 reads env + defines functions; it connects to Telegram/Claude solely in main()."""
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import importlib.util
 from pathlib import Path
 
@@ -236,3 +238,120 @@ def test_bridge_buffer_disabled_is_total_noop(tmp_path, monkeypatch):
     bridge._buffer.append("user", "never written")
     bridge._save_session("sid-x")                          # rekey path must not raise
     assert list(tmp_path.glob("*.jsonl")) == []
+
+
+# ---- /btw — steer the in-flight turn --------------------------------------
+# handle_message-level: a /btw while a turn is busy must write the bare note
+# straight onto the live client's stdin (steering the running reply) and must
+# NOT touch the _pending queue; idle (or on a failed write) it degrades to the
+# normal coalesce path so the note is never lost.
+
+class _BtwClient:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def query(self, prompt, session_id="default"):
+        self.sent.append(prompt)
+
+
+class _DeadClient:
+    async def query(self, prompt, session_id="default"):
+        raise RuntimeError("transport down")
+
+
+class _BufStub:
+    def append(self, *a, **k): ...
+
+
+def _btw_env(monkeypatch, tmp_path, sent):
+    async def fake_send(text, chat_id=None):
+        sent.append(text)
+
+    async def fake_typing():
+        pass
+
+    monkeypatch.setattr(bridge, "CHAT_ID_RAW", "42")
+    monkeypatch.setattr(bridge, "LOCK_FILE", tmp_path / "bridge.lock")
+    monkeypatch.setattr(bridge, "send", fake_send)
+    monkeypatch.setattr(bridge, "send_typing", fake_typing)
+    monkeypatch.setattr(bridge, "audit", lambda *a, **k: None)
+    monkeypatch.setattr(bridge, "_buffer", _BufStub())
+    monkeypatch.setattr(bridge, "_pending", [])
+    monkeypatch.setattr(bridge, "_queued_ack_sent", False)
+
+
+def _msg(text):
+    return {"message": {"chat": {"id": 42}, "text": text}}
+
+
+@requires_sdk
+def test_btw_mid_turn_writes_to_live_client_not_queue(monkeypatch, tmp_path):
+    sent: list[str] = []
+    _btw_env(monkeypatch, tmp_path, sent)
+    client = _BtwClient()
+    monkeypatch.setattr(bridge, "_client", client)
+
+    async def scenario():
+        turn = asyncio.create_task(asyncio.sleep(30))      # a busy in-flight turn
+        monkeypatch.setattr(bridge, "_turn_task", turn)
+        try:
+            await bridge.handle_message(_msg("/btw check the dates"))
+        finally:
+            turn.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await turn
+
+    asyncio.run(scenario())
+    assert client.sent == ["check the dates"]              # bare note, straight to stdin
+    assert bridge._pending == []                           # steered, NOT queued
+    assert any("folded" in s for s in sent)                # the ack Alex sees
+
+
+@requires_sdk
+def test_btw_idle_falls_back_to_normal_message(monkeypatch, tmp_path):
+    sent: list[str] = []
+    _btw_env(monkeypatch, tmp_path, sent)
+    monkeypatch.setattr(bridge, "_client", None)
+    monkeypatch.setattr(bridge, "_turn_task", None)
+
+    async def scenario():
+        try:
+            await bridge.handle_message(_msg("/btw check the dates"))
+            assert bridge._pending == [{"text": "check the dates", "paths": []}]
+        finally:
+            bridge._clear_pending()                        # cancel the armed drain task
+
+    asyncio.run(scenario())
+
+
+@requires_sdk
+def test_btw_failed_write_falls_back_to_queue(monkeypatch, tmp_path):
+    sent: list[str] = []
+    _btw_env(monkeypatch, tmp_path, sent)
+    monkeypatch.setattr(bridge, "_client", _DeadClient())
+
+    async def scenario():
+        turn = asyncio.create_task(asyncio.sleep(30))
+        monkeypatch.setattr(bridge, "_turn_task", turn)
+        try:
+            await bridge.handle_message(_msg("/btw check the dates"))
+            assert bridge._pending == [{"text": "check the dates", "paths": []}]
+        finally:
+            bridge._clear_pending()
+            turn.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await turn
+
+    asyncio.run(scenario())
+    assert any("queued" in s for s in sent)                # the one busy-period ack
+
+
+@requires_sdk
+def test_btw_bare_shows_usage(monkeypatch, tmp_path):
+    sent: list[str] = []
+    _btw_env(monkeypatch, tmp_path, sent)
+    monkeypatch.setattr(bridge, "_client", None)
+    monkeypatch.setattr(bridge, "_turn_task", None)
+    asyncio.run(bridge.handle_message(_msg("/btw")))
+    assert bridge._pending == []
+    assert any("usage: /btw" in s for s in sent)

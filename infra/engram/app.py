@@ -62,6 +62,7 @@ SLASH_CMDS = [
     ("/workflows", "workflow runs this session — phases + agents"),
     ("/fleet", "parallel Engram sessions across repos  (/fleet <path> [task])"),
     ("/agent", "delegate to a sub-agent  (e.g. /agent Explore <task>)"),
+    ("/btw", "aside — steer the reply that's streaming  (/btw <note>)"),
     ("/context", "show context-window usage"),
     ("/rewind", "restore files to before an earlier message"),
     ("/sessions", "resume another of this folder's sessions"),
@@ -75,7 +76,7 @@ SLASH_CMDS = [
 # Commands that take an argument: selecting one completes the text and waits (for
 # /effort it then offers the levels; for /agent, the sub-agent names); the rest
 # submit immediately on select.
-ARG_CMDS = {"/effort", "/model", "/agent", "/fleet"}
+ARG_CMDS = {"/effort", "/model", "/agent", "/fleet", "/btw"}
 # State-changing commands — they touch the driver / warm client, so they must not
 # run while a reply is streaming (mid-turn they're blocked, never queued). /context
 # is read-only but pokes the warm client (a control request), so it's gated too.
@@ -1071,6 +1072,30 @@ class EngramApp(App):
             self._render_header()
             self._status("ultracode ⚡ on — Engram orchestrates substantive work with workflows"
                          if self._ultracode else "ultracode off")
+            return
+        # /btw — a mid-turn aside, like Claude Code's steering: written straight onto
+        # the live turn's stdin so it folds into the reply being written (no
+        # interrupt, no type-ahead queue; the turn keeps its ONE final Result —
+        # probed on CLI 2.1.195). Idle it's just a normal message; if the turn ends
+        # in the same instant (inject refused), fall back to the type-ahead queue so
+        # the note is never lost.
+        if text == "/btw" or text.startswith("/btw "):
+            note = text[len("/btw"):].strip()
+            if not note:
+                self._status("usage: /btw <note> — steer the reply being written")
+                return
+            if self._busy and await self.driver.inject(note):
+                # Close the open reply block so the aside lands in true order
+                # (reply-so-far → ↪ btw → continuation); _ensure_stream reopens.
+                await self._break_stream()
+                await self._add(Static(f"[#67E8F9]↪ btw: {escape(note)}[/]"))
+                self._status("↪ folded into the current reply")
+            elif self._busy:
+                self._queue.append((note, []))
+                self._render_queue()
+                self._status("⏳ couldn't reach the running reply — queued next instead")
+            else:
+                await self._dispatch(note, [])
             return
         # State-changing slash commands can't run while a turn is in flight (they'd
         # disrupt the warm client) — block them, don't queue; otherwise dispatch.

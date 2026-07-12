@@ -31,6 +31,8 @@ Config (env, normally from ~/.config/recall/telegram-agent.env via systemd):
                                    <repo>/scripts/recall_inject.py; empty disables)
 
 Built-in commands (no model call): /new /end /cancel /lock /unlock /status /ping /model.
+/btw <note> steers the turn that's streaming right now — the note is written onto
+the live client's stdin and folds into the reply being written (idle: a normal message).
 """
 from __future__ import annotations
 
@@ -768,6 +770,7 @@ async def handle_message(update: dict) -> None:
             "  /new    — end this conversation and start fresh\n"
             "  /end    — end this conversation\n"
             "  /cancel — stop the current reply\n"
+            "  /btw    — fold a note into the reply being written\n"
             "  /status — locked? busy? model? active session\n"
             "  /model  — switch model (opus[1m] · opus · fable · …)\n"
             "  /lock /unlock — pause/resume inbound\n"
@@ -838,6 +841,30 @@ async def handle_message(update: dict) -> None:
     if LOCK_FILE.exists():
         await send("🔒 bridge is locked — /unlock first")
         return
+
+    # /btw — a mid-turn aside, like Claude Code's steering: written straight onto
+    # the live turn's stdin so it folds into the reply being written. The turn
+    # keeps its ONE true-final ResultMessage (probed on CLI 2.1.195), so
+    # _query_once's receive_response() is undisturbed. Idle → just a normal
+    # message on the usual coalesce path; a failed write → the same fallback, so
+    # the note is never lost. (Known ms-wide race: if the turn ends between the
+    # busy check and the write, the note starts an unread turn — next message
+    # resyncs; accepted for now.)
+    btw = _cmd_arg(text, "btw")
+    if btw is not None:
+        if not btw:
+            await send("usage: /btw <note> — steer the reply being written right now")
+            return
+        if _busy() and _client is not None:
+            try:
+                await _client.query(btw)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("/btw inject failed; falling back to the queue: %s", exc)
+            else:
+                audit("BTW", btw)
+                await send("↪️ folded into the reply being written")
+                return
+        text = btw   # idle (or failed inject) → the normal message path below
 
     if not _busy():
         await send_typing()
