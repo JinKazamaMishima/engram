@@ -427,6 +427,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "dream-all":
         from recall import registry
         return registry.dream_all(argv[1:])
+    if argv and argv[0] == "cogito":
+        from recall import cogito
+        return cogito.main(argv[1:])
     if argv and argv[0] == "reconsolidate":
         from recall import reconsolidate
         return reconsolidate.main(argv[1:])

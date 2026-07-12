@@ -43,9 +43,15 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+# The sibling engine modules (LiveBuffer, the driver's tier-1 gate) live in
+# infra/engram; putting it on the path keeps this bridge and the terminal
+# driver on ONE wiring path so they can't drift apart.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "infra" / "engram"))
 
 # --- auth: subscription vs API key -------------------------------------------
 # The SDK spawns `claude`, which prefers ANTHROPIC_API_KEY over the subscription
@@ -65,6 +71,9 @@ from claude_agent_sdk import (  # noqa: E402  (after the env strip on purpose)
     SystemMessage,
     TextBlock,
 )
+
+from buffer import LiveBuffer  # noqa: E402 — sibling infra/engram module, shared with the terminal driver
+from core import BUFFER_DIR, BUFFER_ON  # noqa: E402 — tier-1 gate/dir single source (never fork it)
 
 TOKEN = os.environ.get("RECALL_TELEGRAM_AGENT_TOKEN", "")
 CHAT_ID_RAW = os.environ.get("RECALL_TELEGRAM_AGENT_CHAT_ID", "")
@@ -167,6 +176,37 @@ BOT_USERNAME = ""
 # --- conversation state ------------------------------------------------------
 _client: Optional[ClaudeSDKClient] = None
 _session_id: Optional[str] = None
+
+# LiveBuffer (tier 1 of the continuous-STM stack) — bridge parity with the
+# terminal driver. Phone conversations were invisible to tier 1 (and to
+# everything re-derived from it: the working set, eviction, the cogito
+# instrument) because only the driver buffered and the bridge holds a raw SDK
+# client. Same gate + dir as core, same provisional-launch-id -> migrate-on-sid
+# semantics, appending the RAW exchanged text at the audit seams (the log-raw /
+# inject-derived invariant). Deliberately NO eviction here: bridge sessions
+# already curate per-session on /new + /end — eviction stays driver-side.
+_buf_launch_id: str = "launch-" + uuid.uuid4().hex[:12]
+_buf_convo_id: str = _buf_launch_id
+_buffer = LiveBuffer(BUFFER_DIR if BUFFER_ON else None, lambda: _buf_convo_id)
+
+
+def _buf_rekey(sid: Optional[str]) -> None:
+    """Follow the conversation's identity on disk: mint (launch->sid) and
+    resume (saved sid at boot) MIGRATE the file; end-of-conversation
+    (sid->None on /new,/end) mints a FRESH launch id and leaves the finished
+    conversation's file where it lies. Always reseeds so seq stays strictly
+    ordered across restarts and renames. Fail-open throughout (LiveBuffer)."""
+    global _buf_convo_id, _buf_launch_id
+    if sid:
+        if sid != _buf_convo_id:
+            _buffer.migrate(_buf_convo_id, sid)
+            _buf_convo_id = sid
+    else:
+        _buf_launch_id = "launch-" + uuid.uuid4().hex[:12]
+        _buf_convo_id = _buf_launch_id
+    _buffer.reseed()
+
+
 _current_model: str = AGENT_MODEL   # mutable; /model swaps it, _build_options reads it on reconnect
 _turn_task: Optional[asyncio.Task] = None
 _last_activity = 0.0
@@ -374,6 +414,7 @@ def seed_offset_if_missing() -> int:
 def _save_session(sid: Optional[str]) -> None:
     global _session_id
     _session_id = sid
+    _buf_rekey(sid)   # tier-1 follows the conversation identity (fail-open)
     try:
         if sid:
             SESSION_FILE.write_text(sid)
@@ -667,6 +708,7 @@ async def _process_turn(text: str) -> None:
     finally:
         _last_activity = time.monotonic()
     audit("OUT", reply)
+    _buffer.append("assistant", reply)
     await send(reply or "(no text in reply)")
 
 
@@ -717,6 +759,7 @@ async def handle_message(update: dict) -> None:
         return
 
     audit("IN", text or f"[media] {caption}")
+    _buffer.append("user", text or f"[media] {caption}")
     log.info("inbound: %r media=%s", (text or caption)[:160], has_media)
 
     if _matches_cmd(text, "start") or _matches_cmd(text, "help"):
@@ -865,6 +908,7 @@ async def main() -> int:
 
     BOT_USERNAME = await asyncio.to_thread(fetch_bot_username)
     _session_id = _load_session()
+    _buf_rekey(_session_id)   # boot resume: tier-1 continues under the saved sid
     _last_activity = time.monotonic()
     log.info("agent bridge starting; label=%s bot=@%s allowed_chat=%s cwd=%s state=%s "
              "setting_sources=%s allowed_tools=%s resume=%s",
