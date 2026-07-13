@@ -70,7 +70,7 @@ async def test_task_registry_and_events():
     d._client = FakeClient([
         TaskStartedMessage(subtype="task_started", data={"subagent_type": "Explore"},
                            task_id="tA", description="find callers", uuid="u",
-                           session_id="s"),
+                           session_id="s", tool_use_id="tuA"),
         TaskProgressMessage(subtype="task_progress", data={}, task_id="tA",
                             description="running",
                             usage={"total_tokens": 12400, "tool_uses": 2,
@@ -86,6 +86,10 @@ async def test_task_registry_and_events():
     task_evs = [e for e in evs if e.kind == "task"]
     assert len(task_evs) == 3, [e.kind for e in evs]
     assert task_evs[0].data["tasks"][0]["status"] == "running"
+    # aurora m2: identity rides every snapshot so the panel can resolve the
+    # on-disk transcript (task_id from the registry key, tool_use_id from start)
+    assert task_evs[0].data["tasks"][0]["task_id"] == "tA"
+    assert task_evs[0].data["tasks"][0]["tool_use_id"] == "tuA"
     assert task_evs[1].data["tasks"][0]["tokens"] == 12400
     assert task_evs[1].data["tasks"][0]["last_tool"] == "Grep"
     assert task_evs[2].data["tasks"][0]["status"] == "completed"

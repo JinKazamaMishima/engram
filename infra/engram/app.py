@@ -22,6 +22,12 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from agent_tail import (  # noqa: E402 — aurora m2: live agents panel plumbing
+    TailReader,
+    agent_detail_card,
+    agent_panel_rows,
+    resolve_task_file,
+)
 from attach import grab_clipboard_image, is_image, parse_dropped_paths  # noqa: E402
 from core import (  # noqa: E402
     _STRIPPED_API_KEY,
@@ -37,11 +43,18 @@ from core import (  # noqa: E402
 )
 from rich.markup import escape  # noqa: E402
 from textual import events, work  # noqa: E402
-from textual.app import App, ComposeResult, SystemCommand  # noqa: E402
+from textual.app import App, ComposeResult  # noqa: E402
 from textual.containers import VerticalScroll  # noqa: E402
 from textual.message import Message  # noqa: E402
 from textual.theme import Theme  # noqa: E402
-from textual.widgets import Footer, Markdown, OptionList, Static, TextArea  # noqa: E402
+from textual.widgets import (  # noqa: E402
+    Footer,
+    Markdown,
+    OptionList,
+    RichLog,
+    Static,
+    TextArea,
+)
 from textual.widgets.option_list import Option  # noqa: E402
 
 # On reattach, replay the tail of the resumed conversation so a fresh TUI isn't blank —
@@ -60,6 +73,7 @@ SLASH_CMDS = [
     ("/mode", "toggle plan ↔ regular  (or shift+tab)"),
     ("/ultracode", "toggle multi-agent workflow orchestration"),
     ("/workflows", "workflow runs this session — phases + agents"),
+    ("/agents", "live agents panel — ↑/↓ pick · enter peeks output  (ctrl+t)"),
     ("/fleet", "parallel Engram sessions across repos  (/fleet <path> [task])"),
     ("/agent", "delegate to a sub-agent  (e.g. /agent Explore <task>)"),
     ("/btw", "aside — steer the reply that's streaming  (/btw <note>)"),
@@ -196,6 +210,52 @@ STAR_DIM = "#5A6C96"
 STAR_LIT = "#C7D6FF"
 STAR_CYAN = "#67E8F9"
 
+# --- aurora m1: the live activity indicator ---------------------------------
+# A moving, color-keyed pulse in the chrome showing what Engram is DOING each
+# moment — thinking, running a tool, responding — read off the same Event stream
+# the turn loop already consumes. Calm body, alive chrome
+# ([[engram-tui-density-follows-function]]); blanks when idle.
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_ACT_SHELL = "#FBBF24"   # amber  — running commands (Bash)
+_ACT_READ = "#67E8F9"    # cyan   — looking things up (Read/Grep/Glob/Web*)
+_ACT_WRITE = "#86EFAC"   # green  — changing files (Edit/Write)
+_ACT_DELEG = "#C4B5FD"   # violet — delegating (Agent/Task/Workflow) + thinking
+_ACT_TALK = "#9FB9FF"    # blue   — responding (streaming text)
+_TOOL_COLOR = {
+    "Bash": _ACT_SHELL,
+    "Read": _ACT_READ, "Grep": _ACT_READ, "Glob": _ACT_READ,
+    "WebSearch": _ACT_READ, "WebFetch": _ACT_READ,
+    "Edit": _ACT_WRITE, "Write": _ACT_WRITE, "NotebookEdit": _ACT_WRITE,
+    "Agent": _ACT_DELEG, "Task": _ACT_DELEG, "Workflow": _ACT_DELEG,
+}
+
+
+def _activity_color(activity: str) -> str:
+    """Color for an activity string, keyed on the tool name — the token before
+    →/: in ``_tool_label``'s output, so ``Agent→Explore: x`` resolves to ``Agent``."""
+    head = activity.split("→", 1)[0].split(":", 1)[0].split()[0] if activity.strip() else ""
+    return _TOOL_COLOR.get(head, _ACT_TALK)
+
+
+def render_activity(activity: str, frame: int) -> str:
+    """Pure Rich-markup for the live activity cell: a colored spinner + label,
+    with an occasional cyan ✦ glint (the starfield's sparkle). ``''`` when idle so
+    the chrome quiets. Unit-testable without Textual."""
+    activity = (activity or "").strip()
+    if not activity:
+        return ""
+    if activity == "thinking":
+        color = _ACT_DELEG
+    elif activity == "responding":
+        color = _ACT_TALK
+    else:
+        color = _activity_color(activity)
+    spin = SPINNER[frame % len(SPINNER)]
+    label = activity if len(activity) <= 48 else activity[:47] + "…"
+    glint = f" [{STAR_CYAN}]✦[/]" if frame % 17 == 3 else ""
+    return f"[{color}]{spin} {escape(label)}[/]{glint}"
+
+
 # What opens the home: true facts about the engram — the memory trace the project is
 # named for. One is chosen at random each launch.
 ENGRAM_EPIGRAPHS = (
@@ -300,6 +360,26 @@ class PromptArea(TextArea):
                 event.stop()
                 app._interact_cancel()                                 # type: ignore[attr-defined]
                 return
+        # The agents panel is open (aurora m2): ↑/↓ move, Enter with an EMPTY prompt
+        # peeks the highlighted agent's output, Enter with text submits that text as a
+        # normal message (watch while you chat), Esc closes the panel — so with it
+        # open, the FIRST esc closes the panel and a second one interrupts the reply.
+        if getattr(app, "_agents_open", False):
+            if event.key in ("down", "up"):
+                event.prevent_default()
+                event.stop()
+                app._agents_move(1 if event.key == "down" else -1)     # type: ignore[attr-defined]
+                return
+            if event.key == "enter" and not self.text.strip():
+                event.prevent_default()
+                event.stop()
+                app._agents_accept()                                   # type: ignore[attr-defined]
+                return
+            if event.key == "escape":
+                event.prevent_default()
+                event.stop()
+                app._close_agents()                                    # type: ignore[attr-defined]
+                return
         if event.key == "escape" and getattr(app, "_busy", False):
             event.prevent_default()                # ESC mid-reply → stop Engram now
             event.stop()
@@ -336,6 +416,10 @@ class PromptArea(TextArea):
 
 
 class EngramApp(App):
+    # Our own /-command system + Ctrl-bindings cover everything Textual's built-in
+    # Ctrl+P palette offered, and its footer entry reads as a theme switch. Off. (aurora m1)
+    ENABLE_COMMAND_PALETTE = False
+
     CSS = """
     Screen { background: $background; }
     #vhead { dock: top; height: 3; padding: 0 2; background: $panel; }
@@ -348,10 +432,27 @@ class EngramApp(App):
     }
     Markdown { margin: 0 0 1 0; padding: 0 1; }
     #status { height: 1; color: $secondary; text-style: italic; padding: 0 2; }
+    #activity { height: auto; padding: 0 2; }
     #chips { height: auto; color: $accent; padding: 0 2; }
     #queued { height: auto; color: $warning; text-style: italic; padding: 0 2; }
     #fleet { height: auto; color: $accent; padding: 0 2; }
     #tasks { height: auto; color: $secondary; padding: 0 2; }
+    #agents {
+        display: none;
+        margin: 0 2; height: auto; max-height: 8;
+        background: $panel; border: round $accent 60%;
+        scrollbar-size-vertical: 1;
+    }
+    #agents > .option-list--option { padding: 0 1; color: $foreground; }
+    #agents > .option-list--option-highlighted {
+        background: $accent 25%; color: $foreground; text-style: bold;
+    }
+    #agentview {
+        display: none;
+        height: 12; margin: 0 2;
+        background: $surface; border: round $accent 40%;
+        scrollbar-size-vertical: 1;
+    }
     #cmdmenu {
         display: none;
         margin: 0 2; height: auto; max-height: 8;
@@ -390,12 +491,15 @@ class EngramApp(App):
         ("ctrl+n", "new_thread", "new"),
         ("ctrl+v", "paste_image", "paste image"),
         ("ctrl+y", "copy_reply", "copy reply"),
+        ("ctrl+t", "toggle_agents", "agents"),
     ]
 
     def __init__(self, driver: ModelDriver | None = None) -> None:
         super().__init__()
         self.driver: ModelDriver = driver or AgentSDKDriver()
         self._busy = False
+        self._activity = ""              # aurora m1: live turn activity (thinking/tool/responding)
+        self._act_frame = 0              # spinner frame counter for the activity cell
         self._attachments: list = []     # pending file paths for the next turn
         self._last_reply = ""            # for copy-a-reply
         self._menu_open = False          # slash-command dropdown visible?
@@ -406,6 +510,13 @@ class EngramApp(App):
         self._fallback_shown = False                # one-time notice when the model rotates
         self._todos: list = []                      # last TodoWrite list (persists across turns)
         self._tasks_snapshot: list = []             # last sub-agent registry snapshot
+        # aurora m2 — navigable agents panel + live output tail (pull-only: never
+        # opens itself). One TailReader at most; only the selected agent is tailed.
+        self._agents_open = False
+        self._agents_sel: str | None = None         # highlighted row id (survives re-render)
+        self._detail_id: str | None = None          # row id whose output pane is open
+        self._tail = None                           # TailReader | None
+        self._agent_rows: list = []                 # last agent_panel_rows() result
         self._fleet = None                          # Fleet (lazy — created on first /fleet)
         self._perception = None                     # PerceptionBridge (opt-in: ENGRAM_PERCEIVE=1)
         # Interactive tools (plan approval · option questions). The driver calls
@@ -432,10 +543,14 @@ class EngramApp(App):
         yield Static(id="vhead")
         yield VerticalScroll(id="convo")
         yield Static("", id="status")
+        yield Static("", id="activity")     # aurora m1: animated activity pulse
         yield Static("", id="chips")
         yield Static("", id="queued")
         yield Static("", id="fleet")        # live fleet-member strip (⚑ per repo)
         yield Static("", id="tasks")        # live todo + sub-agent panel
+        yield OptionList(id="agents")       # aurora m2: navigable live agents
+        yield RichLog(id="agentview", max_lines=400, wrap=True, markup=True,
+                      auto_scroll=True)     # aurora m2: selected agent's live output
         yield OptionList(id="cmdmenu")
         yield Static("", id="perception")   # live senses HUD (shown when ENGRAM_PERCEIVE on)
         yield PromptArea(id="prompt", soft_wrap=True, tab_behavior="focus")
@@ -446,6 +561,8 @@ class EngramApp(App):
         self.theme = "engram"
         self._render_header()
         self.set_interval(0.7, self._render_header)   # twinkle
+        self.set_interval(0.12, self._tick_activity)  # aurora m1: activity pulse
+        self.set_interval(0.5, self._tick_tail)       # aurora m2: agent output tail
         prompt = self.query_one("#prompt", PromptArea)
         prompt.border_title = "message"
         await self._add(Static("✦ Engram — " + random.choice(ENGRAM_EPIGRAPHS), id="welcome"))
@@ -513,24 +630,19 @@ class EngramApp(App):
         await self._add(Static("[dim]──  now  "
                                "───────────────────────────────────[/dim]"))
 
-    # ---- command palette ----
-    def get_system_commands(self, screen):
-        yield from super().get_system_commands(screen)
-        yield SystemCommand("Engram: New thread", "Clear context and start fresh",
-                            lambda: self.run_worker(self._reset_thread()))
-        yield SystemCommand("Engram: Copy last reply", "Copy Engram's last message",
-                            self.action_copy_reply)
-        yield SystemCommand("Engram: Attach clipboard image", "Paste a screenshot",
-                            lambda: self.run_worker(self.action_paste_image()))
-        yield SystemCommand("Engram: Context usage", "Show context-window usage",
-                            lambda: self.run_worker(self._show_context()))
-        for lvl in EFFORT_LEVELS:
-            yield SystemCommand(f"Engram: Effort → {lvl}", f"Set reasoning effort to {lvl}",
-                                lambda level=lvl: self.run_worker(self._apply_effort(level)))
-
     # ---- helpers ----
     def _status(self, text: str) -> None:
         self.query_one("#status", Static).update(text)
+
+    def _tick_activity(self) -> None:
+        """Frame the live activity cell (aurora m1) — a cheap render each tick,
+        like the header twinkle. Guarded: a tick can race mount/teardown."""
+        self._act_frame += 1
+        try:
+            cell = self.query_one("#activity", Static)
+        except Exception:  # noqa: BLE001 — cell not mounted (yet / anymore)
+            return
+        cell.update(render_activity(self._activity, self._act_frame))
 
     def _subtitle(self) -> str:
         model = getattr(self.driver, "model", "?")
@@ -840,6 +952,11 @@ class EngramApp(App):
         if event.option_list.id == "cmdmenu" and event.option.id:
             event.stop()
             self._choose_command(event.option.id)
+            return
+        if event.option_list.id == "agents" and event.option.id:   # mouse = enter
+            event.stop()
+            self._agents_sel = event.option.id
+            self._agents_accept()
 
     def _choose_command(self, value: str) -> None:
         """Act on a selected menu entry. Arg-taking command names (/effort, /model,
@@ -1073,6 +1190,19 @@ class EngramApp(App):
             self._status("ultracode ⚡ on — Engram orchestrates substantive work with workflows"
                          if self._ultracode else "ultracode off")
             return
+        # Always-safe read/UI commands. These lived in _handle_command behind the
+        # STATE_CMDS gate — which never matches them, so typed they fell through to
+        # the model as chat (pre-existing dead branches; fixed with aurora m2).
+        if text == "/workflows":
+            await self._show_workflows()
+            return
+        if text == "/agents":
+            # UI-state only (like /ultracode) — safe to flip mid-reply.
+            self.action_toggle_agents()
+            return
+        if text.startswith("/fleet"):
+            await self._handle_fleet(text[len("/fleet"):].strip())
+            return
         # /btw — a mid-turn aside, like Claude Code's steering: written straight onto
         # the live turn's stdin so it folds into the reply being written (no
         # interrupt, no type-ahead queue; the turn keeps its ONE final Result —
@@ -1175,10 +1305,9 @@ class EngramApp(App):
             await self._do_fork()
         elif text == "/export":
             await self._do_export()
-        elif text == "/workflows":
-            await self._show_workflows()
-        elif text.startswith("/fleet"):
-            await self._handle_fleet(text[len("/fleet"):].strip())
+        # (/workflows, /agents and /fleet are handled in the main dispatcher — they
+        # are always-safe and were unreachable here: this method only ever fires
+        # for STATE_CMDS.)
 
     async def _show_rewind(self) -> None:
         """List this session's file checkpoints (one per typed prompt, newest first)
@@ -1364,6 +1493,121 @@ class EngramApp(App):
             self.query_one("#tasks", Static).update(
                 escape(render_tasks_line(self._todos, self._tasks_snapshot)))
         except Exception:  # noqa: BLE001 — panel not mounted (teardown); skip
+            pass
+        if self._agents_open:                       # aurora m2: live panel rides along
+            self._render_agents()
+
+    # ---- aurora m2: navigable agents panel + live output tail ----
+    def action_toggle_agents(self) -> None:
+        if self._agents_open:
+            self._close_agents()
+        else:
+            self._agents_open = True
+            self._render_agents()
+            try:
+                self.query_one("#agents", OptionList).display = True
+            except Exception:  # noqa: BLE001 — not mounted (teardown)
+                self._agents_open = False
+
+    def _close_agents(self) -> None:
+        self._agents_open = False
+        self._close_detail()
+        try:
+            self.query_one("#agents", OptionList).display = False
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _agents_move(self, delta: int) -> None:
+        try:
+            panel = self.query_one("#agents", OptionList)
+        except Exception:  # noqa: BLE001
+            return
+        n = panel.option_count
+        if n:
+            panel.highlighted = ((panel.highlighted or 0) + delta) % n
+            opt = panel.get_option_at_index(panel.highlighted)
+            self._agents_sel = opt.id
+
+    def _agents_accept(self) -> None:
+        """Enter (or click) on the highlighted row: toggle its output pane."""
+        row = next((r for r in self._agent_rows if r["id"] == self._agents_sel), None)
+        if row is None or row.get("kind") == "info":
+            return
+        if self._detail_id == row["id"]:
+            self._close_detail()
+        else:
+            self._open_detail(row)
+
+    def _open_detail(self, row: dict) -> None:
+        """Resolve the row to its on-disk transcript and arm the tail. Fail-open:
+        an unresolvable row still shows the state-only card."""
+        self._close_detail()
+        path, how = resolve_task_file(
+            row, getattr(self.driver, "cwd", ENGRAM_CWD),
+            getattr(self.driver, "session_id", None))
+        self._detail_id = row["id"]
+        self._tail = TailReader(path) if path is not None else None
+        try:
+            view = self.query_one("#agentview", RichLog)
+            view.clear()
+            view.display = True
+            view.write(agent_detail_card(row, how))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _close_detail(self) -> None:
+        self._detail_id = None
+        self._tail = None
+        try:
+            view = self.query_one("#agentview", RichLog)
+            view.clear()
+            view.display = False
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _render_agents(self) -> None:
+        """Rebuild the panel rows from the latest snapshot, keeping the highlight
+        on the same row id across re-renders. Empty → one dim placeholder (the
+        panel never closes itself under the operator)."""
+        try:
+            panel = self.query_one("#agents", OptionList)
+        except Exception:  # noqa: BLE001
+            return
+        self._agent_rows = agent_panel_rows(self._tasks_snapshot)
+        panel.clear_options()
+        if not self._agent_rows:
+            panel.add_options([Option("  (no live agents — /agent or a workflow "
+                                      "populates this)", id="~empty", disabled=True)])
+            panel.highlighted = None
+        else:
+            panel.add_options([Option(r["label"], id=r["id"],
+                                      disabled=r.get("kind") == "info")
+                               for r in self._agent_rows])
+            ids = [r["id"] for r in self._agent_rows]
+            idx = ids.index(self._agents_sel) if self._agents_sel in ids else 0
+            panel.highlighted = idx
+            self._agents_sel = ids[idx]
+        # The tailed agent vanished from the snapshot (finished / turn ended):
+        # stop polling, say so, keep the pane up until you close it.
+        if self._detail_id and self._detail_id not in [r["id"] for r in self._agent_rows]:
+            if self._tail is not None:
+                self._tail = None
+                try:
+                    self.query_one("#agentview", RichLog).write(
+                        "[dim]— agent finished (tail stopped) —[/dim]")
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _tick_tail(self) -> None:
+        """0.5s poll of the selected agent's transcript (aurora m2) — same guarded
+        no-op pattern as _tick_activity; free while nothing is tailed."""
+        if self._tail is None:
+            return
+        try:
+            chunk = self._tail.poll()
+            if chunk:
+                self.query_one("#agentview", RichLog).write(chunk.rstrip("\n"))
+        except Exception:  # noqa: BLE001 — pane unmounted mid-tick
             pass
 
     async def _show_workflows(self) -> None:
@@ -1671,7 +1915,7 @@ class EngramApp(App):
         acc: list[str] = []
         tools: list[str] = []
         wrote_any = False
-        self._status(f"✦ {agent[0]} working…" if agent else "✦ thinking…")
+        self._activity = agent[0] if agent else "thinking"   # aurora m1: live pulse
         try:
             source = (self.driver.run_subagent(*agent) if agent
                       else self.driver.query(text, prepend=prepend))
@@ -1680,6 +1924,7 @@ class EngramApp(App):
                     if not self._recall_shown:      # first response wins (one hook wired)
                         await self._add_recall_line(ev.text)
                 elif ev.kind == "text":
+                    self._activity = "responding"   # aurora m1
                     if not self._recall_shown:      # text arrived, no hook event ever did
                         await self._add_recall_line(None)
                     await self._ensure_stream()     # (re)open a block; a card may have broken it
@@ -1694,7 +1939,7 @@ class EngramApp(App):
                 elif ev.kind == "tool":
                     if ev.text not in tools:
                         tools.append(ev.text)
-                    self._status(f"⚙ {ev.text}…")
+                    self._activity = ev.text        # aurora m1: color-keyed live pulse
                 elif ev.kind == "status":          # ephemeral (sub-agent progress)
                     self._status(f"⚙ {ev.text}…")
                 elif ev.kind == "todos":
@@ -1713,6 +1958,7 @@ class EngramApp(App):
         finally:
             await self._break_stream()
             self._busy = False
+            self._activity = ""                     # aurora m1: chrome quiets when idle
             bg_live = getattr(self.driver, "has_background_tasks", False)
             # A mode armed via shift+tab mid-reply applies now, governing the next turn —
             # unless background agents are still out: applying recycles the warm client,
