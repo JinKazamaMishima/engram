@@ -537,6 +537,18 @@ def _build_options(resume_id: Optional[str]) -> ClaudeAgentOptions:
         opts["allowed_tools"] = ALLOWED_TOOLS
     if DISALLOWED_TOOLS:
         opts["disallowed_tools"] = DISALLOWED_TOOLS
+    # In-process MCP tools (recall pull, x_search, grok, envoy) — the SAME shared
+    # builder the terminal driver uses, so phone and terminal never drift. Under
+    # bypassPermissions we need only register the servers, not pre-allow them.
+    # Fail-open: a bad build means no tools, never a dead bridge.
+    try:
+        from engram_mcp import build_servers
+        servers = build_servers(AGENT_CWD)
+        if servers:
+            opts["mcp_servers"] = servers
+            log.info("in-process MCP tools: %s", ", ".join(servers))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("in-process MCP tools unavailable: %s", exc)
     return ClaudeAgentOptions(**opts)
 
 
