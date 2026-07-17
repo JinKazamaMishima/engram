@@ -38,7 +38,7 @@ class FakeDriver(ModelDriver):
         self.model = "opus[1m]"
         self.effort = "max"
         self.session_id = "sess-1"
-        self.cwd = Path("/home/user/repos/engram")
+        self.cwd = Path("/home/user/proj")
         self.resumed = False
         self.stderr_tail = ""
         self.calls: list[str] = []
@@ -185,11 +185,63 @@ async def scenario_enter_with_text_submits() -> None:
         print("✓ enter with text submits a normal message; panel stays open")
 
 
+async def scenario_delegation_row() -> None:
+    """aurora m3: a grok call (in-process tool, not a task) surfaces as a 📡 row,
+    opens a still card (one-shot — no tail), and collapses to a counter on finish."""
+    import delegations
+    delegations.reset()
+    app = EngramApp(driver=FakeDriver(tasks=[]))
+    async with app.run_test() as pilot:
+        did = delegations.start("grok·low", "grok-4.5", "xai")
+        await pilot.press("ctrl+t")
+        await wait_until(lambda: app._agents_open, pilot, "panel open")
+        app._render_agents()
+        await wait_until(
+            lambda: any(r["id"] == f"deleg/{did}" for r in app._agent_rows),
+            pilot, "delegation row appears")
+        row = next(r for r in app._agent_rows if r["kind"] == "deleg")
+        assert "grok·low" in row["label"] and "📡" in row["label"]
+        # enter opens a still card (no transcript to tail)
+        await pilot.press("enter")
+        await wait_until(lambda: app._detail_id == f"deleg/{did}", pilot, "deleg card")
+        assert app._tail is None
+        lines = "\n".join(str(s) for s in
+                          app.query_one("#agentview", RichLog).lines)
+        assert "one-shot" in lines
+        # finishing it drops the live row and leaves the collapsed counter
+        delegations.finish(did, cost=0.02, ok=True)
+        app._render_agents()
+        assert not any(r["kind"] == "deleg" for r in app._agent_rows)
+        assert any(r["id"] == "~deleg" for r in app._agent_rows), "collapsed counter"
+    delegations.reset()
+    print("✓ delegation row: 📡 live → still card (no tail) → finish collapses to counter")
+
+
+async def scenario_tasks_snake_animates() -> None:
+    """The #tasks braille snake advances on the activity tick while an agent runs —
+    and the old 🛰 satellite icon is gone."""
+    from textual.widgets import Static
+    app = EngramApp(driver=FakeDriver())
+    async with app.run_test() as pilot:
+        app.post_message(PromptArea.Submitted("go"))
+        await wait_until(lambda: app._tasks_running(), pilot, "a task goes live")
+        cell = app.query_one("#tasks", Static)
+        app._tick_activity()
+        first = str(cell.render())
+        app._tick_activity()
+        second = str(cell.render())
+        assert first and second and first != second, (first, second)
+        assert "🛰" not in first, first
+        print("✓ #tasks braille snake advances frame-to-frame; no 🛰 satellite icon")
+
+
 async def main() -> None:
     await scenario_toggle_and_navigate()
+    await scenario_tasks_snake_animates()
     await scenario_slash_agents_and_placeholder()
     await scenario_detail_tail()
     await scenario_enter_with_text_submits()
+    await scenario_delegation_row()
     print("\nALL PASS")
 
 

@@ -22,11 +22,15 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from agent_tail import (  # noqa: E402 — aurora m2: live agents panel plumbing
+import delegations  # noqa: E402 — aurora m3: live cross-provider delegation registry
+import starlight  # noqa: E402 — aurora m6: pure breathing-starfield + meteor math
+from agent_tail import (  # noqa: E402 — aurora m2/m3: live agents panel plumbing
     TailReader,
     agent_detail_card,
     agent_panel_rows,
+    enrich_workflow_agents,
     resolve_task_file,
+    workflow_disk_agents,
 )
 from attach import grab_clipboard_image, is_image, parse_dropped_paths  # noqa: E402
 from core import (  # noqa: E402
@@ -129,47 +133,51 @@ def render_recall_line(line: str | None) -> str:
     return f"◆ recall · {body}"
 
 
-def render_tasks_line(todos: list, tasks: list) -> str:
+def render_tasks_line(todos: list, tasks: list, deleg: dict | None = None,
+                      frame: int = 0) -> str:
     """The one-line task panel: todo progress + the active step, then each LIVE
-    sub-agent with its state. Finished agents don't stack up — the transcript
-    already carries their ✓/✗ summary lines inline, so terminal entries collapse
-    into compact counters (and the whole panel empties when nothing is live).
-    Pure (unit-testable without Textual); empty string when nothing to show."""
+    sub-agent as ONE dynamic cell — a colored braille 'snake' while it runs, a ✓/✗
+    IN PLACE the moment it finishes (no separate start/finish rows, no finished-
+    counter). The whole panel empties at the turn boundary, so a finished cell never
+    outlives its turn. ``frame`` advances the snake (driven by the activity tick, so
+    running cells animate in step with the m1 pulse). ``deleg`` (a
+    delegations.snapshot()) adds a 📡 cell per IN-FLIGHT grok call — ambient only, so
+    it vanishes when the call returns. Returns Rich markup (names escaped inline);
+    empty string when nothing to show."""
     parts = []
     if todos:
         done = sum(1 for t in todos if t.get("status") == "completed")
         line = f"☑ {done}/{len(todos)}"
         cur = next((t for t in todos if t.get("status") == "in_progress"), None)
         if cur:
-            line += f"  ▶ {cur.get('activeForm') or cur.get('content') or ''}"
+            line += f"  ▶ {escape(cur.get('activeForm') or cur.get('content') or '')}"
         parts.append(line)
-    n_done = n_dead = 0
+    snake = SPINNER[frame % len(SPINNER)]
     for t in tasks:
         status = t.get("status")
+        # Workflows keep their ⚙ type-tag in every state; sub-agents carry no icon of
+        # their own now — the leading glyph (snake / ✓ / ✗) IS the state.
+        tag = "⚙ " if t.get("workflow") else ""
+        name = escape(str(t.get("name", "sub-agent"))).removeprefix("⚙ ")
         if status == "completed":
-            n_done += 1
+            parts.append(f"[{_ACT_WRITE}]✓ {tag}{name}[/]")
         elif status in ("failed", "stopped", "killed"):
-            n_dead += 1
-        elif t.get("workflow"):
-            # A dynamic-workflow run: show where it is in its phase/agent tree
-            # (the wf snapshot rides every progress heartbeat — see
-            # core.workflow_snapshot); /workflows expands the full tree.
-            w = t.get("wf") or {}
-            bit = f"⚙ {t.get('name', 'workflow').removeprefix('⚙ ')} ⏳"
-            if w.get("total"):
-                bit += f" {w.get('phase', '')} {w['done']}/{w['total']}"
-            if t.get("tokens"):
-                bit += f" {int(t['tokens']) // 1000}k"
-            parts.append(bit)
+            parts.append(f"[{_MET_WARN}]✗ {tag}{name}[/]")
         else:
-            bit = f"🛰 {t.get('name', 'sub-agent')} ⏳"
+            bit = f"[{_ACT_DELEG}]{snake}[/] {tag}{name}"
+            if t.get("workflow"):
+                # phase/agent tree rides every progress heartbeat (core.workflow_snapshot);
+                # /workflows expands the full tree.
+                w = t.get("wf") or {}
+                if w.get("total"):
+                    bit += f" {escape(str(w.get('phase', '')))} {w['done']}/{w['total']}"
+            elif t.get("last_tool"):        # folded in from the old status line
+                bit += f" [dim]{escape(str(t['last_tool']))}[/dim]"
             if t.get("tokens"):
                 bit += f" {int(t['tokens']) // 1000}k"
             parts.append(bit)
-    if n_done:
-        parts.append(f"🛰 ✓ {n_done} done")
-    if n_dead:
-        parts.append(f"🛰 ✗ {n_dead} failed")
+    for e in (deleg or {}).get("live") or []:
+        parts.append(f"[{_ACT_DELEG}]{snake}[/] 📡 {escape(e.get('label') or 'grok')}")
     return "   ".join(parts)
 
 
@@ -198,7 +206,7 @@ MODELS = (
 # Sticky-header palette (Rich-markup hex, matching ENGRAM_THEME — Static markup can't
 # see Textual's $accent vars). The logo is a pixel gem (half-block "pixels") — the
 # star Engram is named for. Later this header area can swap to a pixel-rendered face.
-LOGO_C = "#67E8F9"   # cyan — the star's glint
+LOGO_C = "#3D7A87"   # cyan — the star's glint
 NAME_C = "#E8ECF8"   # starlight
 SUB_C = "#8593B8"    # muted
 ENGRAM_LOGO = ("█   █", " █ █ ", "  █  ")
@@ -207,8 +215,18 @@ ENGRAM_LOGO = ("█   █", " █ █ ", "  █  ")
 # flickers each tick (a gentle ~0.7s timer). Movement, kept subtle.
 STAR_GLYPHS = ("·", "✦", "✧", "⋆", "˖")
 STAR_DIM = "#5A6C96"
-STAR_LIT = "#C7D6FF"
-STAR_CYAN = "#67E8F9"
+STAR_LIT = "#727C95"
+STAR_CYAN = "#3D7A87"
+
+# aurora m6: the "living sky" palette — colors the starfield/meteor blend between,
+# owned here (the theme) and handed to the pure math in starlight.py. Stars dim
+# toward the #vhead cell bg ($panel); Engram's own ✦ and the meteor share the cyan.
+SKY = starlight.SkyPalette(
+    bg="#1B2340",            # $panel — the header cell bg every star breathes toward
+    dim=STAR_DIM, lit=STAR_LIT, engram=STAR_CYAN,
+    meteor_head="#E8ECF8",   # starlight-white head
+    meteor_tail=STAR_CYAN,   # cyan trail
+)
 
 # --- aurora m1: the live activity indicator ---------------------------------
 # A moving, color-keyed pulse in the chrome showing what Engram is DOING each
@@ -216,11 +234,11 @@ STAR_CYAN = "#67E8F9"
 # the turn loop already consumes. Calm body, alive chrome
 # ([[engram-tui-density-follows-function]]); blanks when idle.
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-_ACT_SHELL = "#FBBF24"   # amber  — running commands (Bash)
-_ACT_READ = "#67E8F9"    # cyan   — looking things up (Read/Grep/Glob/Web*)
-_ACT_WRITE = "#86EFAC"   # green  — changing files (Edit/Write)
-_ACT_DELEG = "#C4B5FD"   # violet — delegating (Agent/Task/Workflow) + thinking
-_ACT_TALK = "#9FB9FF"    # blue   — responding (streaming text)
+_ACT_SHELL = "#BE9436"   # amber  — running commands (Bash)
+_ACT_READ = "#3D7A87"    # cyan   — looking things up (Read/Grep/Glob/Web*)
+_ACT_WRITE = "#5E9B73"   # green  — changing files (Edit/Write)
+_ACT_DELEG = "#7E739C"   # violet — delegating (Agent/Task/Workflow) + thinking
+_ACT_TALK = "#66748F"    # blue   — responding (streaming text)
 _TOOL_COLOR = {
     "Bash": _ACT_SHELL,
     "Read": _ACT_READ, "Grep": _ACT_READ, "Glob": _ACT_READ,
@@ -256,6 +274,68 @@ def render_activity(activity: str, frame: int) -> str:
     return f"[{color}]{spin} {escape(label)}[/]{glint}"
 
 
+# --- aurora m4: context / provenance meter ----------------------------------
+# The quiet chrome gauge answering the one question a self-compact raises: how much
+# of the window is FRESH re-derived context (working-memory + notes, rebuilt every
+# turn) vs accumulated history the backend may have compacted behind our back. The
+# 1M Claude window rarely bites — but this reads the ModelDriver seam, so it ALSO
+# rides Grok, whose window has NO auto-compact net and where it's the only warning
+# before the wall. Same doctrine as temporal grounding: make drift VISIBLE.
+_MET_FLOOR = _ACT_WRITE   # green — re-derived this turn (trustworthy)
+_MET_HIST = "#6B7BA8"     # slate — accumulated history (drift-prone once compacted)
+_MET_FREE = "#2A3350"     # faint — unused window
+_MET_WARN = "#BC5C68"     # rose  — filling window with no auto-compact net (Grok)
+_MET_FULL = "⣿"           # braille full-cell (used window) — echoes the m1 spinner's dots
+_MET_EMPTY = "⣀"          # braille low-rail (free window) — the braille analog of ░
+
+
+def _meter_bar(floor: int, total: int, mx: int, width: int = 16) -> str:
+    """Two-tone window bar sized against the full window ``mx``: a green head for the
+    re-derived floor, dim body for history, faint tail for free space."""
+    if mx <= 0:
+        return ""
+    total = max(0, min(total, mx))
+    floor = max(0, min(floor, total))
+    # The re-derived floor is usually sub-percent of a 1M/256k window, so proportional
+    # rounding erases it — force a 1-cell green sliver whenever a floor exists, so the
+    # provenance split stays VISIBLE (the exact size lives in the "Nk fresh" label).
+    g = int(round(width * floor / mx))
+    g = min(width, max(1, g) if floor > 0 else g)
+    h = min(width - g, int(round(width * (total - floor) / mx)))
+    f = width - g - h
+    return (f"[{_MET_FLOOR}]{_MET_FULL * g}[/][{_MET_HIST}]{_MET_FULL * h}[/]"
+            f"[{_MET_FREE}]{_MET_EMPTY * f}[/]")
+
+
+def render_context_meter(usage: dict, floor_tokens: int, compactions: int) -> str:
+    """Pure Rich-markup for the context/provenance gauge — unit-testable without
+    Textual. Fail-open: no usable usage → ``''`` (the cell stays blank, chrome quiet).
+    ``floor_tokens`` is what Engram re-injects this turn (the green head); ``compactions``
+    is the drift-count badge. A filling window with auto-compact OFF (Grok / a future
+    local model) turns the readout rose — the real warning, since nothing catches the
+    overflow. On Claude's auto-compacting 1M window it simply stays calm."""
+    if not usage:
+        return ""
+    total = int(usage.get("totalTokens") or 0)
+    mx = int(usage.get("rawMaxTokens") or usage.get("maxTokens") or 0)
+    if total <= 0 or mx <= 0:
+        return ""
+    pct = usage.get("percentage")
+    pct = float(pct) if pct is not None else 100.0 * total / mx
+    floor_tokens = max(0, min(int(floor_tokens or 0), total))
+    warn = (not usage.get("isAutoCompactEnabled", False)) and pct >= 75
+    pctcol = _MET_WARN if warn else STAR_DIM
+    out = (f"🧠 {_meter_bar(floor_tokens, total, mx)} "
+           f"[{pctcol}]{pct:.0f}%[/]")
+    if floor_tokens >= 1000:
+        out += f" [{_MET_FLOOR}]· {floor_tokens // 1000}k fresh[/]"
+    if compactions > 0:
+        out += f" [{_MET_WARN}]⎇{compactions}[/]"
+    if warn:
+        out += f" [{_MET_WARN}]⚠ no auto-compact[/]"
+    return out
+
+
 # What opens the home: true facts about the engram — the memory trace the project is
 # named for. One is chosen at random each launch.
 ENGRAM_EPIGRAPHS = (
@@ -285,10 +365,10 @@ ULTRACODE_REMINDER = (
 # cyan glint as the accent — memory as points of light held in the dark.
 ENGRAM_THEME = Theme(
     name="engram",
-    primary="#9FB9FF", secondary="#C4B5FD", accent="#67E8F9",
+    primary="#66748F", secondary="#7E739C", accent="#3D7A87",
     foreground="#E8ECF8", background="#0A0E1A", surface="#121829", panel="#1B2340",
-    success="#86EFAC", warning="#FBBF24", error="#FB7185",
-    dark=True, variables={"input-cursor-background": "#67E8F9"},
+    success="#5E9B73", warning="#BE9436", error="#BC5C68",
+    dark=True, variables={"input-cursor-background": "#3D7A87"},
 )
 
 
@@ -431,12 +511,13 @@ class EngramApp(App):
         border-left: thick $accent 55%;
     }
     Markdown { margin: 0 0 1 0; padding: 0 1; }
-    #status { height: 1; color: $secondary; text-style: italic; padding: 0 2; }
-    #activity { height: auto; padding: 0 2; }
-    #chips { height: auto; color: $accent; padding: 0 2; }
-    #queued { height: auto; color: $warning; text-style: italic; padding: 0 2; }
-    #fleet { height: auto; color: $accent; padding: 0 2; }
-    #tasks { height: auto; color: $secondary; padding: 0 2; }
+    #status { display: none; height: auto; color: $secondary; text-style: italic; padding: 0 2; }
+    #activity { display: none; height: auto; padding: 0 2; }
+    #contextmeter { display: none; height: auto; padding: 0 2; }
+    #chips { display: none; height: auto; color: $accent; padding: 0 2; }
+    #queued { display: none; height: auto; color: $warning; text-style: italic; padding: 0 2; }
+    #fleet { display: none; height: auto; color: $accent; padding: 0 2; }
+    #tasks { display: none; height: auto; color: $secondary; padding: 0 2; }
     #agents {
         display: none;
         margin: 0 2; height: auto; max-height: 8;
@@ -480,7 +561,7 @@ class EngramApp(App):
         background: $panel; border: round $accent 45%;
     }
     PromptArea {
-        margin: 0 2 1 2; height: auto; max-height: 12;
+        margin: 1 2 1 2; height: auto; max-height: 12;   /* 1-row gap off chrome */
         background: $surface; color: $foreground; border: round $accent 35%;
     }
     PromptArea:focus { border: round $accent; }
@@ -500,6 +581,8 @@ class EngramApp(App):
         self._busy = False
         self._activity = ""              # aurora m1: live turn activity (thinking/tool/responding)
         self._act_frame = 0              # spinner frame counter for the activity cell
+        self._sky_t0 = time.monotonic()  # aurora m6: wall-clock phase for the breathing starfield
+        self._meteor_t0: float | None = None  # aurora m6: one-shot meteor start (or None)
         self._attachments: list = []     # pending file paths for the next turn
         self._last_reply = ""            # for copy-a-reply
         self._menu_open = False          # slash-command dropdown visible?
@@ -517,6 +600,7 @@ class EngramApp(App):
         self._detail_id: str | None = None          # row id whose output pane is open
         self._tail = None                           # TailReader | None
         self._agent_rows: list = []                 # last agent_panel_rows() result
+        self._agents_sig = None                     # aurora m3: 0.5s panel-refresh change detector
         self._fleet = None                          # Fleet (lazy — created on first /fleet)
         self._perception = None                     # PerceptionBridge (opt-in: ENGRAM_PERCEIVE=1)
         # Interactive tools (plan approval · option questions). The driver calls
@@ -534,6 +618,9 @@ class EngramApp(App):
         self._cur_md = None
         self._cur_stream = None
         self._cur_last = ""
+        self._compactions_shown = 0                 # aurora m4: markers already drawn
+        self._ctx_usage_cache: dict = {}            # aurora m4: last good usage payload
+        self._fake_compact_fired = False            # aurora m4: ENGRAM_FAKE_COMPACT one-shot
         try:
             self.driver.on_interaction = self._handle_interaction
         except Exception:  # noqa: BLE001 — a driver may forbid the attr set; degrade to no-UI
@@ -544,6 +631,7 @@ class EngramApp(App):
         yield VerticalScroll(id="convo")
         yield Static("", id="status")
         yield Static("", id="activity")     # aurora m1: animated activity pulse
+        yield Static("", id="contextmeter") # aurora m4: context/provenance gauge
         yield Static("", id="chips")
         yield Static("", id="queued")
         yield Static("", id="fleet")        # live fleet-member strip (⚑ per repo)
@@ -560,7 +648,7 @@ class EngramApp(App):
         self.register_theme(ENGRAM_THEME)
         self.theme = "engram"
         self._render_header()
-        self.set_interval(0.7, self._render_header)   # twinkle
+        self.set_interval(0.09, self._render_header)  # aurora m6: ~11fps breathe + meteor
         self.set_interval(0.12, self._tick_activity)  # aurora m1: activity pulse
         self.set_interval(0.5, self._tick_tail)       # aurora m2: agent output tail
         prompt = self.query_one("#prompt", PromptArea)
@@ -575,7 +663,10 @@ class EngramApp(App):
                                    "— /new for a fresh thread  · · ·[/dim]"))
             self._status("resumed last session  ·  /new for fresh")
         else:
-            self._status("ready")
+            self._status("")
+        # aurora m4: paint the gauge ONCE on startup so a resumed session shows its
+        # fill straight away — without this the meter only appeared after the first turn.
+        self._refresh_context_meter(0)
         if os.environ.get("ENGRAM_PERCEIVE"):
             self._start_perception()
 
@@ -632,17 +723,76 @@ class EngramApp(App):
 
     # ---- helpers ----
     def _status(self, text: str) -> None:
-        self.query_one("#status", Static).update(text)
+        # Transient feedback only (command results, errors, "busy…"). The persistent
+        # "ready · ⚙ tools" readout was dropped — the braille activity pulse below now
+        # carries live state — so this collapses out of layout when there's nothing to
+        # say (same collapse-when-empty pattern as the other one-line chrome cells).
+        self._set_line(self.query_one("#status", Static), text)
+
+    @staticmethod
+    def _set_line(widget: Static, markup: str) -> None:
+        """Update a one-line chrome Static and COLLAPSE it when empty — ``display=False``
+        takes it out of layout, not just blanks it. Idle cells each reserved a row, and
+        that stack of empties was the gap between the meter and the prompt. Same pattern
+        the #agents/#cmdmenu panels already use (CSS ``display: none`` + toggled here)."""
+        # layout=False: repaint in place. These are one-line cells, and the display
+        # toggle below already drives a relayout on the frames a cell actually appears
+        # or disappears — so the only thing dropped is the redundant per-repaint reflow
+        # (e.g. the 8fps activity pulse, which fired update("") over the whole tree even
+        # while idle-and-hidden). Same reflow-storm the header fix kills.
+        widget.update(markup, layout=False)
+        widget.display = bool(markup)
+
+    def _tasks_running(self) -> bool:
+        """True while any sub-agent / workflow / grok call is in flight — the gate
+        for advancing the #tasks braille snake on the activity tick (a finished cell
+        holds a static ✓/✗, so no repaint is owed once everything has landed)."""
+        if any(t.get("status") not in ("completed", "failed", "stopped", "killed")
+               for t in self._tasks_snapshot):
+            return True
+        return bool(delegations.snapshot().get("live"))
 
     def _tick_activity(self) -> None:
-        """Frame the live activity cell (aurora m1) — a cheap render each tick,
-        like the header twinkle. Guarded: a tick can race mount/teardown."""
+        """Frame the live activity cell (aurora m1) + the sub-agent braille snake in
+        the #tasks panel — a cheap render each tick, like the header twinkle. Guarded:
+        a tick can race mount/teardown."""
         self._act_frame += 1
         try:
             cell = self.query_one("#activity", Static)
         except Exception:  # noqa: BLE001 — cell not mounted (yet / anymore)
             return
-        cell.update(render_activity(self._activity, self._act_frame))
+        self._set_line(cell, render_activity(self._activity, self._act_frame))
+        # Advance the running-agent snake in step with the pulse (the #tasks Static only;
+        # the navigable #agents OptionList would flicker if rebuilt 8×/s, so it rides its
+        # own state-change refresh). Cheap no-op when nothing is live.
+        if self._tasks_running():
+            try:
+                self._set_line(self.query_one("#tasks", Static),
+                               render_tasks_line(self._todos, self._tasks_snapshot,
+                                                 delegations.snapshot(), self._act_frame))
+            except Exception:  # noqa: BLE001 — panel not mounted (teardown)
+                pass
+
+    @work(exclusive=True, group="ctxmeter")
+    async def _refresh_context_meter(self, floor_tokens: int) -> None:
+        """aurora m4: repaint the context/provenance gauge off the LIVE driver — a
+        background worker (its own group, so it never cancels a turn), because reading
+        usage is a control round-trip that must not delay a turn finishing. Provider-
+        agnostic: whichever driver is current (Claude / Grok / a future local) answers
+        get_context_usage and carries a compaction_count. Fail-open: a backend that
+        can't report usage keeps the last painted value."""
+        try:
+            usage = await self.driver.get_context_usage()
+        except Exception:  # noqa: BLE001 — control unsupported / client busy: keep last
+            usage = {}
+        if usage:
+            self._ctx_usage_cache = usage
+        cc = getattr(self.driver, "compaction_count", 0)
+        try:
+            self._set_line(self.query_one("#contextmeter", Static),
+                           render_context_meter(self._ctx_usage_cache, floor_tokens, cc))
+        except Exception:  # noqa: BLE001 — cell not mounted (teardown)
+            pass
 
     def _subtitle(self) -> str:
         model = getattr(self.driver, "model", "?")
@@ -672,34 +822,31 @@ class EngramApp(App):
         ]
         width = head.content_size.width
         start = max(len(p) for p, _ in left) + 4
-        lines = [markup + " " * (start - len(plain))
-                 + (self._starline(width - start, i) if width > start + 1 else "")
+        # aurora m6: the right field is a breathing starfield (per-star sin² pulse off
+        # a wall-clock phase, so it's smooth regardless of frame rate) with a one-shot
+        # meteor overlaid when a turn has just finished. All pure — starlight.py.
+        t = time.monotonic() - self._sky_t0
+        band = (starlight.header_band(width - start, len(left), t, self._meteor_progress(), SKY)
+                if width > start + 1 else [""] * len(left))
+        lines = [markup + " " * (start - len(plain)) + band[i]
                  for i, (plain, markup) in enumerate(left)]
-        head.update("\n".join(lines))
+        # layout=False: #vhead is a fixed height:3 dock and the band width only moves
+        # on resize (Textual relayouts on its own Resize event, not this timer), so the
+        # content never changes SIZE frame-to-frame — only color. update()'s default
+        # layout=True reflowed the WHOLE widget tree 11×/s (O(#convo widgets)); py-spy
+        # put ~93% of idle CPU there, the starfield math itself at 0.5%. Repaint only.
+        head.update("\n".join(lines), layout=False)
 
-    def _starline(self, width: int, seed: int) -> str:
-        """One row of the header starfield: positions/glyphs fixed (seeded), each
-        star's brightness flickers per call → twinkle without drifting."""
-        if width <= 1:
-            return ""
-        rng = random.Random(seed * 9973 + 7)
-        cols = set(rng.sample(range(width), min(max(2, width // 6), width)))
-        glyph = {col: rng.choice(STAR_GLYPHS) for col in cols}
-        out = []
-        for col in range(width):
-            if col not in cols:
-                out.append(" ")
-                continue
-            r = random.random()
-            if r < 0.45:
-                out.append(" ")                                       # dark
-            elif r < 0.80:
-                out.append(f"[{STAR_DIM}]{glyph[col]}[/]")            # dim
-            elif r < 0.94:
-                out.append(f"[{STAR_LIT}]{glyph[col]}[/]")            # bright
-            else:
-                out.append(f"[{STAR_CYAN}]✦[/]")                      # rare cyan sparkle
-        return "".join(out)
+    def _meteor_progress(self) -> float | None:
+        """aurora m6: progress ∈ [0, 1) of the one-shot completion meteor, or None when
+        none is flying. Self-clearing on expiry — no timer to leak (rule-no-pings…)."""
+        if self._meteor_t0 is None:
+            return None
+        p = (time.monotonic() - self._meteor_t0) / starlight.METEOR_SECS
+        if p >= 1.0:
+            self._meteor_t0 = None
+            return None
+        return p
 
     def _status_line(self) -> str:
         d = self.driver
@@ -791,7 +938,7 @@ class EngramApp(App):
     def _render_chips(self) -> None:
         chips = "  ".join(("🖼 " if is_image(p) else "📎 ") + escape(p.name)
                           for p in self._attachments)
-        self.query_one("#chips", Static).update(chips)
+        self._set_line(self.query_one("#chips", Static), chips)
 
     # ---- actions ----
     async def action_new_thread(self) -> None:
@@ -1218,7 +1365,7 @@ class EngramApp(App):
                 # Close the open reply block so the aside lands in true order
                 # (reply-so-far → ↪ btw → continuation); _ensure_stream reopens.
                 await self._break_stream()
-                await self._add(Static(f"[#67E8F9]↪ btw: {escape(note)}[/]"))
+                await self._add(Static(f"[#3D7A87]↪ btw: {escape(note)}[/]"))
                 self._status("↪ folded into the current reply")
             elif self._busy:
                 self._queue.append((note, []))
@@ -1329,7 +1476,7 @@ class EngramApp(App):
             choices, hint="↑/↓ + Enter to restore files  ·  Esc to cancel")
         if choice.get("kind") != "option":
             await self._add(Static("[dim]rewind cancelled[/dim]"))
-            self._status("ready")
+            self._status("")
             return
         picked = next(c for c in recent if c["uuid"] == choice["id"])
         try:
@@ -1340,10 +1487,10 @@ class EngramApp(App):
             tail = getattr(self.driver, "stderr_tail", "")
             if tail:
                 await self._add(Static(f"[red dim]{escape(tail)}[/red dim]"))
-            self._status("ready")
+            self._status("")
             return
         await self._add(Static(
-            f"[#86EFAC]⏪ files restored to just before: ❯ {escape(picked['preview'])}[/]"))
+            f"[#5E9B73]⏪ files restored to just before: ❯ {escape(picked['preview'])}[/]"))
         self._rewind_note = (
             "[system] The working tree was just REWOUND to its state before the prompt "
             f"\"{picked['preview']}\" — edits made after that point are undone on disk; "
@@ -1370,10 +1517,10 @@ class EngramApp(App):
             choices, hint="↑/↓ + Enter to resume  ·  Esc to cancel")
         if choice.get("kind") != "option":
             await self._add(Static("[dim]cancelled[/dim]"))
-            self._status("ready")
+            self._status("")
             return
         await self.driver.resume_session(choice["id"])
-        await self._add(Static(f"[#86EFAC]↺ resumed session {escape(choice['id'][:8])} — "
+        await self._add(Static(f"[#5E9B73]↺ resumed session {escape(choice['id'][:8])} — "
                                "your next message continues that thread[/]"))
         self._status("↺ resumed — next message continues that thread")
 
@@ -1387,7 +1534,7 @@ class EngramApp(App):
             self._status("nothing to fork yet — this thread has no session")
             return
         await self.driver.fork()
-        await self._add(Static("[#C4B5FD]⑂ forked — your next message starts a new "
+        await self._add(Static("[#7E739C]⑂ forked — your next message starts a new "
                                "branch; the original thread is kept (see /sessions)[/]"))
         self._status("⑂ forked — next message begins the branch")
 
@@ -1424,7 +1571,7 @@ class EngramApp(App):
         except OSError as exc:
             self._status(f"export failed: {exc}")
             return
-        await self._add(Static(f"[#86EFAC]⇩ exported → {escape(str(out))}[/]"))
+        await self._add(Static(f"[#5E9B73]⇩ exported → {escape(str(out))}[/]"))
         self._status("exported")
 
     async def _show_context(self) -> None:
@@ -1444,7 +1591,7 @@ class EngramApp(App):
                 await self._add(Static(f"[red dim]{escape(tail)}[/red dim]"))
             return
         await self._add(Markdown(render_context_md(usage)))
-        self._status("ready")
+        self._status("")
 
     def _parse_agent(self, text: str) -> "tuple[str, str] | None":
         """Parse '/agent <name> <task>' → (name, task); None if not well-formed.
@@ -1490,8 +1637,9 @@ class EngramApp(App):
     def _render_tasks(self) -> None:
         """Refresh the sticky todo/sub-agent panel above the prompt."""
         try:
-            self.query_one("#tasks", Static).update(
-                escape(render_tasks_line(self._todos, self._tasks_snapshot)))
+            self._set_line(self.query_one("#tasks", Static),
+                           render_tasks_line(self._todos, self._tasks_snapshot,
+                                             delegations.snapshot(), self._act_frame))
         except Exception:  # noqa: BLE001 — panel not mounted (teardown); skip
             pass
         if self._agents_open:                       # aurora m2: live panel rides along
@@ -1542,6 +1690,25 @@ class EngramApp(App):
         """Resolve the row to its on-disk transcript and arm the tail. Fail-open:
         an unresolvable row still shows the state-only card."""
         self._close_detail()
+        if row.get("kind") in ("deleg", "info"):
+            # Not an SDK task — nothing on disk to tail. A grok delegation is
+            # one-shot (its answer lands in the conversation, not a transcript);
+            # counter rows are purely informational. Show an honest still card.
+            self._detail_id = row["id"]
+            self._tail = None
+            try:
+                view = self.query_one("#agentview", RichLog)
+                view.clear()
+                view.display = True
+                if row.get("kind") == "deleg":
+                    view.write(f"[b]{escape(row['label'].strip())}[/b]\n[dim]"
+                               "cross-provider delegation · one-shot, no live "
+                               "transcript[/dim]")
+                else:
+                    view.write(f"[dim]{escape(row['label'].strip())}[/dim]")
+            except Exception:  # noqa: BLE001
+                pass
+            return
         path, how = resolve_task_file(
             row, getattr(self.driver, "cwd", ENGRAM_CWD),
             getattr(self.driver, "session_id", None))
@@ -1573,7 +1740,15 @@ class EngramApp(App):
             panel = self.query_one("#agents", OptionList)
         except Exception:  # noqa: BLE001
             return
-        self._agent_rows = agent_panel_rows(self._tasks_snapshot)
+        # aurora m3: enrich fast workflow fan-outs from disk (the heartbeat tree
+        # arrives too late for short runs) and fold in live cross-provider
+        # delegations (grok calls — tool calls, not tasks, invisible otherwise).
+        self._agent_rows = agent_panel_rows(
+            enrich_workflow_agents(self._tasks_snapshot,
+                                   getattr(self.driver, "cwd", ENGRAM_CWD),
+                                   getattr(self.driver, "session_id", None)),
+            deleg=delegations.snapshot(), frame=self._act_frame)
+        self._agents_sig = self._panel_sig()
         panel.clear_options()
         if not self._agent_rows:
             panel.add_options([Option("  (no live agents — /agent or a workflow "
@@ -1598,9 +1773,26 @@ class EngramApp(App):
                 except Exception:  # noqa: BLE001
                     pass
 
+    def _panel_sig(self):
+        """Cheap change-detector for the 0.5s panel refresh: live delegation ids +
+        finished tallies, plus a running workflow's disk agent states (which grow
+        without any task event firing). Read only while the panel is open."""
+        d = delegations.snapshot()
+        sig = (tuple(e["id"] for e in d["live"]), d["done"], d["failed"])
+        if any(t.get("workflow") and t.get("status") == "running"
+               for t in self._tasks_snapshot):
+            disk = workflow_disk_agents(getattr(self.driver, "cwd", ENGRAM_CWD),
+                                        getattr(self.driver, "session_id", None))
+            sig = (*sig, tuple((a["label"], a["state"]) for a in disk))
+        return sig
+
     def _tick_tail(self) -> None:
-        """0.5s poll of the selected agent's transcript (aurora m2) — same guarded
-        no-op pattern as _tick_activity; free while nothing is tailed."""
+        """0.5s poll (aurora m2/m3) — same guarded no-op pattern as _tick_activity.
+        First refresh the panel if live delegations or a fast workflow fan-out
+        changed under it (neither fires a task event), then tail the selected
+        agent's transcript. Free while the panel is closed and nothing is tailed."""
+        if self._agents_open and self._panel_sig() != self._agents_sig:
+            self._render_agents()
         if self._tail is None:
             return
         try:
@@ -1654,8 +1846,8 @@ class EngramApp(App):
         try:
             from fleet import render_fleet_line
             rows = self._fleet.rows() if self._fleet else []
-            self.query_one("#fleet", Static).update(
-                escape(render_fleet_line(rows)))
+            self._set_line(self.query_one("#fleet", Static),
+                           escape(render_fleet_line(rows)))
         except Exception:  # noqa: BLE001 — panel not mounted (teardown); skip
             pass
 
@@ -1713,7 +1905,7 @@ class EngramApp(App):
         """The pending type-ahead strip above the prompt — previews of queued msgs."""
         widget = self.query_one("#queued", Static)
         if not self._queue:
-            widget.update("")
+            self._set_line(widget, "")
             return
         def preview(item) -> str:
             t, atts = item
@@ -1723,7 +1915,7 @@ class EngramApp(App):
             if atts:
                 s = (s + " " if s else "") + f"📎{len(atts)}"
             return s or "(attachment)"
-        widget.update("   ".join("⏳ " + escape(preview(it)) for it in self._queue))
+        self._set_line(widget, "   ".join("⏳ " + escape(preview(it)) for it in self._queue))
 
     async def _drain_queue(self) -> None:
         """Send the oldest queued message, once the turn that scheduled this drain
@@ -1775,11 +1967,11 @@ class EngramApp(App):
                 self.driver, "plan_restore_target", REGULAR_MODE)
             self._pending_mode = None
             self._render_header()
-            await self._add(Static("[#86EFAC]✓ approved — leaving plan mode, implementing…[/]"))
+            await self._add(Static("[#5E9B73]✓ approved — leaving plan mode, implementing…[/]"))
             return {"approved": True}
         feedback = choice.get("text", "").strip() if choice.get("kind") == "text" else ""
         await self._add(Static(
-            f"[#C4B5FD]✎ keep planning{': ' + escape(feedback) if feedback else ''}[/]"))
+            f"[#7E739C]✎ keep planning{': ' + escape(feedback) if feedback else ''}[/]"))
         return {"approved": False,
                 "message": feedback or "Keep planning — don't implement yet; refine the plan."}
 
@@ -1808,7 +2000,7 @@ class EngramApp(App):
             else:
                 ans = choice.get("text", "").strip() or "(no preference — you decide)"
             records.append(f"{header or qtext or 'answer'}: {ans}")
-            await self._add(Static(f"[#67E8F9]❯ {escape(ans)}[/]"))
+            await self._add(Static(f"[#3D7A87]❯ {escape(ans)}[/]"))
         return {"message": "The user answered your question(s):\n" + "\n".join(records)}
 
     async def _await_choice(self, choices: list, hint: str = "") -> dict:
@@ -1913,7 +2105,6 @@ class EngramApp(App):
         # provenance line for them rather than falsely reporting "silent".
         self._recall_shown = agent is not None
         acc: list[str] = []
-        tools: list[str] = []
         wrote_any = False
         self._activity = agent[0] if agent else "thinking"   # aurora m1: live pulse
         try:
@@ -1937,11 +2128,9 @@ class EngramApp(App):
                     self._cur_last = ev.text
                     wrote_any = True
                 elif ev.kind == "tool":
-                    if ev.text not in tools:
-                        tools.append(ev.text)
                     self._activity = ev.text        # aurora m1: color-keyed live pulse
-                elif ev.kind == "status":          # ephemeral (sub-agent progress)
-                    self._status(f"⚙ {ev.text}…")
+                # ev.kind == "status" (sub-agent progress) is intentionally dropped — the
+                # #tasks braille snake carries live sub-agent state now (no status line).
                 elif ev.kind == "todos":
                     self._todos = (ev.data or {}).get("todos") or []
                     self._render_tasks()
@@ -1959,6 +2148,8 @@ class EngramApp(App):
             await self._break_stream()
             self._busy = False
             self._activity = ""                     # aurora m1: chrome quiets when idle
+            if agent is None:                       # aurora m6: streak a meteor when the operator's
+                self._meteor_t0 = time.monotonic()  # turn finishes (not internal sub-agent runs)
             bg_live = getattr(self.driver, "has_background_tasks", False)
             # A mode armed via shift+tab mid-reply applies now, governing the next turn —
             # unless background agents are still out: applying recycles the warm client,
@@ -1987,13 +2178,32 @@ class EngramApp(App):
                     self._fallback_shown = False
                 if not wrote_any and not self._last_reply:   # removes #convo before this runs
                     await self._add(Static("[dim]*(no text in reply)*[/dim]"))
-                self._status("🛰 background agents working — results stream in here" if bg_live
-                             else "ready" + (f"   ·   ⚙ {', '.join(tools)}" if tools else ""))
+                self._status("🛰 background agents working — results stream in here"
+                             if bg_live else "")
                 if not bg_live:
                     # The turn is over: finished sub-agents live in the transcript,
                     # not the panel (todos persist — they're session state).
                     self._tasks_snapshot = []
                     self._render_tasks()
+                # aurora m4: dev aid — ENGRAM_FAKE_COMPACT fires ONE synthetic compaction
+                # (first turn) so the marker/badge can be eyeballed without filling a
+                # 1M window; harmless when unset.
+                if os.environ.get("ENGRAM_FAKE_COMPACT") and not self._fake_compact_fired:
+                    self._fake_compact_fired = True
+                    try:
+                        self.driver.compaction_count += 1
+                    except Exception:  # noqa: BLE001 — base attr always present; be safe
+                        pass
+                # aurora m4: if the backend compacted during this turn, mark the boundary
+                # so answer-drift across it is VISIBLE, not inferred (mirrors the fallback-
+                # notice latch above). Then repaint the gauge off the live driver.
+                cc = getattr(self.driver, "compaction_count", 0)
+                if cc > self._compactions_shown:
+                    self._compactions_shown = cc
+                    await self._add(Static(
+                        f"[{_MET_HIST}]⎯⎯  context compacted (#{cc}) — history summarized "
+                        f"here; answers past this line may drift  ⎯⎯[/]"))
+                self._refresh_context_meter(len(prepend) // 4)
                 self._scroll()
             except Exception:  # noqa: BLE001 — convo/status gone (app closing); nothing to show
                 pass
@@ -2028,8 +2238,8 @@ class EngramApp(App):
                         await self._cur_stream.write(sep)
                     await self._cur_stream.write(ev.text)
                     self._cur_last = ev.text
-                elif ev.kind in ("tool", "status"):
-                    self._status(f"⚙ {ev.text}…")
+                # ev.kind in ("tool", "status"): dropped — the #tasks braille snake
+                # carries live background-agent state now (no status line).
                 elif ev.kind == "todos":
                     self._todos = (ev.data or {}).get("todos") or []
                     self._render_tasks()
@@ -2043,7 +2253,7 @@ class EngramApp(App):
             try:
                 await self._break_stream()
                 if not getattr(self.driver, "has_background_tasks", False):
-                    self._status("ready")
+                    self._status("")
                     self._tasks_snapshot = []      # last background agent landed —
                     self._render_tasks()           # the panel's job here is done
                     self._scroll()

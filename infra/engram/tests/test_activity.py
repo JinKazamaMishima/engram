@@ -9,7 +9,16 @@ import sys
 ENGRAM = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ENGRAM)
 
-from app import SPINNER, _activity_color, render_activity  # noqa: E402
+from app import (  # noqa: E402
+    _ACT_DELEG,
+    _ACT_READ,
+    _ACT_SHELL,
+    _ACT_TALK,
+    _ACT_WRITE,
+    SPINNER,
+    _activity_color,
+    render_activity,
+)
 
 
 def test_idle_is_blank():
@@ -18,18 +27,20 @@ def test_idle_is_blank():
 
 
 def test_color_by_tool_category():
-    assert _activity_color("Bash") == "#FBBF24"                       # shell = amber
-    assert _activity_color("Read") == "#67E8F9"                       # read = cyan
-    assert _activity_color("Grep") == "#67E8F9"
-    assert _activity_color("Edit") == "#86EFAC"                       # write = green
-    assert _activity_color("Agent→Explore: find callers") == "#C4B5FD"  # delegate = violet
-    assert _activity_color("Workflow→deep-research") == "#C4B5FD"
-    assert _activity_color("MysteryTool") == "#9FB9FF"               # default = blue
+    # Assert the tool→color MAPPING via the constants, not literal hexes, so palette
+    # tweaks (e.g. the night-dim pass) don't break the test.
+    assert _activity_color("Bash") == _ACT_SHELL                      # shell = amber
+    assert _activity_color("Read") == _ACT_READ                      # read = cyan
+    assert _activity_color("Grep") == _ACT_READ
+    assert _activity_color("Edit") == _ACT_WRITE                     # write = green
+    assert _activity_color("Agent→Explore: find callers") == _ACT_DELEG  # delegate = violet
+    assert _activity_color("Workflow→deep-research") == _ACT_DELEG
+    assert _activity_color("MysteryTool") == _ACT_TALK              # default = blue
 
 
 def test_thinking_and_responding_colors():
-    assert "#C4B5FD" in render_activity("thinking", 0)                # violet
-    assert "#9FB9FF" in render_activity("responding", 0)             # blue
+    assert _ACT_DELEG in render_activity("thinking", 0)              # violet
+    assert _ACT_TALK in render_activity("responding", 0)            # blue
 
 
 def test_spinner_advances_with_frame():

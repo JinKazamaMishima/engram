@@ -25,7 +25,7 @@ from agent_tail import (  # noqa: E402  (after sys.path shim, like sibling tests
     tmp_task_output,
 )
 
-CWD = "/home/user/repos/engram"
+CWD = "/home/user/proj"
 SID = "sess-1"
 
 
@@ -72,9 +72,9 @@ def _fixture(tmp):
 
 def test_path_shapes():
     p = tmp_task_output(CWD, SID, "t1", "/tmp/base")
-    assert str(p).endswith("-home-user-repos-engram/sess-1/tasks/t1.output")
+    assert str(p).endswith("-home-user-proj/sess-1/tasks/t1.output")
     s = subagents_dir(CWD, SID, "/proj")
-    assert str(s) == "/proj/-home-user-repos-engram/sess-1/subagents"
+    assert str(s) == "/proj/-home-user-proj/sess-1/subagents"
 
 
 def test_resolver_direct_symlink():
@@ -185,15 +185,72 @@ def test_panel_rows_and_card():
     ]
     rows = agent_panel_rows(tasks)
     ids = [r["id"] for r in rows]
-    assert ids == ["t1", "t2", "t2/scan:a", "t2/scan:b", "~finished"]
+    # finished tasks now show a ✓/✗ row IN PLACE (no collapsed ~finished counter)
+    assert ids == ["t1", "t2", "t2/scan:a", "t2/scan:b", "t3", "t4"]
     assert len(set(ids)) == len(ids)                       # stable + unique
     assert "12k" in rows[0]["label"] and "Grep" in rows[0]["label"]
     assert rows[2]["kind"] == "wfagent" and rows[2]["wf_index"] == 0
-    assert "✓" in rows[2]["label"] and "⏳" in rows[3]["label"]
-    assert "✓ 1 done" in rows[4]["label"] and "✗ 1 failed" in rows[4]["label"]
+    # a done child keeps its ✓; a running child now shows the braille snake, not ⏳
+    assert "✓" in rows[2]["label"] and "⠋" in rows[3]["label"] and "⏳" not in rows[3]["label"]
+    assert rows[4]["label"] == "✓ old" and rows[5]["label"] == "✗ dead"
+    assert not any(r["id"] == "~finished" for r in rows)
     card = agent_detail_card(rows[2], "heading")
     assert "scan:a" in card and "matched by heading" in card
     assert "state only" in agent_detail_card(rows[0], "none")
+
+
+def test_workflow_disk_agents():
+    # aurora m3: reconstruct a fan-out from the journal + agent-file headings,
+    # so the panel shows it before any heartbeat carries the tree.
+    from agent_tail import workflow_disk_agents
+    with tempfile.TemporaryDirectory() as tmp:
+        _tmp_base, projects = _fixture(tmp)
+        ag = workflow_disk_agents(CWD, SID, projects_base=projects)
+        assert [a["label"] for a in ag] == ["verify:alpha", "scan:beta"]
+        assert all(a["state"] == "progress" for a in ag), "no result rows yet"
+        # a result row flips just that agentId to done; journal order preserved
+        wf = subagents_dir(CWD, SID, projects) / "workflows" / "wf_x1"
+        with open(wf / "journal.jsonl", "a") as f:
+            f.write(json.dumps({"type": "result", "key": "k1",
+                                "agentId": "w001", "result": "ok"}) + "\n")
+        ag = workflow_disk_agents(CWD, SID, projects_base=projects)
+        assert ag[0]["state"] == "done" and ag[1]["state"] == "progress"
+        assert workflow_disk_agents(CWD, "no-such", projects_base=projects) == []
+
+
+def test_enrich_workflow_agents():
+    from agent_tail import enrich_workflow_agents
+    with tempfile.TemporaryDirectory() as tmp:
+        _tmp_base, projects = _fixture(tmp)
+        # empty heartbeat snapshot on a LIVE workflow → filled from disk
+        thin = [{"task_id": "wf", "workflow": True, "status": "running", "wf": {}}]
+        out = enrich_workflow_agents(thin, CWD, SID, projects_base=projects)
+        agents = out[0]["wf"]["phases"][0]["agents"]
+        assert [a["label"] for a in agents] == ["verify:alpha", "scan:beta"]
+        assert out[0]["wf"]["total"] == 2
+        # a RICHER heartbeat snapshot wins — disk does not overwrite it
+        rich = [{"task_id": "wf", "workflow": True, "status": "running",
+                 "wf": {"phases": [{"title": "Scan", "agents": [
+                     {"label": "a"}, {"label": "b"}, {"label": "c"}]}]}}]
+        assert enrich_workflow_agents(rich, CWD, SID,
+                                      projects_base=projects)[0] is rich[0]
+        # terminal workflows are never enriched (the run is over)
+        done = [{"task_id": "wf", "workflow": True, "status": "completed", "wf": {}}]
+        assert enrich_workflow_agents(done, CWD, SID,
+                                      projects_base=projects)[0] is done[0]
+
+
+def test_panel_rows_delegations():
+    deleg = {"live": [{"id": 7, "label": "grok·low", "model": "grok-4.5"}],
+             "done": 2, "failed": 1, "cost": 0.61}
+    rows = agent_panel_rows([], deleg=deleg)
+    assert [r["id"] for r in rows] == ["deleg/7", "~deleg"]
+    assert rows[0]["kind"] == "deleg" and "📡" in rows[0]["label"]
+    assert "grok·low" in rows[0]["label"] and "grok-4.5" in rows[0]["label"]
+    assert rows[1]["kind"] == "info"
+    assert "✓ 2 done" in rows[1]["label"] and "✗ 1 failed" in rows[1]["label"]
+    assert "$0.61" in rows[1]["label"]
+    assert agent_panel_rows([]) == [], "no deleg + no tasks → empty"
 
 
 if __name__ == "__main__":
