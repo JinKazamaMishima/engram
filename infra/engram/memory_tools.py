@@ -120,11 +120,11 @@ def build_code_tools(cwd: Path | str) -> list:
     return [code_search]
 
 
-def build_recall_server(cwd: Path | str):
-    """The in-process MCP server ('recall') with the memory tools + the sonar
-    ``code_search`` tool, all bound to ``cwd``'s project corpus + the shared soul.
-    Returns None if the SDK server can't be built — the caller treats memory tools
-    as optional."""
+def build_recall_tools(cwd: Path | str) -> list:
+    """The ``recall_search`` + ``recall_read_note`` tools + the sonar ``code_search``
+    tool, bound to ``cwd``'s project corpus + the shared soul. Shared source for both
+    the SDK server (below) and the envoy native loop, so both drive the SAME handlers
+    — no drift."""
     project_dir = Path(cwd)
 
     def _scopes() -> list:
@@ -188,9 +188,14 @@ def build_recall_server(cwd: Path | str):
         except Exception as exc:  # noqa: BLE001 — fail open, model routes around
             return _err(f"memory unavailable: {type(exc).__name__}: {exc}")
 
+    return [recall_search, recall_read_note, *build_code_tools(project_dir)]
+
+
+def build_recall_server(cwd: Path | str):
+    """The in-process MCP server ('recall') wrapping build_recall_tools. Returns None
+    if the SDK server can't be built — the caller treats memory tools as optional."""
     try:
         return create_sdk_mcp_server(name="recall", version="1.0.0",
-                                     tools=[recall_search, recall_read_note,
-                                            *build_code_tools(project_dir)])
+                                     tools=build_recall_tools(cwd))
     except Exception:  # noqa: BLE001 — memory tools are strictly optional
         return None

@@ -117,18 +117,27 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # Known model families, so the UI can tell a fallback apart from the primary even
 # though one side is an alias ("fable", "opus[1m]") and the other the resolved id
 # the SDK reports back ("claude-fable-5", "claude-opus-4-8"). Order matters only if
-# an id ever contained two — it won't.
-_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+# an id ever contained two — it won't. "grok" is the non-Anthropic backend (broker):
+# a grok id routes to the GrokDriver instead of the Claude Agent SDK, so both the
+# header (family display) and the driver-selection seam read it from this one list.
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable", "grok")
 
 
 def _model_family(name: Optional[str]) -> Optional[str]:
     """The family token in a model alias OR a resolved id ('opus'/'sonnet'/
-    'haiku'/'fable'), else None — lets configured-vs-actual be compared across the
-    alias/id boundary without a lookup table."""
+    'haiku'/'fable'/'grok'), else None — lets configured-vs-actual be compared across
+    the alias/id boundary without a lookup table."""
     if not name:
         return None
     low = str(name).lower()
     return next((f for f in _MODEL_FAMILIES if f in low), None)
+
+
+def _is_grok(name: Optional[str]) -> bool:
+    """True if this model id/alias names the Grok (xAI) backend — the driver-selection
+    predicate. A grok id swaps the harness onto the native GrokDriver (broker m5);
+    every other id stays on the Claude Agent SDK. Single source: the 'grok' family."""
+    return _model_family(name) == "grok"
 
 # Permission modes Engram cycles between with shift+tab, like Claude Code. "Regular" =
 # bypassPermissions (Engram acts freely; the persona is the only guardrail). "Plan" =
@@ -731,14 +740,11 @@ class AgentSDKDriver(ModelDriver):
         # with (the ambient hook only pushes titles). Built once and reused across
         # our disconnect→reconnect recycles; strictly optional (fail-open).
         self.mcp_servers: dict = {}
-        if os.environ.get("ENGRAM_RECALL_TOOLS", "1") != "0":
-            try:
-                from memory_tools import build_recall_server
-                srv = build_recall_server(self.cwd)
-                if srv is not None:
-                    self.mcp_servers["recall"] = srv
-            except Exception:  # noqa: BLE001 — memory tools must never block launch
-                pass
+        try:
+            from engram_mcp import build_servers
+            self.mcp_servers = build_servers(self.cwd)
+        except Exception:  # noqa: BLE001 — tools must never block launch
+            pass
 
     def _options(self) -> ClaudeAgentOptions:
         opts = dict(
