@@ -14,6 +14,7 @@ TARGET = date(2026, 6, 24)
 def _setup(tmp_path, monkeypatch):
     monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
     monkeypatch.delenv("RECALL_GLOBAL_DIR", raising=False)
+    monkeypatch.delenv("RECALL_COGITO_SELF_NAMES_FILE", raising=False)
 
 
 def _buffer_row(seq, role, text, *, ts=f"{TARGET.isoformat()}T15:00:00+00:00"):
@@ -170,3 +171,117 @@ def test_calibration_report_triggers_once_at_threshold(tmp_path, monkeypatch):
                   name="third-convo")
     _run(monkeypatch, notify=notify)                               # latch: no second report
     assert len(pings) == 1
+
+
+# ---- integrity guards: anti-contamination armor ------------------------------
+
+def test_degenerate_self_names_flags_stopwords_and_shorties():
+    assert cogito.degenerate_self_names(("the",)) == ["the"]        # the 2026-07 bug
+    assert cogito.degenerate_self_names(("Nova", "I", "  ")) == ["I", "  "]
+    assert cogito.degenerate_self_names(("Nova", "the system", "the assistant")) == []
+
+
+def test_matched_name_returns_the_hit(monkeypatch):
+    monkeypatch.setattr(cogito, "SELF_NAMES", ("Nova", "the system"))
+    assert cogito.matched_name("The system retried it.").lower() == "the system"
+    assert cogito.matched_name("The operator shipped it.") is None
+
+
+def test_run_refuses_degenerate_self_name(tmp_path, monkeypatch):
+    """A bare-stopword self-name (the 2026-07 'the' contamination) must abort the
+    run loudly before any tracing, never silently generate noise."""
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(cogito, "SELF_NAMES", ("Nova", "the"))
+    _write_buffer([_buffer_row(1, "assistant", "Easy yes on the instinct.")])
+    pings = []
+    out = _run(monkeypatch, notify=lambda **kw: pings.append(kw) or True)
+    assert out.kind == "failed" and out.reason == "degenerate_self_name"
+    assert "the" in out.detail
+    assert pings and pings[0]["priority"] == "high"                # paged loudly
+    assert not cogito.trace_path().exists()                        # nothing traced
+
+
+def test_run_match_rate_gate_refuses_saturating_name(tmp_path, monkeypatch):
+    """Backstop: a non-stopword self-name that still matches too much prose is
+    degenerate whatever its source; refuse before spawning the judge or writing."""
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(cogito, "SELF_NAMES", ("Nova",))
+    monkeypatch.setattr(cogito, "_GATE_MIN_SENTS", 4)              # small sample for test
+    _write_buffer([_buffer_row(1, "assistant",
+                               "Nova ran. Nova ran. Sam ran. Lee ran.")])   # 50% > 20%
+    judge = _FakeJudge({"Nova": "SPEAKER"})
+    pings = []
+    out = _run(monkeypatch, judge=judge,
+               notify=lambda **kw: pings.append(kw) or True)
+    assert out.kind == "failed" and out.reason == "self_name_too_common"
+    assert judge.started == 0                                      # bailed before the judge
+    assert pings and pings[0]["priority"] == "high"
+    assert not cogito.trace_path().exists()
+
+
+def test_run_match_rate_gate_abstains_on_small_sample(tmp_path, monkeypatch):
+    """Below the sample floor a rate is too noisy to judge -- the gate abstains so
+    a real self-name on a quiet day is never falsely flagged."""
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(cogito, "SELF_NAMES", ("Nova",))          # floor stays at 50
+    _write_buffer([_buffer_row(1, "assistant", "Nova shipped it. Nova tested it.")])
+    out = _run(monkeypatch, judge=_FakeJudge({"Nova": "SPEAKER"}))
+    assert out.kind == "traced"                                   # 2 sentences < floor
+
+
+def test_name_route_rows_record_which_name_matched(tmp_path, monkeypatch):
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(cogito, "SELF_NAMES", ("Nova",))
+    _write_buffer([_buffer_row(1, "assistant",
+                               "I'll commit it. Nova's palate liked it.")])
+    _run(monkeypatch, judge=_FakeJudge({"palate": "SPEAKER"}))
+    rows = [json.loads(x) for x in cogito.trace_path().read_text().splitlines()]
+    regex_row = next(r for r in rows if r["via"] == "regex")
+    judge_row = next(r for r in rows if r["via"] == "judge")
+    assert "matched" not in regex_row                             # first-person: no name
+    assert judge_row["matched"].lower() == "nova"                 # name route: records hit
+
+
+# ---- layer 4: self-names from a JSON file (the robust channel) ---------------
+
+def test_self_names_from_json_file_survive_spaces(tmp_path, monkeypatch):
+    """A space-containing name in a JSON array loads intact -- the channel that
+    can't be truncated the way the unquoted systemd env value was."""
+    f = tmp_path / "self_names.json"
+    f.write_text(json.dumps(["Nova", "the system", "the assistant"]))
+    monkeypatch.setenv("RECALL_COGITO_SELF_NAMES_FILE", str(f))
+    monkeypatch.delenv("RECALL_COGITO_SELF_NAMES", raising=False)
+    assert cogito.load_self_names() == ("Nova", "the system", "the assistant")
+    assert cogito.self_names_file_problem() is None
+
+
+def test_self_names_file_takes_precedence_over_comma_env(tmp_path, monkeypatch):
+    f = tmp_path / "self_names.json"
+    f.write_text(json.dumps(["Nova"]))
+    monkeypatch.setenv("RECALL_COGITO_SELF_NAMES_FILE", str(f))
+    monkeypatch.setenv("RECALL_COGITO_SELF_NAMES", "should,be,ignored")
+    assert cogito.load_self_names() == ("Nova",)
+
+
+def test_broken_self_names_file_is_a_loud_problem(tmp_path, monkeypatch):
+    bad = tmp_path / "broken.json"
+    bad.write_text("{not json")
+    monkeypatch.setenv("RECALL_COGITO_SELF_NAMES_FILE", str(bad))
+    assert cogito.self_names_file_problem() is not None            # malformed
+    monkeypatch.setenv("RECALL_COGITO_SELF_NAMES_FILE", str(tmp_path / "nope.json"))
+    assert cogito.self_names_file_problem() is not None            # absent
+    monkeypatch.delenv("RECALL_COGITO_SELF_NAMES_FILE", raising=False)
+    assert cogito.self_names_file_problem() is None                # unset: fine
+
+
+def test_run_refuses_when_configured_self_names_file_is_broken(tmp_path, monkeypatch):
+    """A configured-but-broken source fails loud rather than silently running on
+    fallback names that drop the operator's real self-names."""
+    _setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("RECALL_COGITO_SELF_NAMES_FILE", str(tmp_path / "missing.json"))
+    _write_buffer([_buffer_row(1, "assistant", "Nova shipped it.")])
+    pings = []
+    out = _run(monkeypatch, notify=lambda **kw: pings.append(kw) or True)
+    assert out.kind == "failed" and out.reason == "self_names_file"
+    assert pings and pings[0]["priority"] == "high"
+    assert not cogito.trace_path().exists()

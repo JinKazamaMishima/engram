@@ -32,10 +32,13 @@ WorkingDirectory=__ENGRAM_HOME__
 Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 EnvironmentFile=-%h/.config/recall/telegram.env
-# Cogito m1 — instrument config (kept out of code). Uncomment + point at a
-# pinned local GGUF judge (a different model family than the assistant) and
-# a llama.cpp server binary; without them, hard cases land as "unjudged".
-#Environment=RECALL_COGITO_SELF_NAMES=the assistant,the system
+# Cogito — instrument config (kept out of code). Uncomment + point at a pinned
+# local GGUF judge (a different model family than the assistant) and a llama.cpp
+# server binary; without them, hard cases land as "unjudged". Self-names go in a
+# JSON FILE, not an inline value: an unquoted space-containing Environment= value
+# is whitespace-split by systemd (e.g. "Nova,the system,..." truncated to
+# "Nova,the"), which silently poisons the trace; a path has no spaces to split.
+#Environment=RECALL_COGITO_SELF_NAMES_FILE=/home/user/.local/share/recall/cogito/self_names.json
 #Environment=RECALL_COGITO_JUDGE_GGUF=/home/user/models/gemma-3-1b-it-Q4_K_M.gguf
 #Environment=RECALL_COGITO_LLAMA_BIN=/home/user/llama.cpp/llama-server
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall doctor --notify
