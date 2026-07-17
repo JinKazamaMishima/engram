@@ -521,6 +521,12 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "code-build-all":
         from recall import registry
         return registry.code_build_all(argv[1:])
+    if argv and argv[0] == "reap":
+        from recall import reap
+        return reap.main(argv[1:])
+    if argv and argv[0] == "reap-all":
+        from recall import registry
+        return registry.reap_all(argv[1:])
     args = build_parser().parse_args(argv)
     return args.func(args)
 

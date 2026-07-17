@@ -24,6 +24,12 @@ Instrument integrity (the Goodhart armor):
     different model family, pinned by file, prompt frozen in this module;
   - when the judge is unavailable the hard cases are recorded as "unjudged",
     never silently guessed;
+  - self-name integrity (anti-contamination armor): a self-name that is a bare
+    stopword or matches an implausible fraction of ordinary prose is degenerate
+    -- it turns the instrument into a noise generator (the 2026-07 'the'
+    incidents) -- so the run REFUSES loudly rather than trace or report against
+    it, via an a-priori stopword tripwire AND an empirical per-name match-rate
+    gate; every name-route record also carries which self-name matched it;
   - every record carries how it was decided (via regex|judge|unjudged);
   - pre-registered definitions (frozen before any trend is read): FIRST counts
     singular first person only (I-words + Spanish "soy"); "we" is excluded as
@@ -37,9 +43,12 @@ corrected labels become the frozen gold set. The report generates once (its
 file is the latch) and pages low-priority.
 
 Config (all env; the systemd unit carries machine-local values so none live in
-code): RECALL_COGITO_SELF_NAMES (comma list; default "the system,the
-assistant"), RECALL_COGITO_JUDGE_GGUF + RECALL_COGITO_LLAMA_BIN (both required
-for the judge to spawn), RECALL_COGITO_JUDGE_PORT (default 8384),
+code): RECALL_COGITO_SELF_NAMES_FILE (path to a JSON array of names -- the
+robust channel, since a space-containing name like "the system" lives as a JSON
+string and can't be truncated the way an unquoted systemd Environment= value is)
+takes precedence over RECALL_COGITO_SELF_NAMES (comma list; default "the
+system,the assistant"); RECALL_COGITO_JUDGE_GGUF + RECALL_COGITO_LLAMA_BIN (both
+required for the judge to spawn), RECALL_COGITO_JUDGE_PORT (default 8384),
 RECALL_COGITO_REPORT_AT (default 100).
 
 Usage:
@@ -72,10 +81,75 @@ REPORT_AT = int(os.environ.get("RECALL_COGITO_REPORT_AT", "100"))
 JUDGE_GGUF = os.environ.get("RECALL_COGITO_JUDGE_GGUF", "")
 LLAMA_BIN = os.environ.get("RECALL_COGITO_LLAMA_BIN", "")
 JUDGE_PORT = int(os.environ.get("RECALL_COGITO_JUDGE_PORT", "8384"))
-SELF_NAMES = tuple(
-    x.strip() for x in
-    os.environ.get("RECALL_COGITO_SELF_NAMES",
-                   "the system,the assistant").split(",") if x.strip())
+def load_self_names() -> tuple[str, ...]:
+    """Resolve the self-name list. Precedence: a JSON-array FILE
+    (RECALL_COGITO_SELF_NAMES_FILE) > the comma env (RECALL_COGITO_SELF_NAMES) >
+    a generic default. The file is the robust channel -- a space-containing name
+    like "the system" lives as a JSON string, so it can NEVER be truncated by
+    systemd's whitespace-splitting Environment= parsing (the 2026-07 root cause,
+    where an unquoted value silently became just the bare article "the"). A
+    missing/malformed file falls through here; ``self_names_file_problem`` turns a
+    *configured-but-broken* file into a loud refusal at run time instead."""
+    path = os.environ.get("RECALL_COGITO_SELF_NAMES_FILE", "").strip()
+    if path:
+        try:
+            data = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, list):
+            names = tuple(str(x).strip() for x in data if str(x).strip())
+            if names:
+                return names
+    return tuple(
+        x.strip() for x in
+        os.environ.get("RECALL_COGITO_SELF_NAMES",
+                       "the system,the assistant").split(",") if x.strip())
+
+
+def self_names_file_problem() -> str | None:
+    """If RECALL_COGITO_SELF_NAMES_FILE is set but is not a readable, non-empty
+    JSON array of names, the problem string; else None. A configured source that
+    won't load must fail LOUD -- never silently fall back to a default that drops
+    the operator's real self-names (read the value, don't let a prior infer it)."""
+    path = os.environ.get("RECALL_COGITO_SELF_NAMES_FILE", "").strip()
+    if not path:
+        return None
+    try:
+        data = json.loads(Path(path).read_text())
+    except OSError as e:
+        return f"{path!r} unreadable ({e.__class__.__name__})"
+    except json.JSONDecodeError:
+        return f"{path!r} is not valid JSON"
+    if not isinstance(data, list) or not [x for x in data if str(x).strip()]:
+        return f"{path!r} is not a non-empty JSON array of names"
+    return None
+
+
+SELF_NAMES = load_self_names()
+
+# Anti-contamination guards. A self-name that matches a large fraction of
+# ordinary prose silently turns the instrument into a noise generator: on
+# 2026-07-13/07-14 an unquoted systemd Environment= value truncated the
+# self-name list at the first space, leaving the bare article "the" -- which
+# matched 53.8% of one day's assistant sentences -- and the pipeline shipped the
+# noise as a "ready" calibration report. These guards live in the CODE (not the
+# deployment) so no config mistake can poison the trace silently again.
+#   - _NAME_STOPWORDS: an a-priori tripwire -- a bare article/pronoun/conjunction
+#     is never a legitimate self-name; rejected at run start, loudly.
+#   - _MAX_NAME_RATE: the empirical backstop -- any self-name matching more than
+#     this fraction of scanned assistant sentences is degenerate whatever its
+#     source. Measured margin is wide: real self-names touch <5% of prose (a
+#     genuine name ~3.7%, "the system"/"the assistant" ~0.2%), a bare stopword
+#     ~50%+ ("the" 53.8%).
+#   - _GATE_MIN_SENTS: below this sample size a rate is too noisy to judge, so
+#     the match-rate gate abstains; the stopword tripwire still applies.
+_NAME_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "at", "by",
+    "is", "it", "as", "be", "we", "i", "he", "she", "they", "you", "that",
+    "this", "for", "with", "our", "us", "me", "my", "was", "are", "not",
+})
+_MAX_NAME_RATE = 0.20
+_GATE_MIN_SENTS = 50
 
 # Pre-registered FIRST markers: singular first person + Spanish first-person
 # copula (the assistant self-identifies in Spanish to third parties). "we"/"our"
@@ -111,6 +185,23 @@ def report_path() -> Path:
 def _name_re() -> re.Pattern:
     alts = "|".join(re.escape(n) for n in SELF_NAMES)
     return re.compile(rf"\b(?:{alts})\b", re.I)
+
+
+def matched_name(sentence: str) -> str | None:
+    """The self-name text that flagged this sentence as a name-route candidate,
+    recorded on the row so contamination is auditable at a glance (no re-deriving
+    the match after the fact). None if nothing matched."""
+    m = _name_re().search(sentence)
+    return m.group(0) if m else None
+
+
+def degenerate_self_names(names) -> list[str]:
+    """Self-names that can never be legitimate -- empty, too short to be a name,
+    or a bare stopword. A non-empty return means the instrument is misconfigured
+    and must refuse to run rather than trace noise (a-priori tripwire; the
+    empirical match-rate gate in ``run`` is the backstop for the rest)."""
+    return [n for n in names
+            if len(n.strip()) < 3 or n.strip().lower() in _NAME_STOPWORDS]
 
 
 def split_sentences(text: str) -> list[str]:
@@ -272,9 +363,10 @@ def _write_calibration_report(rows: list[dict], out: Path, *, at: int) -> None:
     ]
     for i, r in enumerate(take, 1):
         sent = str(r.get("sentence", "")).replace("\n", " ")
+        hit = f" matched={r['matched']!r}" if r.get("matched") else ""
         lines.append(
-            f"{i:3}. [{r.get('stance', '?'):8}] via={r.get('via', '?'):8} "
-            f"{r.get('date', '?')} `{sent[:140]}`\n     gold: \n")
+            f"{i:3}. [{r.get('stance', '?'):8}] via={r.get('via', '?'):8}"
+            f"{hit} {r.get('date', '?')} `{sent[:140]}`\n     gold: \n")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("".join(lines))
 
@@ -315,6 +407,33 @@ def run(argv: list[str] | None = None, *,
     since = datetime.combine(target, datetime.min.time(), tzinfo=ET)
     until = since + timedelta(days=1)
 
+    # Guard (source integrity): a configured self-names file that won't load must
+    # fail loud, never silently run on fallback names that drop the real ones.
+    problem = self_names_file_problem()
+    if problem:
+        detail = (f"self-names file is set but broken: {problem} -- refusing to "
+                  f"run on fallback names rather than the configured ones")
+        notify(title="[cogito] refusing to run -- self-names file broken",
+               body=detail, priority="high")
+        o = Outcome(kind="failed", reason="self_names_file",
+                    detail=detail, exit_code=1)
+        _print(o)
+        return o
+
+    # Guard (a-priori): a stopword / too-short self-name is never legitimate.
+    # Refuse loudly before touching the buffer rather than trace noise.
+    bad = degenerate_self_names(SELF_NAMES)
+    if bad:
+        detail = (f"self-name(s) {bad} are degenerate (a bare stopword or too "
+                  f"short) -- the instrument is misconfigured and will not trace "
+                  f"noise; fix RECALL_COGITO_SELF_NAMES")
+        notify(title="[cogito] refusing to run -- degenerate self-name",
+               body=detail, priority="high")
+        o = Outcome(kind="failed", reason="degenerate_self_name",
+                    detail=detail, exit_code=1)
+        _print(o)
+        return o
+
     buf_dir = config.engram_buffer_dir()
     if not buf_dir.is_dir():
         o = Outcome(kind="skipped", reason="no_buffer",
@@ -326,12 +445,21 @@ def run(argv: list[str] | None = None, *,
     candidates: list[tuple[str, str, str, str]] = []   # (key, convo, ts, sentence)
     seen = _existing_keys(trace_path())
     turns = 0
+    # Denominator + per-name hit counts for the match-rate gate below: how much
+    # of ALL scanned prose each self-name touches (not just the candidates).
+    name_res = {n: re.compile(rf"\b{re.escape(n)}\b", re.I) for n in SELF_NAMES}
+    total_sents = 0
+    name_hits = {n: 0 for n in SELF_NAMES}
     for buf in sorted(buf_dir.glob("*.jsonl")):
         for ex in iter_buffer_exchanges(buf, since=since, until=until):
             if ex.role != "assistant":
                 continue
             turns += 1
             for sent in split_sentences(ex.text):
+                total_sents += 1
+                for n, rx in name_res.items():
+                    if rx.search(sent):
+                        name_hits[n] += 1
                 if prefilter(sent) is None:
                     continue
                 ts = ex.ts.isoformat() if ex.ts else ""
@@ -357,6 +485,26 @@ def run(argv: list[str] | None = None, *,
             _print(o)
             return o
 
+    # Guard (empirical backstop): a self-name matching an implausible fraction
+    # of ordinary prose is degenerate whatever its source (env truncation, a
+    # typo, a stopword the tripwire missed). Refuse -- do not append candidates
+    # or generate a report against a poisoned name. Abstains on tiny samples.
+    if total_sents >= _GATE_MIN_SENTS:
+        hot = [(n, name_hits[n] / total_sents) for n in SELF_NAMES
+               if name_hits[n] / total_sents > _MAX_NAME_RATE]
+        if hot:
+            worst = ", ".join(f"{n!r}={r:.0%}" for n, r in sorted(
+                hot, key=lambda x: -x[1]))
+            detail = (f"self-name(s) {worst} matched >{_MAX_NAME_RATE:.0%} of "
+                      f"{total_sents} scanned sentences -- degenerate, refusing "
+                      f"to trace; fix RECALL_COGITO_SELF_NAMES")
+            notify(title="[cogito] refusing to run -- self-name matches too much "
+                         "prose", body=detail, priority="high")
+            o = Outcome(kind="failed", reason="self_name_too_common",
+                        detail=detail, exit_code=1)
+            _print(o)
+            return o
+
     if args.dry_run:
         o = Outcome(kind="skipped", reason="dry_run",
                     detail=f"{turns} turn(s), {len(candidates)} new candidate(s); "
@@ -378,10 +526,12 @@ def run(argv: list[str] | None = None, *,
             if res is None:
                 continue
             stance, via = res
+            row = {"key": key, "date": target.isoformat(), "convo": convo,
+                   "ts": ts, "sentence": sent, "stance": stance, "via": via}
+            if via != "regex":                       # name-route: record what matched
+                row["matched"] = matched_name(sent)
             rows_out.append(json.dumps(
-                {"key": key, "date": target.isoformat(), "convo": convo,
-                 "ts": ts, "sentence": sent, "stance": stance, "via": via},
-                separators=(",", ":"), sort_keys=True))
+                row, separators=(",", ":"), sort_keys=True))
         if rows_out:
             cogito_dir().mkdir(parents=True, exist_ok=True)
             with trace_path().open("a") as f:

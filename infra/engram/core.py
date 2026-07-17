@@ -1313,7 +1313,8 @@ class AgentSDKDriver(ModelDriver):
                 yield self._task_upd(msg.task_id, name=name, desc=msg.description,
                                      status="running",
                                      background=msg.task_id in self._bg_tasks,
-                                     workflow=True if is_wf else None)
+                                     workflow=True if is_wf else None,
+                                     tool_use_id=getattr(msg, "tool_use_id", None))
             elif isinstance(msg, TaskProgressMessage):
                 name = self._task_names.get(msg.task_id, "sub-agent")
                 tot = (getattr(msg, "usage", None) or {}).get("total_tokens")
@@ -1508,7 +1509,9 @@ class AgentSDKDriver(ModelDriver):
         Event (front-ends re-render their panel from ``data["tasks"]``; the
         human narration still flows as text/status events)."""
         entry = self.tasks.setdefault(
-            task_id, {"name": self._task_names.get(task_id, "sub-agent"),
+            task_id, {"task_id": task_id,   # rides every snapshot → front-ends can
+                      # resolve the on-disk transcript (aurora m2 live tail)
+                      "name": self._task_names.get(task_id, "sub-agent"),
                       "desc": "", "status": "running"})
         entry.update({k: v for k, v in fields.items() if v is not None})
         # Copy the entries: each Event must be a point-in-time snapshot, not an
@@ -1586,7 +1589,8 @@ class AgentSDKDriver(ModelDriver):
                                     f" — {msg.description}*\n\n")
                 yield self._task_upd(msg.task_id, name=name, desc=msg.description,
                                      status="running", background=bg,
-                                     workflow=True if is_wf else None)
+                                     workflow=True if is_wf else None,
+                                     tool_use_id=getattr(msg, "tool_use_id", None))
             elif isinstance(msg, TaskProgressMessage):
                 name = self._task_names.get(msg.task_id, "sub-agent")
                 tot = (getattr(msg, "usage", None) or {}).get("total_tokens")

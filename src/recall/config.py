@@ -90,6 +90,16 @@ def project_corpus_dir(project_dir: str | Path) -> Path:
     return Path(project_dir).resolve() / PROJECT_CORPUS_RELPATH
 
 
+def archive_dir(corpus_dir: str | Path) -> Path:
+    """The reversible graveyard for a corpus: ``<corpus>/archive``. The reaper
+    (``recall reap``) MOVES cold/superseded notes here. Because the note loaders
+    glob non-recursively (``glob("*.md")``), an archived note drops out of the
+    rebuilt index automatically while staying in the same repo — still on disk,
+    still ``cat``-able (so the miss-log can catch a wrong eviction), one
+    ``reap --restore`` from coming back."""
+    return Path(corpus_dir) / "archive"
+
+
 def ensure_dirs(*paths: Path) -> None:
     for p in paths:
         Path(p).mkdir(parents=True, exist_ok=True)

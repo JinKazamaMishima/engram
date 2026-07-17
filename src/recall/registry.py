@@ -303,3 +303,41 @@ def code_build_all(argv: list[str] | None = None, *,
                   file=sys.stderr)
             rc = 1
     return rc
+
+
+def reap_all(argv: list[str] | None = None) -> int:
+    """Nightly reaper for the global soul corpus + every registered project:
+    archive superseded + cold notes out of the live set (a reversible move to
+    ``archive/``, so the index shrinks but nothing is deleted). Deterministic +
+    GPU-free; one scope's failure doesn't stop the others. The overall code is
+    non-zero if any failed."""
+    from recall import reap
+    ap = argparse.ArgumentParser(prog="recall reap-all")
+    ap.add_argument("--date", default=None)
+    ap.add_argument("--commit", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--max-per-run", type=int, default=None)
+    a = ap.parse_args(argv)
+
+    def _flags(base: list[str]) -> list[str]:
+        if a.date:
+            base += ["--date", a.date]
+        if a.commit:
+            base.append("--commit")
+        if a.dry_run:
+            base.append("--dry-run")
+        if a.max_per_run is not None:
+            base += ["--max-per-run", str(a.max_per_run)]
+        return base
+
+    rc = 0
+    print("\n=== reap global ===", flush=True)
+    if reap.run(_flags(["--scope", "global"])).exit_code != 0:
+        rc = 1
+    for d in list_projects():
+        print(f"\n=== reap {d.name} ({d}) ===", flush=True)
+        if reap.run(
+                _flags(["--scope", "project", "--project-dir", str(d)])
+        ).exit_code != 0:
+            rc = 1
+    return rc
