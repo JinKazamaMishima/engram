@@ -151,6 +151,69 @@ def _cmd_query(args) -> int:
     return 0
 
 
+def _code_scope(args) -> tuple[str, Path, Path]:
+    """(slug, repo_dir, db_path) for a ``code-*`` command — always project-scoped
+    (code indices are per-repo; there is no shared/global code corpus)."""
+    repo = Path(args.project).resolve() if args.project else Path.cwd()
+    slug = config.project_slug(repo)
+    db = (Path(args.db).resolve() if getattr(args, "db", None)
+          else config.code_index_path(slug))
+    return slug, repo, db
+
+
+def _cmd_code_build(args) -> int:
+    from recall import code_index
+    slug, repo, db = _code_scope(args)
+    files = code_index.iter_source_files(repo)
+    # Daemon-first, like `recall build`: reuse the ONE warm embedder; only load
+    # in-process when the daemon is down (the GPU is free then). Nothing to embed
+    # -> keyword-only index (a later rebuild WITH a model adds semantic search).
+    embedder = None
+    mode = "keyword-only"
+    if files:
+        try:
+            from recall.index import DaemonEmbedder, best_embedder
+            embedder = best_embedder()
+            mode = ("keyword+semantic (daemon)"
+                    if isinstance(embedder, DaemonEmbedder)
+                    else "keyword+semantic (in-process)")
+        except ImportError:
+            print("[recall] semantic models not installed — building a keyword-only "
+                  "code index (FTS5).", file=sys.stderr)
+    n = code_index.build_code_index(repo, db, embedder)
+    print(f"[recall] indexed {n} code chunks from {len(files)} files in {repo} "
+          f"-> {db}  (scope: {slug}, {mode})")
+    return 0
+
+
+def _cmd_code_query(args) -> int:
+    from recall import index
+    slug, _repo, db = _code_scope(args)
+    if not db.exists():
+        print(f"[recall] no code index yet for {slug} — run `recall code-build` first.",
+              file=sys.stderr)
+        return 1
+    qvec = None
+    if not args.no_vec:
+        try:
+            from recall.index import best_embedder
+            qvec = best_embedder().embed([args.text], is_query=True)[0]
+        except ImportError:
+            print("[recall] semantic models not installed — keyword-only search "
+                  "(pass --no-vec to silence this).", file=sys.stderr)
+    conn = index._connect(db, read_only=True)
+    try:
+        hits = index.search(conn, args.text, query_vector=qvec, k=args.k,
+                            corpus_label="code", sem_floor=args.sem_floor)
+    finally:
+        conn.close()
+    for i, h in enumerate(hits, 1):
+        print(f"{i}. [{h.score:.4f}] {h.slug} — {h.description}")
+    if not hits:
+        print("(no matches)")
+    return 0
+
+
 def _cmd_paths(args) -> int:
     project = Path(args.project).resolve() if args.project else Path.cwd()
     slug = config.project_slug(project)
@@ -193,6 +256,25 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--rerank", action="store_true",
                    help="cross-encoder rerank the fused top-N (loads the reranker)")
     q.set_defaults(func=_cmd_query)
+
+    cb = sub.add_parser("code-build",
+                        help="(sonar) build the semantic index over this repo's source")
+    cb.add_argument("--project", default=None, help="repo dir (default: cwd)")
+    cb.add_argument("--db", default=None, help="override the code index DB path")
+    cb.set_defaults(func=_cmd_code_build)
+
+    cq = sub.add_parser("code-query",
+                        help="(sonar) hybrid search over this repo's source")
+    cq.add_argument("text")
+    cq.add_argument("--project", default=None, help="repo dir (default: cwd)")
+    cq.add_argument("--db", default=None, help="override the code index DB path")
+    cq.add_argument("-k", type=int, default=8)
+    cq.add_argument("--no-vec", action="store_true",
+                    help="keyword-only (skip the model)")
+    cq.add_argument("--sem-floor", type=float, default=0.0,
+                    help="drop hits below this cos(query,chunk) (default 0 = off; "
+                         "the note index uses 0.40 but code wants its own tuning)")
+    cq.set_defaults(func=_cmd_code_query)
 
     pa = sub.add_parser("paths", help="print resolved corpus/index paths")
     pa.add_argument("--project", default=None)
@@ -436,6 +518,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "reconsolidate-all":
         from recall import registry
         return registry.reconsolidate_all(argv[1:])
+    if argv and argv[0] == "code-build-all":
+        from recall import registry
+        return registry.code_build_all(argv[1:])
     args = build_parser().parse_args(argv)
     return args.func(args)
 

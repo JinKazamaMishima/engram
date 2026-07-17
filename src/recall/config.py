@@ -76,6 +76,15 @@ def index_path(scope: str) -> Path:
     return index_dir() / f"{scope}.sqlite"
 
 
+def code_index_path(scope: str) -> Path:
+    """Derived CODE index DB for a scope id (a project slug) — the sonar semantic
+    index over a repo's SOURCE, sibling to :func:`index_path`'s note index and
+    rebuilt the same disposable way. Kept in a SEPARATE file so code chunks never
+    touch the note corpus, its eval, or the injection tier: it exists only to be
+    pulled on demand by the ``code_search`` tool."""
+    return index_dir() / f"{scope}.code.sqlite"
+
+
 def project_corpus_dir(project_dir: str | Path) -> Path:
     """Convention for a project's own corpus: ``<project>/docs/knowledge``."""
     return Path(project_dir).resolve() / PROJECT_CORPUS_RELPATH
