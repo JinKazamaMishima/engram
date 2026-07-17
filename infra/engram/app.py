@@ -206,7 +206,7 @@ MODELS = (
 # Sticky-header palette (Rich-markup hex, matching ENGRAM_THEME — Static markup can't
 # see Textual's $accent vars). The logo is a pixel gem (half-block "pixels") — the
 # star Engram is named for. Later this header area can swap to a pixel-rendered face.
-LOGO_C = "#67E8F9"   # cyan — the star's glint
+LOGO_C = "#3D7A87"   # cyan — the star's glint
 NAME_C = "#E8ECF8"   # starlight
 SUB_C = "#8593B8"    # muted
 ENGRAM_LOGO = ("█   █", " █ █ ", "  █  ")
@@ -215,8 +215,18 @@ ENGRAM_LOGO = ("█   █", " █ █ ", "  █  ")
 # flickers each tick (a gentle ~0.7s timer). Movement, kept subtle.
 STAR_GLYPHS = ("·", "✦", "✧", "⋆", "˖")
 STAR_DIM = "#5A6C96"
-STAR_LIT = "#C7D6FF"
-STAR_CYAN = "#67E8F9"
+STAR_LIT = "#727C95"
+STAR_CYAN = "#3D7A87"
+
+# aurora m6: the "living sky" palette — colors the starfield/meteor blend between,
+# owned here (the theme) and handed to the pure math in starlight.py. Stars dim
+# toward the #vhead cell bg ($panel); Engram's own ✦ and the meteor share the cyan.
+SKY = starlight.SkyPalette(
+    bg="#1B2340",            # $panel — the header cell bg every star breathes toward
+    dim=STAR_DIM, lit=STAR_LIT, engram=STAR_CYAN,
+    meteor_head="#E8ECF8",   # starlight-white head
+    meteor_tail=STAR_CYAN,   # cyan trail
+)
 
 # --- aurora m1: the live activity indicator ---------------------------------
 # A moving, color-keyed pulse in the chrome showing what Engram is DOING each
@@ -224,11 +234,11 @@ STAR_CYAN = "#67E8F9"
 # the turn loop already consumes. Calm body, alive chrome
 # ([[engram-tui-density-follows-function]]); blanks when idle.
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-_ACT_SHELL = "#FBBF24"   # amber  — running commands (Bash)
-_ACT_READ = "#67E8F9"    # cyan   — looking things up (Read/Grep/Glob/Web*)
-_ACT_WRITE = "#86EFAC"   # green  — changing files (Edit/Write)
-_ACT_DELEG = "#C4B5FD"   # violet — delegating (Agent/Task/Workflow) + thinking
-_ACT_TALK = "#9FB9FF"    # blue   — responding (streaming text)
+_ACT_SHELL = "#BE9436"   # amber  — running commands (Bash)
+_ACT_READ = "#3D7A87"    # cyan   — looking things up (Read/Grep/Glob/Web*)
+_ACT_WRITE = "#5E9B73"   # green  — changing files (Edit/Write)
+_ACT_DELEG = "#7E739C"   # violet — delegating (Agent/Task/Workflow) + thinking
+_ACT_TALK = "#66748F"    # blue   — responding (streaming text)
 _TOOL_COLOR = {
     "Bash": _ACT_SHELL,
     "Read": _ACT_READ, "Grep": _ACT_READ, "Glob": _ACT_READ,
@@ -264,6 +274,68 @@ def render_activity(activity: str, frame: int) -> str:
     return f"[{color}]{spin} {escape(label)}[/]{glint}"
 
 
+# --- aurora m4: context / provenance meter ----------------------------------
+# The quiet chrome gauge answering the one question a self-compact raises: how much
+# of the window is FRESH re-derived context (working-memory + notes, rebuilt every
+# turn) vs accumulated history the backend may have compacted behind our back. The
+# 1M Claude window rarely bites — but this reads the ModelDriver seam, so it ALSO
+# rides Grok, whose window has NO auto-compact net and where it's the only warning
+# before the wall. Same doctrine as temporal grounding: make drift VISIBLE.
+_MET_FLOOR = _ACT_WRITE   # green — re-derived this turn (trustworthy)
+_MET_HIST = "#6B7BA8"     # slate — accumulated history (drift-prone once compacted)
+_MET_FREE = "#2A3350"     # faint — unused window
+_MET_WARN = "#BC5C68"     # rose  — filling window with no auto-compact net (Grok)
+_MET_FULL = "⣿"           # braille full-cell (used window) — echoes the m1 spinner's dots
+_MET_EMPTY = "⣀"          # braille low-rail (free window) — the braille analog of ░
+
+
+def _meter_bar(floor: int, total: int, mx: int, width: int = 16) -> str:
+    """Two-tone window bar sized against the full window ``mx``: a green head for the
+    re-derived floor, dim body for history, faint tail for free space."""
+    if mx <= 0:
+        return ""
+    total = max(0, min(total, mx))
+    floor = max(0, min(floor, total))
+    # The re-derived floor is usually sub-percent of a 1M/256k window, so proportional
+    # rounding erases it — force a 1-cell green sliver whenever a floor exists, so the
+    # provenance split stays VISIBLE (the exact size lives in the "Nk fresh" label).
+    g = int(round(width * floor / mx))
+    g = min(width, max(1, g) if floor > 0 else g)
+    h = min(width - g, int(round(width * (total - floor) / mx)))
+    f = width - g - h
+    return (f"[{_MET_FLOOR}]{_MET_FULL * g}[/][{_MET_HIST}]{_MET_FULL * h}[/]"
+            f"[{_MET_FREE}]{_MET_EMPTY * f}[/]")
+
+
+def render_context_meter(usage: dict, floor_tokens: int, compactions: int) -> str:
+    """Pure Rich-markup for the context/provenance gauge — unit-testable without
+    Textual. Fail-open: no usable usage → ``''`` (the cell stays blank, chrome quiet).
+    ``floor_tokens`` is what Engram re-injects this turn (the green head); ``compactions``
+    is the drift-count badge. A filling window with auto-compact OFF (Grok / a future
+    local model) turns the readout rose — the real warning, since nothing catches the
+    overflow. On Claude's auto-compacting 1M window it simply stays calm."""
+    if not usage:
+        return ""
+    total = int(usage.get("totalTokens") or 0)
+    mx = int(usage.get("rawMaxTokens") or usage.get("maxTokens") or 0)
+    if total <= 0 or mx <= 0:
+        return ""
+    pct = usage.get("percentage")
+    pct = float(pct) if pct is not None else 100.0 * total / mx
+    floor_tokens = max(0, min(int(floor_tokens or 0), total))
+    warn = (not usage.get("isAutoCompactEnabled", False)) and pct >= 75
+    pctcol = _MET_WARN if warn else STAR_DIM
+    out = (f"🧠 {_meter_bar(floor_tokens, total, mx)} "
+           f"[{pctcol}]{pct:.0f}%[/]")
+    if floor_tokens >= 1000:
+        out += f" [{_MET_FLOOR}]· {floor_tokens // 1000}k fresh[/]"
+    if compactions > 0:
+        out += f" [{_MET_WARN}]⎇{compactions}[/]"
+    if warn:
+        out += f" [{_MET_WARN}]⚠ no auto-compact[/]"
+    return out
+
+
 # What opens the home: true facts about the engram — the memory trace the project is
 # named for. One is chosen at random each launch.
 ENGRAM_EPIGRAPHS = (
@@ -293,10 +365,10 @@ ULTRACODE_REMINDER = (
 # cyan glint as the accent — memory as points of light held in the dark.
 ENGRAM_THEME = Theme(
     name="engram",
-    primary="#9FB9FF", secondary="#C4B5FD", accent="#67E8F9",
+    primary="#66748F", secondary="#7E739C", accent="#3D7A87",
     foreground="#E8ECF8", background="#0A0E1A", surface="#121829", panel="#1B2340",
-    success="#86EFAC", warning="#FBBF24", error="#FB7185",
-    dark=True, variables={"input-cursor-background": "#67E8F9"},
+    success="#5E9B73", warning="#BE9436", error="#BC5C68",
+    dark=True, variables={"input-cursor-background": "#3D7A87"},
 )
 
 
@@ -528,6 +600,7 @@ class EngramApp(App):
         self._detail_id: str | None = None          # row id whose output pane is open
         self._tail = None                           # TailReader | None
         self._agent_rows: list = []                 # last agent_panel_rows() result
+        self._agents_sig = None                     # aurora m3: 0.5s panel-refresh change detector
         self._fleet = None                          # Fleet (lazy — created on first /fleet)
         self._perception = None                     # PerceptionBridge (opt-in: ENGRAM_PERCEIVE=1)
         # Interactive tools (plan approval · option questions). The driver calls
@@ -575,7 +648,7 @@ class EngramApp(App):
         self.register_theme(ENGRAM_THEME)
         self.theme = "engram"
         self._render_header()
-        self.set_interval(0.7, self._render_header)   # twinkle
+        self.set_interval(0.09, self._render_header)  # aurora m6: ~11fps breathe + meteor
         self.set_interval(0.12, self._tick_activity)  # aurora m1: activity pulse
         self.set_interval(0.5, self._tick_tail)       # aurora m2: agent output tail
         prompt = self.query_one("#prompt", PromptArea)
@@ -590,7 +663,10 @@ class EngramApp(App):
                                    "— /new for a fresh thread  · · ·[/dim]"))
             self._status("resumed last session  ·  /new for fresh")
         else:
-            self._status("ready")
+            self._status("")
+        # aurora m4: paint the gauge ONCE on startup so a resumed session shows its
+        # fill straight away — without this the meter only appeared after the first turn.
+        self._refresh_context_meter(0)
         if os.environ.get("ENGRAM_PERCEIVE"):
             self._start_perception()
 
@@ -1614,6 +1690,25 @@ class EngramApp(App):
         """Resolve the row to its on-disk transcript and arm the tail. Fail-open:
         an unresolvable row still shows the state-only card."""
         self._close_detail()
+        if row.get("kind") in ("deleg", "info"):
+            # Not an SDK task — nothing on disk to tail. A grok delegation is
+            # one-shot (its answer lands in the conversation, not a transcript);
+            # counter rows are purely informational. Show an honest still card.
+            self._detail_id = row["id"]
+            self._tail = None
+            try:
+                view = self.query_one("#agentview", RichLog)
+                view.clear()
+                view.display = True
+                if row.get("kind") == "deleg":
+                    view.write(f"[b]{escape(row['label'].strip())}[/b]\n[dim]"
+                               "cross-provider delegation · one-shot, no live "
+                               "transcript[/dim]")
+                else:
+                    view.write(f"[dim]{escape(row['label'].strip())}[/dim]")
+            except Exception:  # noqa: BLE001
+                pass
+            return
         path, how = resolve_task_file(
             row, getattr(self.driver, "cwd", ENGRAM_CWD),
             getattr(self.driver, "session_id", None))

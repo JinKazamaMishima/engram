@@ -500,6 +500,12 @@ class ModelDriver:
     # they land, and gates client-recycling commands that would kill them.
     has_background_tasks: bool = False
 
+    # aurora m4: recursive-summary drift counter — 0 on any driver (a store-less or a
+    # future LocalModelDriver until it grows one); AgentSDKDriver bumps it from the
+    # SDK's PreCompact hook. The TUI reads these off ANY driver, no hasattr guard.
+    compaction_count: int = 0
+    last_compaction_ts: Optional[float] = None
+
     async def drain_background(self) -> AsyncIterator[Event]:
         """Yield Events that arrive AFTER a turn has ended (background sub-agent
         completions + the model's follow-up turns). Default: nothing to drain."""
@@ -1018,6 +1024,11 @@ class AgentSDKDriver(ModelDriver):
         exclude it — cooled edge, not full flush). With a LiveBuffer that's the
         buffer path; otherwise the legacy transcript --session pass. A store-less
         (perceiving) driver never curates — camera greetings are not gold."""
+        # aurora m4: count the compaction FIRST, outside the fragile spawn path, so
+        # the TUI can mark the boundary even if curation is disabled/errors. Pure
+        # state writes; they cannot block or veto compaction.
+        self.compaction_count += 1
+        self.last_compaction_ts = time.time()
         try:
             if self._store is None:
                 return {}

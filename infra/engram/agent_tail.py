@@ -90,6 +90,70 @@ def _journal_agent_ids(wf_dir: Path) -> list[str]:
     return ids
 
 
+def workflow_disk_agents(cwd, sid, *, projects_base=None) -> list[dict]:
+    """Reconstruct a workflow's agent tree from its newest run dir ON DISK.
+
+    The journal's ``started``/``result`` rows give order + live state (an agentId
+    with a matching ``result`` row is done, otherwise still running); each
+    agent's first-row ``## <label>`` heading gives its name. This is what lets
+    the panel show a fan-out the instant it spawns — fast workflows finish before
+    the first progress heartbeat carries the phase/agent tree, so the in-memory
+    snapshot is empty exactly when the run is most alive. Fail-open → ``[]``.
+
+    Returns ``[{label, state, model}]`` (model unknown from disk → "")."""
+    dirs = workflow_dirs(cwd, sid, projects_base)
+    if not dirs:
+        return []
+    wf = dirs[0]
+    started: list[str] = []
+    done: set[str] = set()
+    try:
+        for raw in (wf / "journal.jsonl").read_text().splitlines():
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            aid = row.get("agentId")
+            if not aid:
+                continue
+            if row.get("type") == "started":
+                started.append(aid)
+            elif row.get("type") == "result":
+                done.add(aid)
+    except OSError:
+        return []
+    agents: list[dict] = []
+    for aid in started:
+        label = _first_line_label(wf / f"agent-{aid}.jsonl") or f"agent {len(agents)}"
+        agents.append({"label": label,
+                       "state": "done" if aid in done else "progress", "model": ""})
+    return agents
+
+
+def enrich_workflow_agents(tasks, cwd, sid, *, projects_base=None) -> list:
+    """Backfill each LIVE workflow row's agent tree from disk when the in-memory
+    heartbeat snapshot is thinner than what the journal already shows. The
+    heartbeat wins once it's richer (it carries real per-agent model + state);
+    disk fills the gap for fast fan-outs the heartbeat hasn't described yet.
+    Returns a new list; unchanged rows are passed through by reference."""
+    out = []
+    for t in tasks or []:
+        if t.get("workflow") and t.get("status") not in (
+                "completed", "failed", "stopped", "killed"):
+            disk = workflow_disk_agents(cwd, sid, projects_base=projects_base)
+            snap = t.get("wf") or {}
+            live_n = sum(len(p.get("agents") or [])
+                         for p in snap.get("phases") or [])
+            if len(disk) > live_n:
+                phase = snap.get("phase") or "run"
+                t = {**t, "wf": {
+                    "phases": [{"title": phase, "agents": disk}],
+                    "done": sum(1 for a in disk if a["state"] == "done"),
+                    "total": len(disk), "phase": phase}}
+        out.append(t)
+    return out
+
+
 def resolve_task_file(row: dict, cwd, sid: Optional[str], *,
                       tmp_base=None, projects_base=None) -> tuple[Optional[Path], str]:
     """Resolve a panel row to its on-disk live transcript. Returns
@@ -255,41 +319,52 @@ class TailReader:
 
 _STATE_MARK = {"done": "✓", "completed": "✓", "failed": "✗", "stopped": "✗",
                "killed": "✗", "error": "✗"}
+_SNAKE = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"    # braille 'snake' for a running row — the m1 pulse's glyph set
 
 
-def agent_panel_rows(tasks: list) -> list[dict]:
-    """Task-registry snapshot → ordered panel rows. One row per LIVE task,
-    plus an indented child row per workflow agent; finished tasks collapse to
-    one dim counters row (the transcript already carries their ✓/✗ lines).
+def agent_panel_rows(tasks: list, *, deleg: dict | None = None,
+                     frame: int = 0) -> list[dict]:
+    """Task-registry snapshot → ordered panel rows. One row per task: a running row
+    leads with a braille 'snake' (advanced by ``frame``) + an indented child row per
+    workflow agent; a finished row shows a ✓/✗ IN PLACE (no separate finished-counter
+    — the row itself carries the outcome until the turn empties the panel). ``deleg``
+    (a delegations.snapshot()) adds a 📡 row per live cross-provider call and a
+    collapsed counter for finished ones — grok calls are tool calls, not SDK tasks, so
+    this is the only place they surface, and the snapshot carries only a count+cost for
+    finished ones (hence a counter there, not per-call rows).
     Row shape: {id, label, kind, task_id, tool_use_id, desc, workflow,
     wf_label|None, wf_index|None, status}."""
     rows: list[dict] = []
-    n_done = n_dead = 0
+    snake = _SNAKE[frame % len(_SNAKE)]
     for t in tasks or []:
         status = t.get("status")
-        if status == "completed":
-            n_done += 1
-            continue
-        if status in ("failed", "stopped", "killed"):
-            n_dead += 1
-            continue
         task_id = t.get("task_id") or ""
         base = {"task_id": task_id, "tool_use_id": t.get("tool_use_id"),
                 "desc": t.get("desc") or "", "workflow": bool(t.get("workflow")),
                 "status": status or "running"}
-        name = t.get("name", "sub-agent")
-        bits = [f"{'⚙' if t.get('workflow') else '🛰'} {name.removeprefix('⚙ ')} ⏳"]
+        tag = "⚙ " if t.get("workflow") else ""
+        name = str(t.get("name", "sub-agent")).removeprefix("⚙ ")
+        rid = task_id or name
+        if status == "completed":
+            rows.append({**base, "id": rid, "kind": "task", "label": f"✓ {tag}{name}",
+                         "wf_label": None, "wf_index": None})
+            continue
+        if status in ("failed", "stopped", "killed"):
+            rows.append({**base, "id": rid, "kind": "task", "label": f"✗ {tag}{name}",
+                         "wf_label": None, "wf_index": None})
+            continue
+        bits = [f"{snake} {tag}{name}"]
         if t.get("tokens"):
             bits.append(f"{int(t['tokens']) // 1000}k")
         if t.get("last_tool"):
             bits.append(str(t["last_tool"]))
-        rows.append({**base, "id": task_id or name, "kind": "task",
+        rows.append({**base, "id": rid, "kind": "task",
                      "label": "  ".join(bits), "wf_label": None, "wf_index": None})
         wf = t.get("wf") or {}
         idx = 0
         for phase in wf.get("phases") or []:
             for a in phase.get("agents") or []:
-                mark = _STATE_MARK.get(a.get("state"), "⏳")
+                mark = _STATE_MARK.get(a.get("state"), snake)
                 label = a.get("label") or f"agent {idx}"
                 bits = [f"  {mark} {label}"]
                 if a.get("model"):
@@ -298,10 +373,23 @@ def agent_panel_rows(tasks: list) -> list[dict]:
                              "label": "  ".join(bits), "wf_label": label,
                              "wf_index": idx, "status": a.get("state") or "…"})
                 idx += 1
-    if n_done or n_dead:
-        tail = " · ".join(([f"✓ {n_done} done"] if n_done else [])
-                          + ([f"✗ {n_dead} failed"] if n_dead else []))
-        rows.append({"id": "~finished", "kind": "info", "label": f"  {tail}",
+    d = deleg or {}
+    for e in d.get("live") or []:
+        bits = [f"{snake} 📡 {e.get('label') or 'delegation'}"]
+        if e.get("model"):
+            bits.append(str(e["model"]))
+        rows.append({"id": f"deleg/{e.get('id')}", "kind": "deleg",
+                     "label": "  ".join(bits), "task_id": "", "tool_use_id": None,
+                     "desc": e.get("model") or "", "workflow": False,
+                     "wf_label": None, "wf_index": None, "status": "running",
+                     "model": e.get("model") or ""})
+    dd, df = int(d.get("done") or 0), int(d.get("failed") or 0)
+    if dd or df:
+        tail = " · ".join(([f"✓ {dd} done"] if dd else [])
+                          + ([f"✗ {df} failed"] if df else []))
+        if d.get("cost"):
+            tail += f" · ~${float(d['cost']):.2f}"
+        rows.append({"id": "~deleg", "kind": "info", "label": f"  📡 {tail}",
                      "task_id": "", "tool_use_id": None, "desc": "",
                      "workflow": False, "wf_label": None, "wf_index": None,
                      "status": "info"})

@@ -106,21 +106,23 @@ def test_render_tasks_line():
         {"name": "general-purpose", "status": "failed"},
     ])
     assert "☑ 1/3" in line and "▶ writing the fix" in line, line
-    assert "🛰 Explore ⏳ 12k" in line, line
-    # Finished agents never stack up by name — they collapse to counters
-    # (the transcript's inline ✓/✗ lines are the record).
-    assert "Plan" not in line and "general-purpose" not in line, line
-    assert "✓ 1 done" in line and "✗ 1 failed" in line, line
+    # running → braille snake in place of the old 🛰 … ⏳; tokens folded in
+    assert "⠋" in line and "Explore 12k" in line and "🛰" not in line, line
+    # finished agents show a ✓/✗ IN PLACE now (a dynamic cell), not a collapsed counter
+    assert "✓ Plan" in line and "✗ general-purpose" in line, line
+    assert "1 done" not in line and "1 failed" not in line, line
     assert render_tasks_line([], []) == ""
-    print("✓ panel renderer: live agents listed, finished ones collapse to counters")
+    print("✓ panel renderer: running snake, finished ✓/✗ in place, no counter")
 
 
-def test_render_tasks_line_nine_done_collapse():
-    # The reported bug: 9 completed sub-agents stacked above the vision card.
+def test_render_tasks_line_finished_show_in_place():
+    # Reversed from the old collapse-to-counter: finished cells show ✓ in place; the
+    # whole panel empties at the turn boundary, so they never outlive their turn.
     nine = [{"name": f"agent-{i}", "status": "completed"} for i in range(9)]
     line = render_tasks_line([], nine)
-    assert line == "🛰 ✓ 9 done", line
-    print("✓ nine finished agents render as one counter cell, not nine rows")
+    assert line.count("✓") == 9 and "done" not in line, line
+    assert "✓ agent-0" in line and "✓ agent-8" in line, line
+    print("✓ finished agents render as ✓ cells in place, not a collapsed counter")
 
 
 async def test_query_prunes_terminal_tasks():
@@ -209,20 +211,32 @@ def test_render_tasks_line_workflow():
     line = render_tasks_line([], [
         {"name": "⚙ audit-routes", "status": "running", "workflow": True,
          "tokens": 40100, "wf": {"phase": "Scan", "done": 1, "total": 2}}])
-    assert "⚙ audit-routes ⏳ Scan 1/2 40k" in line, line
-    print("✓ panel renderer: workflow row shows phase + agents done/total")
+    assert "⠋" in line and "⚙ audit-routes Scan 1/2 40k" in line, line
+    assert "⏳" not in line, line
+    print("✓ panel renderer: workflow row shows snake + phase + agents done/total")
+
+
+def test_render_tasks_line_delegation():
+    # aurora m3: an in-flight grok call rides the one-liner as an ambient 📡 cell.
+    line = render_tasks_line([], [], {"live": [{"label": "grok·high"}],
+                                      "done": 3, "failed": 0, "cost": 0.5})
+    assert "⠋" in line and "📡 grok·high" in line and "⏳" not in line, line
+    # finished-only delegations stay OFF the one-liner (the panel keeps the tally)
+    assert render_tasks_line([], [], {"live": [], "done": 3, "failed": 0}) == ""
+    print("✓ one-liner shows in-flight delegations (snake); finished stay off it")
 
 
 async def main() -> int:
     await test_todowrite_yields_todos_event()
     await test_task_registry_and_events()
     test_render_tasks_line()
-    test_render_tasks_line_nine_done_collapse()
+    test_render_tasks_line_finished_show_in_place()
     await test_query_prunes_terminal_tasks()
     await test_workflow_task_labeled_backgrounded_and_snapshotted()
     test_workflow_snapshot_shapes()
     test_workflow_tool_label()
     test_render_tasks_line_workflow()
+    test_render_tasks_line_delegation()
     print("\nALL PASS")
     return 0
 
