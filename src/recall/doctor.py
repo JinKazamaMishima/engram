@@ -18,9 +18,11 @@ fail-soft per check; findings print to stdout and (``--notify``) page Telegram.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from recall import config, registry, rules
@@ -57,6 +59,7 @@ MACHINE_LANE = "docs/knowledge/"
 # at least one full cycle failed to pick the edits up.
 INDEX_LAG_HOURS = 26
 STRAY_LIST_MAX = 5       # findings page Telegram — name a few, count the rest
+MISS_LOG_MAX = 5         # flagged archived slugs to name before counting the rest
 
 
 @dataclass(frozen=True)
@@ -192,6 +195,81 @@ def check_rules(corpus_dir: Path, scope: str) -> list[Finding]:
     return out
 
 
+def _archived_slugs() -> dict[str, str]:
+    """slug -> scope for every note currently sitting in an ``archive/`` dir
+    (global soul + each registered project). Best-effort; empty on any trouble."""
+    out: dict[str, str] = {}
+    dirs = [(config.GLOBAL_SCOPE, config.archive_dir(config.global_corpus_dir()))]
+    for proj in registry.list_projects():
+        if proj.exists():
+            dirs.append((config.project_slug(proj),
+                         config.archive_dir(config.project_corpus_dir(proj))))
+    for scope, adir in dirs:
+        try:
+            if adir.is_dir():
+                for p in adir.glob("*.md"):
+                    out.setdefault(p.stem, scope)
+        except OSError:
+            continue
+    return out
+
+
+def check_miss_log(*, days: int) -> list[Finding]:
+    """Close the reaper's loop. The reaper (``recall reap``) archives notes recall
+    judges cold; the miss-log records when the operator reached PAST injection for
+    a note by hand (``Bash cat`` of a corpus path — recall_gate.py logs it). If a
+    recently-missed note is one we've since archived, that's a candidate WRONGFUL
+    eviction — the note was cold to retrieval yet the operator still wanted it —
+    so surface it with the one-liner that undoes it. Fail-soft: any trouble → no
+    findings (the miss-log is disposable telemetry, never a gate)."""
+    archived = _archived_slugs()
+    if not archived:
+        return []
+    log = config.data_root() / "miss-log.jsonl"
+    if not log.exists():
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    hit: dict[str, str] = {}   # slug -> scope
+    try:
+        for line in log.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = str(rec.get("ts", ""))
+            if ts:
+                try:
+                    if datetime.fromisoformat(ts) < cutoff:
+                        continue
+                except ValueError:
+                    pass  # unparseable ts -> keep it (fail-open on relevance)
+            cmd = str(rec.get("cmd", ""))
+            for slug, scope in archived.items():
+                if slug not in hit and slug in cmd:
+                    hit[slug] = scope
+    except OSError:
+        return []
+    by_scope: dict[str, list[str]] = {}
+    for slug in sorted(hit):
+        by_scope.setdefault(hit[slug], []).append(slug)
+    out: list[Finding] = []
+    for scope, sl in by_scope.items():
+        shown = ", ".join(sl[:MISS_LOG_MAX])
+        more = (f", … +{len(sl) - MISS_LOG_MAX} more"
+                if len(sl) > MISS_LOG_MAX else "")
+        undo = "recall reap --restore <slug>" + (
+            "" if scope == config.GLOBAL_SCOPE
+            else f" --scope project --project-dir <{scope} repo>")
+        out.append(Finding(
+            "warn", scope,
+            f"{len(sl)} archived note(s) reached for by hand within {days}d — "
+            f"possible wrongful eviction: {shown}{more} (undo: {undo})"))
+    return out
+
+
 def run_checks(*, days: int = 8, do_notify: bool = False) -> int:
     """All checks over the global soul + every registered project. Exit code:
     0 clean, 1 warns only, 2 any error."""
@@ -201,6 +279,7 @@ def run_checks(*, days: int = 8, do_notify: bool = False) -> int:
     findings += check_index(g_dir, config.index_path(config.GLOBAL_SCOPE),
                             config.GLOBAL_SCOPE)
     findings += check_rules(g_dir, config.GLOBAL_SCOPE)
+    findings += check_miss_log(days=days)
 
     for proj in registry.list_projects():
         slug = config.project_slug(proj)
