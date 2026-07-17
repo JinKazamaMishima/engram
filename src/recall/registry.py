@@ -253,6 +253,58 @@ def reconsolidate_all(argv: list[str] | None = None) -> int:
     return rc
 
 
+_ACQUIRE_EMBEDDER = object()  # sentinel: code_build_all fetches the warm embedder itself
+
+
+def code_build_all(argv: list[str] | None = None, *,
+                   embedder=_ACQUIRE_EMBEDDER) -> int:
+    """Nightly (sonar) code-index rebuild for every registered project: chunk each
+    repo's source and re-embed via the warm daemon, atomic-swapping its per-repo
+    ``code.db``. Embedder-only — no LLM — and nothing to COMMIT: the index is
+    derived data under the recall data root, not in the repo. One project's failure
+    doesn't stop the others; the overall code is non-zero if any failed. There is no
+    global code index (the soul has no source tree), so only registered repos are
+    visited. ``embedder`` is injectable for tests (pass ``None`` for a hermetic
+    keyword-only build); by default the warm daemon is used, in-process only if it
+    is down."""
+    from recall import code_index, config
+    ap = argparse.ArgumentParser(prog="recall code-build-all")
+    ap.add_argument("--project", default=None,
+                    help="rebuild ONE repo instead of the whole registry")
+    a = ap.parse_args(argv)
+
+    projects = ([Path(a.project).expanduser().resolve()] if a.project
+                else list_projects())
+    if not projects:
+        print(f"[code-build-all] no projects registered in {registry_path()} — "
+              f"add one with `recall register`.", file=sys.stderr)
+        return 0
+
+    # One warm embedder, reused across every repo — a fresh in-process model per
+    # project would thrash the contended GPU. Daemon-first, alert if up-but-degraded
+    # (like the other unattended nightly steps); keyword-only if no ML stack at all.
+    if embedder is _ACQUIRE_EMBEDDER:
+        embedder = None
+        try:
+            from recall.index import best_embedder
+            embedder = best_embedder(alert_degraded=True)
+        except ImportError:
+            print("[code-build-all] semantic models unavailable — keyword-only "
+                  "code indices.", file=sys.stderr)
+
+    rc = 0
+    for d in projects:
+        try:
+            db = config.code_index_path(config.project_slug(d))
+            n = code_index.build_code_index(d, db, embedder)
+            print(f"\n=== code-build {d.name}: {n} chunks ({d}) ===", flush=True)
+        except Exception as e:  # noqa: BLE001 — one repo's failure mustn't stop the sweep
+            print(f"[code-build-all] {d.name} FAILED: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            rc = 1
+    return rc
+
+
 def reap_all(argv: list[str] | None = None) -> int:
     """Nightly reaper for the global soul corpus + every registered project:
     archive superseded + cold notes out of the live set (a reversible move to

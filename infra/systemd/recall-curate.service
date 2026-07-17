@@ -17,6 +17,11 @@
 #      day's memories into quarantined hypotheses, imagine one-change counterfactual
 #      "what-ifs" over the day's decisions, mature yesterday's, and bleed corroborated
 #      ones into the soul ([dream]). Writes a morning digest under subconscious/.
+#   4. `recall code-build-all` — (sonar) rebuild the per-repo semantic code index
+#      over every registered project's SOURCE: git ls-files -> ast chunks -> the
+#      warm daemon embedder, atomic-swapping each repo's code.db. Embedder-only
+#      (no LLM) and NOTHING to commit — the index is derived data under the recall
+#      data root. Powers the `code_search` tool; failure never pages (`-` prefix).
 # Earlier lines are prefixed `-` so a per-scope failure (each self-alerts) never
 # skips the next stage. Paired with recall-curate.timer (23:15 local).
 #
@@ -52,4 +57,5 @@ ExecStart=-__ENGRAM_HOME__/.venv/bin/recall curate-sessions-all --commit
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall consolidate-all --commit
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall reap-all --commit
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall dream-all --counterfactual --commit
+ExecStart=-__ENGRAM_HOME__/.venv/bin/recall code-build-all
 ExecStart=__ENGRAM_HOME__/.venv/bin/recall cogito

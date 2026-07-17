@@ -39,6 +39,19 @@ READ_DESC = (
     "Read the full body of one memory note by slug (as returned by recall_search). "
     "Gives the complete prior reasoning — the numbers, mechanics, and the WHY — "
     "not just the one-line description.")
+CODE_SEARCH_DESC = (
+    "Semantic + keyword search over THIS repository's own source code (the sonar "
+    "index) — find code by what it DOES, not just literal tokens. Returns ranked "
+    "'path:Lstart-Lend — signature' locators; follow up by Reading that path over "
+    "that line range. Reach for it to locate where a behavior lives before editing "
+    "or explaining it — it complements grep/glob (which need the exact string) with "
+    "meaning-based recall. An empty result or 'no code index' just means fall back "
+    "to grep.")
+
+# Code chunks are matched by a prose query, so the note index's 0.40 semantic
+# floor (tuned on the note eval) does not transfer; m1 leaves the gate OFF and
+# returns the fused top-k. A code-tuned floor is a later milestone.
+CODE_SEM_FLOOR = float(os.environ.get("RECALL_CODE_SEM_FLOOR", "0.0"))
 
 
 def _text(text: str) -> dict:
@@ -65,10 +78,53 @@ def _fetch_query_vector(prompt: str) -> list | None:
         return None
 
 
+def build_code_tools(cwd: Path | str) -> list:
+    """The ``code_search`` tool bound to ``cwd``'s repo — hybrid recall over the
+    sonar code index (``config.code_index_path``). Separate concern from the note
+    tools: it searches SOURCE, never the memory corpus, and is a pure accelerator
+    (the model still Reads the file it points at). Fail-open like the recall tools;
+    a repo with no code index yet returns a polite 'run code-build', not an error
+    that breaks the turn."""
+    project_dir = Path(cwd)
+
+    def _search_sync(query: str, k: int) -> list | None:
+        from recall import config, index
+        db = config.code_index_path(config.project_slug(project_dir))
+        if not Path(db).exists():
+            return None
+        conn = index._connect(Path(db), read_only=True)
+        try:
+            return index.search(conn, query, query_vector=_fetch_query_vector(query),
+                                k=k, corpus_label="code", sem_floor=CODE_SEM_FLOOR)
+        finally:
+            conn.close()
+
+    @tool("code_search", CODE_SEARCH_DESC, {"query": str, "k": int})
+    async def code_search(args: dict) -> dict:
+        try:
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return _err("code_search: empty query")
+            k = max(1, min(int(args.get("k") or 8), 25))
+            hits = await asyncio.to_thread(_search_sync, query, k)
+            if hits is None:
+                return _err("no code index for this repo yet — run: recall code-build")
+            if not hits:
+                return _text("No matching code found (try grep for an exact token).")
+            lines = [f"[{getattr(h, 'score', 0.0):.2f}] {h.slug} — {h.description}"
+                     for h in hits]
+            return _text("\n".join(lines))
+        except Exception as exc:  # noqa: BLE001 — fail open, model routes around
+            return _err(f"code index unavailable: {type(exc).__name__}: {exc}")
+
+    return [code_search]
+
+
 def build_recall_server(cwd: Path | str):
-    """The in-process MCP server ('recall') with both tools bound to ``cwd``'s
-    project corpus + the shared soul. Returns None if the SDK server can't be
-    built — the caller treats memory tools as optional."""
+    """The in-process MCP server ('recall') with the memory tools + the sonar
+    ``code_search`` tool, all bound to ``cwd``'s project corpus + the shared soul.
+    Returns None if the SDK server can't be built — the caller treats memory tools
+    as optional."""
     project_dir = Path(cwd)
 
     def _scopes() -> list:
@@ -134,6 +190,7 @@ def build_recall_server(cwd: Path | str):
 
     try:
         return create_sdk_mcp_server(name="recall", version="1.0.0",
-                                     tools=[recall_search, recall_read_note])
+                                     tools=[recall_search, recall_read_note,
+                                            *build_code_tools(project_dir)])
     except Exception:  # noqa: BLE001 — memory tools are strictly optional
         return None
