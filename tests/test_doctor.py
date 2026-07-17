@@ -2,11 +2,13 @@
 throwaway git repos (no model, no daemon, no Telegram)."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 
-from recall import doctor
+from recall import config, doctor
 from recall.doctor import STUB_MEMORY_MD
 
 
@@ -199,3 +201,64 @@ def test_run_checks_flags_gone_project(tmp_path, monkeypatch, capsys):
     rc = doctor.run_checks()
     assert rc == 2
     assert "registered path is gone" in capsys.readouterr().out
+
+
+# ---- miss-log / reaper guardrail -------------------------------------------
+
+def _miss_setup(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECALL_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.delenv("RECALL_GLOBAL_DIR", raising=False)
+
+
+def _archive_note(slug):
+    adir = config.archive_dir(config.global_corpus_dir())
+    adir.mkdir(parents=True, exist_ok=True)
+    (adir / f"{slug}.md").write_text(f"---\nname: {slug}\ndescription: d\n---\nb\n")
+
+
+def _write_miss_log(rows):
+    log = config.data_root() / "miss-log.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def _ts(days_ago):
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+
+
+def test_miss_log_flags_reached_archived_note(tmp_path, monkeypatch):
+    _miss_setup(tmp_path, monkeypatch)
+    _archive_note("cold-note")
+    _write_miss_log([{"ts": _ts(1), "cwd": "/x",
+                      "cmd": "cat ~/.local/share/recall/global/archive/cold-note.md"}])
+    findings = doctor.check_miss_log(days=8)
+    assert len(findings) == 1 and findings[0].level == "warn"
+    msg = findings[0].message
+    assert "cold-note" in msg and "wrongful eviction" in msg
+    assert "reap --restore" in msg
+
+
+def test_miss_log_ignores_old_entries(tmp_path, monkeypatch):
+    _miss_setup(tmp_path, monkeypatch)
+    _archive_note("cold-note")
+    _write_miss_log([{"ts": _ts(30), "cwd": "/x", "cmd": "cat cold-note.md"}])
+    assert doctor.check_miss_log(days=8) == []
+
+
+def test_miss_log_ignores_unrelated_cmd(tmp_path, monkeypatch):
+    _miss_setup(tmp_path, monkeypatch)
+    _archive_note("cold-note")
+    _write_miss_log([{"ts": _ts(1), "cwd": "/x", "cmd": "cat some-other-file.md"}])
+    assert doctor.check_miss_log(days=8) == []
+
+
+def test_miss_log_no_archive_is_silent(tmp_path, monkeypatch):
+    _miss_setup(tmp_path, monkeypatch)
+    _write_miss_log([{"ts": _ts(1), "cwd": "/x", "cmd": "cat whatever.md"}])
+    assert doctor.check_miss_log(days=8) == []      # nothing archived to match
+
+
+def test_miss_log_absent_log_is_silent(tmp_path, monkeypatch):
+    _miss_setup(tmp_path, monkeypatch)
+    _archive_note("cold-note")
+    assert doctor.check_miss_log(days=8) == []      # archive exists, no log yet

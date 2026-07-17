@@ -7,7 +7,13 @@
 #   2. `recall consolidate-all --commit` — fold the day's recall *activations*
 #      (the hippocampal log the recall hook appends to) into note stability:
 #      reinforce what was used, GPU-free, and scoped-commit ([consolidate]).
-#   3. `recall dream-all --counterfactual --commit` — the dream pass: recombine the
+#   3. `recall reap-all --commit` — (ebb) the reaper: archive superseded + cold
+#      notes OUT of the live corpus into <corpus>/archive (a reversible MOVE, so
+#      the index shrinks but nothing is deleted; rules/permanent/identity anchors
+#      are exempt). Deterministic + GPU-free; scoped-commit ([curator] reap). Runs
+#      after consolidate so a note used today keeps its fresh last_used and is
+#      never mistaken for cold.
+#   4. `recall dream-all --counterfactual --commit` — the dream pass: recombine the
 #      day's memories into quarantined hypotheses, imagine one-change counterfactual
 #      "what-ifs" over the day's decisions, mature yesterday's, and bleed corroborated
 #      ones into the soul ([dream]). Writes a morning digest under subconscious/.
@@ -41,5 +47,6 @@ EnvironmentFile=-%h/.config/recall/telegram.env
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall doctor --notify
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall curate-sessions-all --commit
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall consolidate-all --commit
+ExecStart=-__ENGRAM_HOME__/.venv/bin/recall reap-all --commit
 ExecStart=-__ENGRAM_HOME__/.venv/bin/recall dream-all --counterfactual --commit
 ExecStart=__ENGRAM_HOME__/.venv/bin/recall cogito
