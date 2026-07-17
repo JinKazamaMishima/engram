@@ -30,7 +30,6 @@ import asyncio
 import os
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
-
 from xai_common import load_key, post_json, usd_from_ticks
 
 DEFAULT_MODEL = "grok-4.3"        # PINNED (the operator, 2026-07-08): 1M context, cheap, and
