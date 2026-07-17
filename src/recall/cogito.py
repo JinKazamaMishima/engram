@@ -158,6 +158,29 @@ _FIRST_RE = re.compile(
     r"(?:\b(?:i|me|my|mine|myself|soy)\b|\bi'(?:m|ll|ve|d)\b)", re.I)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 
+# m3 prefilter guards (2026-07-15, from the first clean calibration-100 gold
+# set): two stage-0 false positives the frozen gold exposed --
+#   - a self-name inside a ``[[slug]]`` corpus link or an ``inline-code`` span
+#     names a note / binary / systemd unit, not the assistant (the gold's
+#     out-of-window tail matched "nova" inside `nova-two-tier-...` and
+#     `nova-bridge@...`); the name regex was matching inside note-slug links.
+#   - a bare capital "I" opening an outline item ("- **I — Anatomy...**", the
+#     Roman numeral for part I) is not the first-person pronoun (report row 42).
+# Both are neutralized before routing. Span-blanking preserves length so
+# downstream offsets/boundaries hold; the enumerator strip is start-anchored and
+# removes only the opening "I", so a real first-person marker later in the same
+# sentence (or a sentence-final pronoun "…you and I.") still counts.
+_NONCOUNTING_SPAN_RE = re.compile(r"\[\[.*?\]\]|`[^`]*`")
+_ENUM_I_RE = re.compile(r"^[\s\-*_>#0-9.)]*I(?=\s*[.):]|\s+[—–-]\s)")
+
+
+def _countable(sentence: str) -> str:
+    """The sentence with spans that never carry prose self-reference blanked to
+    spaces: ``[[slug]]`` corpus links and ``inline code`` (identifiers,
+    filenames, service units). Length-preserving so offsets are unaffected."""
+    return _NONCOUNTING_SPAN_RE.sub(lambda m: " " * len(m.group(0)), sentence)
+
+
 # The frozen judge contract — ONLY the hard referential question. The judge
 # never sees FIRST cases (regex owns those) and never scores its own author.
 _JUDGE_SYS = "Answer with exactly one word: SPEAKER or OTHER."
@@ -191,7 +214,7 @@ def matched_name(sentence: str) -> str | None:
     """The self-name text that flagged this sentence as a name-route candidate,
     recorded on the row so contamination is auditable at a glance (no re-deriving
     the match after the fact). None if nothing matched."""
-    m = _name_re().search(sentence)
+    m = _name_re().search(_countable(sentence))
     return m.group(0) if m else None
 
 
@@ -212,9 +235,10 @@ def prefilter(sentence: str) -> str | None:
     """Route a sentence: ``first`` (lexical first person — decided), ``name``
     (self-name mention, needs the judge), or None (no self-reference candidate
     at all — not logged; the denominator is candidates, not all prose)."""
-    if _FIRST_RE.search(sentence):
+    text = _countable(sentence)
+    if _FIRST_RE.search(_ENUM_I_RE.sub(" ", text)):
         return "first"
-    if _name_re().search(sentence):
+    if _name_re().search(text):
         return "name"
     return None
 

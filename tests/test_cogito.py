@@ -70,6 +70,31 @@ def test_prefilter_routes(monkeypatch):
     assert cogito.prefilter("Terminal-Bench scores dropped.") is None
 
 
+def test_prefilter_skips_slug_and_code_spans(monkeypatch):
+    """m3: a self-name inside a ``[[slug]]`` link or ``inline code`` names a note
+    or systemd unit, not the assistant -- it must not reach the judge (the FP the
+    first clean gold set exposed in its out-of-window tail)."""
+    monkeypatch.setattr(cogito, "SELF_NAMES", ("Nova", "the system"))
+    assert cogito.prefilter("Realizes the owned-body tier of `nova-two-tier-own-body`.") is None
+    assert cogito.prefilter("Adding it means a `nova-bridge.service` instance.") is None
+    assert cogito.prefilter("Sourced from [[nova-two-tier-own-body-rent-ceiling]] mainly.") is None
+    assert cogito.matched_name("Grounded in `nova-bridge` config.") is None
+    # a genuine prose mention outside any span still routes to the judge
+    assert cogito.prefilter("Emphatically not Nova's brain yet.") == "name"
+
+
+def test_prefilter_ignores_outline_enumerator_i(monkeypatch):
+    """m3: a bare capital 'I' opening an outline item is the Roman numeral for
+    part I, not the pronoun (report row 42) -- so it is not first person, while a
+    real pronoun (sentence-final or later in the line) is untouched."""
+    monkeypatch.setattr(cogito, "SELF_NAMES", ("Nova",))
+    assert cogito.prefilter("- **I — Anatomy, layer by layer:** residual stream, MoE.") is None
+    assert cogito.prefilter("I. Overview of the training loop.") is None
+    assert cogito.prefilter("That call is up to you and I.") == "first"
+    assert cogito.prefilter("I'll commit it after the tests pass.") == "first"
+    assert cogito.prefilter("- **I — Anatomy**, which I wrote last night.") == "first"
+
+
 def test_classify_regex_owns_first_judge_owns_referent(monkeypatch):
     monkeypatch.setattr(cogito, "SELF_NAMES", ("Nova",))
     judge = _FakeJudge({"palate": "SPEAKER", "star": "OTHER"})
