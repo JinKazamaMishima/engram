@@ -60,6 +60,12 @@ MACHINE_LANE = "docs/knowledge/"
 INDEX_LAG_HOURS = 26
 STRAY_LIST_MAX = 5       # findings page Telegram — name a few, count the rest
 MISS_LOG_MAX = 5         # flagged archived slugs to name before counting the rest
+# Reaches self-tagged with these intents (recall_gate.py's RECALL_REACH token) are
+# deliberate corpus meta-work — auditing an eviction, curating — not injection
+# failing to surface a note. They never signal wrongful eviction. Everything else
+# (default "miss", any unknown tag) still counts, so an untagged reach is never
+# silently dropped.
+MISS_LOG_IGNORE_KINDS = frozenset({"investigate"})
 
 
 @dataclass(frozen=True)
@@ -220,8 +226,10 @@ def check_miss_log(*, days: int) -> list[Finding]:
     a note by hand (``Bash cat`` of a corpus path — recall_gate.py logs it). If a
     recently-missed note is one we've since archived, that's a candidate WRONGFUL
     eviction — the note was cold to retrieval yet the operator still wanted it —
-    so surface it with the one-liner that undoes it. Fail-soft: any trouble → no
-    findings (the miss-log is disposable telemetry, never a gate)."""
+    so surface it with the one-liner that undoes it. Reaches self-tagged
+    ``investigate`` (deliberate corpus meta-work — auditing an eviction, curating)
+    are skipped; only genuine misses count. Fail-soft: any trouble → no findings
+    (the miss-log is disposable telemetry, never a gate)."""
     archived = _archived_slugs()
     if not archived:
         return []
@@ -239,6 +247,8 @@ def check_miss_log(*, days: int) -> list[Finding]:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if str(rec.get("kind", "miss")) in MISS_LOG_IGNORE_KINDS:
+                continue  # deliberate corpus meta-reach, not a retrieval miss
             ts = str(rec.get("ts", ""))
             if ts:
                 try:

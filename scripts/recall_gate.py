@@ -14,7 +14,10 @@ AMBIENT corpus browsing while leaving deliberate retrieval doors open:
   LOG    Bash commands touching a corpus path — allowed on purpose as the ONE
          deliberate override, and appended to the miss-log: every use means the
          per-turn injection failed to surface something needed. The miss-log is
-         the measurement this whole design exists to produce.
+         the measurement this whole design exists to produce. A reach may
+         self-tag intent with `RECALL_REACH=<kind>` in the command — `investigate`
+         marks deliberate corpus meta-work (an eviction audit, curation) so the
+         wrongful-eviction detector skips it; unmarked reaches count as misses.
   EXEMPT the memory-skill headless runs (curate/dream/reconsolidate export a
          distinctive env contract; hook subprocesses inherit it) — the curator
          must read the corpus it maintains.
@@ -48,9 +51,29 @@ EXEMPT_ENV_PREFIXES = ("RECALL_CURATE_", "RECALL_DREAM_", "RECALL_RECON")
 
 GATED_TOOLS = {"Read", "Grep", "Glob"}
 
+# A reach self-declares intent with a `RECALL_REACH=<kind>` token in the command:
+# `investigate` = deliberate corpus meta-work (an eviction audit, curation), which
+# the wrongful-eviction detector ignores. Unmarked reaches default to "miss" — a
+# forgotten tag over-reports a gap, it never hides one.
+REACH_MARKER = "RECALL_REACH="
+
 
 def _protected(target: str) -> bool:
     return bool(target) and any(seg in target for seg in PROTECTED)
+
+
+def _reach_kind(cmd: str) -> str:
+    """The `RECALL_REACH=<kind>` intent token's value (letters only), else "miss"."""
+    i = cmd.find(REACH_MARKER)
+    if i == -1:
+        return "miss"
+    token = ""
+    for ch in cmd[i + len(REACH_MARKER):]:
+        if ch.isalpha():
+            token += ch
+        else:
+            break
+    return token or "miss"
 
 
 def _targets(tool_input: dict) -> list[str]:
@@ -80,7 +103,9 @@ def main() -> int:
                     "facts must arrive via per-turn recall injection. If it "
                     "missed something, use the recall MCP tools "
                     "(recall_search / recall_read_note) — or `Bash cat` the "
-                    "file, which is allowed and LOGGED as a retrieval miss."),
+                    "file, which is allowed and LOGGED as a retrieval miss "
+                    "(prefix `RECALL_REACH=investigate` when auditing the corpus "
+                    "itself, not missing a note)."),
             }}))
             return 0
 
@@ -93,6 +118,7 @@ def main() -> int:
                         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                         "cwd": hook.get("cwd", ""),
                         "cmd": cmd[:500],
+                        "kind": _reach_kind(cmd),
                     }) + "\n")
         return 0
     except Exception:  # noqa: BLE001 — fail-open, never block real work
