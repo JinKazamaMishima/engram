@@ -262,3 +262,24 @@ def test_miss_log_absent_log_is_silent(tmp_path, monkeypatch):
     _miss_setup(tmp_path, monkeypatch)
     _archive_note("cold-note")
     assert doctor.check_miss_log(days=8) == []      # archive exists, no log yet
+
+
+def test_miss_log_skips_investigate_tagged_reach(tmp_path, monkeypatch):
+    # A deliberate corpus meta-reach (eviction audit) tags itself; it must NOT
+    # read as a wrongful eviction even though it names an archived slug.
+    _miss_setup(tmp_path, monkeypatch)
+    _archive_note("cold-note")
+    _write_miss_log([{"ts": _ts(1), "cwd": "/x", "kind": "investigate",
+                      "cmd": "RECALL_REACH=investigate cat "
+                             "~/.local/share/recall/global/archive/cold-note.md"}])
+    assert doctor.check_miss_log(days=8) == []
+
+
+def test_miss_log_unknown_kind_still_counts(tmp_path, monkeypatch):
+    # Only "investigate" is suppressed; a default/unknown tag stays a candidate
+    # miss so a mistagged reach over-reports rather than vanishing.
+    _miss_setup(tmp_path, monkeypatch)
+    _archive_note("cold-note")
+    _write_miss_log([{"ts": _ts(1), "cwd": "/x", "kind": "typo",
+                      "cmd": "cat cold-note.md"}])
+    assert len(doctor.check_miss_log(days=8)) == 1
