@@ -355,3 +355,259 @@ def test_btw_bare_shows_usage(monkeypatch, tmp_path):
     asyncio.run(bridge.handle_message(_msg("/btw")))
     assert bridge._pending == []
     assert any("usage: /btw" in s for s in sent)
+
+
+# ---- ripple m1 — live draft streaming --------------------------------------
+# The streamer is cosmetic BY CONTRACT: drafts may fail (old server, flood, bad
+# client) but finalized text must always be cut from the streamed buffer and
+# prefix-checked against the authoritative reply — degrade, never corrupt.
+
+def _http_429(retry_after):
+    import io
+    import urllib.error
+    body = (b"{}" if retry_after is None else
+            f'{{"ok":false,"parameters":{{"retry_after":{retry_after}}}}}'.encode())
+    return urllib.error.HTTPError("u", 429, "Too Many Requests", None, io.BytesIO(body))
+
+
+@requires_sdk
+def test_retry_after_parsed_floored_and_capped():
+    assert bridge._retry_after_secs(_http_429(2.5)) == 2.5
+    assert bridge._retry_after_secs(_http_429(None)) == 1.0   # missing -> never 0
+    assert bridge._retry_after_secs(_http_429(0)) == 1.0      # zero would amplify
+    assert bridge._retry_after_secs(_http_429(300)) == 30.0   # bounded
+
+
+@requires_sdk
+def test_telegram_post_honors_429_then_succeeds(monkeypatch):
+    calls, sleeps = [], []
+
+    class _Ok:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if len(calls) == 1:
+            raise _http_429(3)
+        return _Ok()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    out = bridge._telegram_post("sendMessage", {"chat_id": 1, "text": "x"})
+    assert out == {"ok": True} and len(calls) == 2
+    assert sleeps == [3.0]                                    # server's window, honored
+
+
+@requires_sdk
+def test_telegram_post_retries_zero_fails_fast(monkeypatch):
+    import urllib.error
+    sleeps = []
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda req, timeout=None: (_ for _ in ()).throw(_http_429(5)))
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    with pytest.raises(urllib.error.HTTPError):
+        bridge._telegram_post("sendMessageDraft", {"chat_id": 1}, 10, 0)
+    assert sleeps == []                    # a cosmetic draft never waits out a flood
+
+
+@requires_sdk
+def test_stream_cut_paragraph_seams_never_inside_fences():
+    p1 = "intro paragraph"
+    fenced = "```\ncode top\n\ncode bottom\n```"
+    text = f"{p1}\n\n{fenced}\n\ntail still growing"
+    cut = bridge._stream_cut(text)
+    # Largest safe seam = after the fence CLOSES; never at the blank line inside
+    # the fence, never at the end (the tail paragraph is still being generated).
+    assert cut == len(p1) + 2 + len(fenced)
+    assert bridge._stream_cut(f"{p1}\n\n```\nopen fence\n\nstill code") == len(p1)
+    assert bridge._stream_cut("one growing paragraph, no seam") == 0
+    assert bridge._stream_cut("a\n\nb") == 1
+
+
+@requires_sdk
+def test_draft_tail_passthrough_and_line_trim():
+    assert bridge._draft_tail("short text") == "short text"
+    long = "\n".join(f"line {i}" for i in range(1000))
+    tail = bridge._draft_tail(long, budget=100)
+    assert tail.startswith("… ") and bridge._u16_len(tail) <= 102
+    assert tail.endswith("line 999")       # newest lines win
+    monster = "y" * 500
+    t = bridge._draft_tail(monster, budget=100)
+    assert t.startswith("… ") and bridge._u16_len(t) <= 100 and t.endswith("y")
+
+
+def _streamer_env(monkeypatch, sends, drafts, typing=None):
+    """Patch the streamer's world: recording send(), a _telegram_post that records
+    sendMessageDraft calls (raising if drafts is None), recording send_typing."""
+    async def fake_send(text, chat_id=None):
+        sends.append(text)
+
+    async def fake_typing():
+        (typing if typing is not None else []).append(1)
+
+    def fake_post(method, params, timeout=15.0, retries=2):
+        if drafts is None:
+            raise RuntimeError("draft transport down")
+        assert method == "sendMessageDraft" and retries == 0
+        drafts.append(dict(params))
+        return {"ok": True}
+
+    monkeypatch.setattr(bridge, "send", fake_send)
+    monkeypatch.setattr(bridge, "send_typing", fake_typing)
+    monkeypatch.setattr(bridge, "_telegram_post", fake_post)
+
+
+@requires_sdk
+def test_streamer_ticks_post_throttled_drafts_with_cursor(monkeypatch):
+    sends, drafts = [], []
+    _streamer_env(monkeypatch, sends, drafts)
+
+    async def scenario():
+        s = bridge._TurnStreamer(42)
+        await s._post_draft("")                     # start(): Thinking… placeholder
+        s.feed("hello ")
+        await s._tick()
+        s.feed("world")
+        await s._tick()
+        await s._tick()                             # unchanged text -> no repost
+        s._last_post = -999                         # keepalive window elapsed
+        await s._tick()                             # -> repost same text (30s expiry)
+        return s
+
+    s = asyncio.run(scenario())
+    assert [d["text"] for d in drafts] == ["", "hello  ▌", "hello world ▌", "hello world ▌"]
+    assert all(d["draft_id"] == s.draft_id for d in drafts)   # one animated bubble
+    assert sends == [] and s.draft_ok
+
+
+@requires_sdk
+def test_streamer_finalizes_chunk_then_streams_remainder(monkeypatch):
+    sends, drafts = [], []
+    _streamer_env(monkeypatch, sends, drafts)
+    monkeypatch.setattr(bridge, "STREAM_FINALIZE_U16", 40)
+    para1 = "first paragraph " + "x" * 40
+    para2 = "second paragraph, still short"
+
+    async def scenario():
+        s = bridge._TurnStreamer(42)
+        first_id = s.draft_id
+        s.feed(para1 + "\n\n" + para2)
+        await s._tick()                             # over threshold -> finalize para1
+        assert sends == [para1] and s.chunks_sent == 1
+        assert s.draft_id != first_id               # continuation = fresh bubble
+        await s._tick()                             # remainder rides the new draft
+        assert drafts[-1]["text"] == para2 + " ▌"
+        assert drafts[-1]["draft_id"] == s.draft_id
+        remainder = await s.finish(para1 + "\n\n" + para2)
+        return remainder
+
+    remainder = asyncio.run(scenario())
+    assert remainder == para2                       # exactly the un-finalized tail
+    assert sends == [para1]                         # nothing duplicated, nothing lost
+
+
+@requires_sdk
+def test_streamer_draft_failure_degrades_to_typing_keepalive(monkeypatch):
+    sends, typing = [], []
+    _streamer_env(monkeypatch, sends, drafts=None, typing=typing)
+    monkeypatch.setattr(bridge, "STREAM_FINALIZE_U16", 40)
+
+    async def scenario():
+        s = bridge._TurnStreamer(42)
+        await s._post_draft("")                     # transport down -> degrade
+        assert not s.draft_ok
+        s.feed("small update")
+        s._last_post = -999
+        await s._tick()                             # degraded tick -> typing ping
+        assert typing == [1]
+        s.feed(" and now enough text to cross the finalize threshold\n\nnext para")
+        await s._tick()                             # finalize still works draft-less
+        return s
+
+    s = asyncio.run(scenario())
+    assert s.chunks_sent == 1 and len(sends) == 1   # delivery survives dead drafts
+
+
+@requires_sdk
+def test_streamer_finish_divergence_sends_full_reply(monkeypatch):
+    sends, drafts = [], []
+    _streamer_env(monkeypatch, sends, drafts)
+
+    async def scenario():
+        s = bridge._TurnStreamer(42)
+        s.buf = "streamed prefix\n\nmore text"
+        s.finalized = len("streamed prefix") + 2    # as if a chunk was finalized
+        return await s.finish("a completely different final reply")
+
+    assert asyncio.run(scenario()) == "a completely different final reply"
+
+
+@requires_sdk
+def test_streamer_finish_without_finalize_returns_reply_verbatim():
+    async def scenario():
+        s = bridge._TurnStreamer(42)
+        s.feed("draft-only text, never finalized")
+        return await s.finish("the authoritative reply")
+
+    assert asyncio.run(scenario()) == "the authoritative reply"
+
+
+@requires_sdk
+def test_stream_event_text_extracts_only_top_level_text_deltas():
+    from types import SimpleNamespace
+
+    def ev(dtype=None, parent=None, text="hi", etype="content_block_delta"):
+        e = {"type": etype}
+        if dtype:
+            e["delta"] = {"type": dtype, "text" if dtype == "text_delta" else "thinking": text}
+        return SimpleNamespace(parent_tool_use_id=parent, event=e)
+
+    assert bridge._stream_event_text(ev("text_delta")) == "hi"
+    assert bridge._stream_event_text(ev("thinking_delta")) == ""   # never hits the chat
+    assert bridge._stream_event_text(ev("text_delta", parent="tool-1")) == ""  # subagent
+    assert bridge._stream_event_text(ev(etype="message_start")) == ""
+
+
+@requires_sdk
+def test_build_options_toggles_partial_messages(monkeypatch):
+    monkeypatch.setattr(bridge, "STREAM_ENABLED", True)
+    assert bridge._build_options(None).include_partial_messages is True
+    monkeypatch.setattr(bridge, "STREAM_ENABLED", False)
+    assert bridge._build_options(None).include_partial_messages is False
+
+
+@requires_sdk
+def test_process_turn_delivers_chunks_live_then_remainder(monkeypatch):
+    """End-to-end wiring: run_turn feeds the streamer mid-flight, a chunk lands
+    BEFORE the turn returns, the remainder lands after, nothing duplicates."""
+    sends, drafts = [], []
+    _streamer_env(monkeypatch, sends, drafts)
+    monkeypatch.setattr(bridge, "STREAM_ENABLED", True)
+    monkeypatch.setattr(bridge, "STREAM_FINALIZE_U16", 40)
+    monkeypatch.setattr(bridge, "DRAFT_TICK_SECS", 0.01)
+    monkeypatch.setattr(bridge, "CHAT_ID_RAW", "42")
+    monkeypatch.setattr(bridge, "audit", lambda *a: None)
+    monkeypatch.setattr(bridge, "_buffer", _BufStub())
+    para1 = "streamed early " + "z" * 40
+    para2 = "and the closing thought"
+    mid_flight = []
+
+    async def fake_run_turn(text, streamer=None):
+        streamer.feed(para1 + "\n\n")
+        await asyncio.sleep(0.2)                    # ~20 ticks: plenty to finalize
+        mid_flight.append(list(sends))              # what the user saw mid-turn
+        streamer.feed(para2)
+        return (para1 + "\n\n" + para2).strip()
+
+    monkeypatch.setattr(bridge, "run_turn", fake_run_turn)
+    asyncio.run(bridge._process_turn("hola"))
+    assert mid_flight == [[para1]]                  # chunk 1 arrived DURING the turn
+    assert sends == [para1, para2]                  # remainder after, no dupes
+    assert drafts and drafts[0]["text"] == ""       # the Thinking… placeholder led

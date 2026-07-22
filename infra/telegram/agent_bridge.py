@@ -21,6 +21,7 @@ Config (env, normally from ~/.config/recall/telegram-agent.env via systemd):
   RECALL_TELEGRAM_AGENT_TOKEN    — bot token from @BotFather (required)
   RECALL_TELEGRAM_AGENT_CHAT_ID  — numeric operator chat id (required, the allowlist)
   RECALL_TELEGRAM_API            — override API base (default https://api.telegram.org)
+  RECALL_TELEGRAM_STREAM         — ripple: stream replies live via Telegram drafts (default 1)
   RECALL_REPO                    — repo to cwd into (default: the repo root)
   RECALL_DATA_ROOT               — recall data root; state under $.../telegram-agent/
   CLAUDE_BIN                     — claude CLI path (default: found on PATH)
@@ -37,12 +38,14 @@ the live client's stdin and folds into the reply being written (idle: a normal m
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import shutil
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -70,6 +73,7 @@ from claude_agent_sdk import (  # noqa: E402  (after the env strip on purpose)
     ClaudeSDKClient,
     HookMatcher,
     ResultMessage,
+    StreamEvent,
     SystemMessage,
     TextBlock,
 )
@@ -141,6 +145,17 @@ MAX_MSG_LEN = 4096
 AUDIT_SNIPPET_LEN = 240
 TURN_TIMEOUT = 1200        # hard cap on a single model turn (20 min)
 COALESCE_WINDOW = 1.0      # debounce: batch a burst of msgs into ONE turn
+
+# ripple m1 — live draft streaming (Bot API 9.5 sendMessageDraft). The reply is
+# streamed into a native draft bubble and finalized into real messages a
+# paragraph-chunk at a time; RECALL_TELEGRAM_STREAM=0 restores send-at-turn-end.
+STREAM_ENABLED = os.environ.get("RECALL_TELEGRAM_STREAM", "1").strip().lower() \
+    not in ("0", "off", "false", "")
+DRAFT_TICK_SECS = 0.75       # draft update cadence (~1-2/s is the flood-safe zone)
+DRAFT_KEEPALIVE_SECS = 15.0  # re-post before Telegram's ~30s draft expiry
+DRAFT_BUDGET = 3900          # u16 cap for the draft bubble (tail-trimmed, < 4096)
+STREAM_FINALIZE_U16 = 3400   # finalize a real message once pending crosses this
+TYPING_REFRESH_SECS = 4.0    # sendChatAction TTL ~5s — cadence when drafts are dead
 
 PERSONA = (
     "You are Engram, a persistent-memory assistant, reachable here over Telegram. "
@@ -222,13 +237,38 @@ _queued_ack_sent = False    # one ack per busy period — never spam a multi-par
 # Telegram HTTP (stdlib only; called via asyncio.to_thread from the loop)
 # ---------------------------------------------------------------------------
 
-def _telegram_post(method: str, params: dict, timeout: float = 15.0) -> dict:
+def _retry_after_secs(exc: urllib.error.HTTPError) -> float:
+    """parameters.retry_after from a 429 body; missing/garbled => 1s (never 0 —
+    a zero sleep amplifies the flood instead of draining it). Bounded at 30s."""
+    try:
+        body = json.loads(exc.read())
+        val = float((body.get("parameters") or {}).get("retry_after", 1.0))
+    except Exception:  # noqa: BLE001
+        val = 1.0
+    return min(max(val, 1.0), 30.0)
+
+
+def _telegram_post(method: str, params: dict, timeout: float = 15.0,
+                   retries: int = 2) -> dict:
+    """POST one Bot API call. Honors 429 flood control: sleeps the server's
+    retry_after and retries up to `retries` times — the sync sleep is fine, every
+    caller runs this via asyncio.to_thread. retries=0 => fail fast (draft updates
+    are cosmetic and must never stall a turn behind a flood window)."""
     url = f"{API_BASE}/bot{TOKEN}/{method}"
     data = urllib.parse.urlencode(params).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt >= retries:
+                raise
+            wait = _retry_after_secs(exc)
+            log.warning("telegram 429 on %s — honoring retry_after=%.1fs", method, wait)
+            time.sleep(wait)
+    raise RuntimeError("unreachable")  # loop always returns or raises
 
 
 # Reuse recall's markdown->Telegram-HTML renderer so replies get bold/headers/
@@ -366,6 +406,186 @@ async def send_typing() -> None:
         )
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------------------
+# ripple m1 — live draft streaming (Bot API 9.5 sendMessageDraft)
+# ---------------------------------------------------------------------------
+# While a turn is being written its text streams into a native Telegram draft
+# bubble (animated in place by the client; empty text = a "Thinking…"
+# placeholder) and is finalized into REAL messages a paragraph-chunk at a time,
+# so the answer arrives as it is generated instead of at turn end. Drafts are
+# cosmetic BY CONTRACT: any draft failure silently degrades to the pre-ripple
+# behavior (typing indicator + finalized sends only) and can never fail a turn.
+# Finalized chunks are always cut from the streamed text itself, and the turn's
+# authoritative reply is prefix-checked against them in finish() — a dropped or
+# degraded draft can therefore never corrupt or lose reply text.
+
+_draft_seq = 0   # non-zero, process-local; drafts expire in ~30s so restart reuse is harmless
+
+
+def _next_draft_id() -> int:
+    global _draft_seq
+    _draft_seq += 1
+    return _draft_seq
+
+
+def _draft_tail(text: str, budget: int = DRAFT_BUDGET) -> str:
+    """Last lines of `text` that fit the draft budget (u16 units), '…'-prefixed
+    when trimmed — the bubble shows the newest text while older paragraphs are
+    already on their way into finalized messages."""
+    if _u16_len(text) <= budget:
+        return text
+    out: list[str] = []
+    used = 2  # the "… " prefix
+    for line in reversed(text.split("\n")):
+        need = _u16_len(line) + 1
+        if used + need > budget:
+            break
+        out.append(line)
+        used += need
+    if not out:   # one monster line — take the trailing budget's worth of it
+        acc = ""
+        for ch in reversed(text):
+            if _u16_len(acc) + _u16_len(ch) > budget - 2:
+                break
+            acc = ch + acc
+        return "… " + acc
+    return "… " + "\n".join(reversed(out))
+
+
+def _stream_cut(pending: str, budget: int = MAX_MSG_LEN - PREFIX_RESERVE) -> int:
+    """Largest index to cut a finalizable chunk at: a blank-line boundary that is
+    OUTSIDE any ``` fence, fits `budget`, and is not the still-growing last
+    paragraph. 0 = no safe cut yet. Paragraph seams keep each finalized message a
+    self-contained markdown fragment for the HTML renderer."""
+    best = 0
+    fences = 0
+    pos = 0
+    for para in pending.split("\n\n"):
+        end = pos + len(para)
+        fences += sum(1 for ln in para.split("\n") if ln.lstrip().startswith("```"))
+        if 0 < end < len(pending) and fences % 2 == 0 \
+                and _u16_len(pending[:end]) <= budget:
+            best = end
+        pos = end + 2
+    return best
+
+
+def _stream_event_text(msg) -> str:
+    """The text delta carried by a StreamEvent; '' for everything else (thinking
+    deltas, block starts, message lifecycle, subagent streams)."""
+    if getattr(msg, "parent_tool_use_id", None):
+        return ""   # subagent text never reaches the final reply — keep buf aligned
+    ev = getattr(msg, "event", None) or {}
+    if ev.get("type") != "content_block_delta":
+        return ""
+    delta = ev.get("delta") or {}
+    if delta.get("type") != "text_delta":
+        return ""
+    return delta.get("text") or ""
+
+
+class _TurnStreamer:
+    """One turn's live delivery: model deltas → draft-bubble ticks + early-
+    finalized real messages. Every Telegram failure degrades; none propagate."""
+
+    def __init__(self, chat_id: int):
+        self.chat_id = chat_id
+        self.buf = ""            # exact streamed text so far (delta concat)
+        self.finalized = 0       # prefix of buf already sent as real messages
+        self.chunks_sent = 0
+        self.draft_ok = True
+        self.draft_id = _next_draft_id()
+        self._last_draft_text: Optional[str] = None
+        self._last_post = 0.0
+        self._task: Optional[asyncio.Task] = None
+
+    def feed(self, text: str) -> None:
+        if text:
+            self.buf += text
+
+    def reset(self) -> None:
+        """Forget streamed text (fresh-session retry path): new bubble, nothing
+        finalized. chunks_sent survives — those messages are already in the chat."""
+        self.buf = ""
+        self.finalized = 0
+        self.draft_id = _next_draft_id()
+        self._last_draft_text = None
+
+    async def start(self) -> None:
+        await self._post_draft("")        # native "Thinking…" placeholder
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+    async def finish(self, reply: str) -> Optional[str]:
+        """Stop ticking and return what still needs a real send: the un-finalized
+        remainder normally; the FULL reply if the stream diverged from the final
+        text (a duplicate beats a hole in the answer); None if nothing is left."""
+        await self.stop()
+        if self.finalized == 0:
+            return reply or None
+        sent = self.buf[: self.finalized].lstrip()   # reply arrives stripped
+        if reply.startswith(sent):
+            return reply[len(sent):].strip() or None
+        log.warning("ripple: stream diverged from the final reply after %d finalized "
+                    "chars — sending the full reply", self.finalized)
+        return reply or None
+
+    async def _run(self) -> None:
+        while True:
+            await asyncio.sleep(DRAFT_TICK_SECS)
+            try:
+                await self._tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — cosmetic path: never kill a turn
+                log.warning("ripple tick error (continuing): %s", exc)
+
+    async def _tick(self) -> None:
+        pending = self.buf[self.finalized:]
+        cut = _stream_cut(pending) if _u16_len(pending) >= STREAM_FINALIZE_U16 else 0
+        if cut:
+            chunk = pending[:cut].strip()
+            if chunk:
+                await send(chunk, self.chat_id)   # real message: md→HTML + fallback
+                self.chunks_sent += 1
+            self.finalized += cut
+            while self.finalized < len(self.buf) and self.buf[self.finalized] == "\n":
+                self.finalized += 1               # eat the seam: no blank-led bubble
+            self.draft_id = _next_draft_id()      # the continuation gets a fresh bubble
+            self._last_draft_text = None
+            return                                 # one send per tick — flood-polite
+        now = time.monotonic()
+        if self.draft_ok:
+            tail = _draft_tail(pending)
+            text = (tail + " ▌") if tail else ""
+            if text != self._last_draft_text \
+                    or (now - self._last_post) >= DRAFT_KEEPALIVE_SECS:
+                await self._post_draft(text)
+        elif (now - self._last_post) >= TYPING_REFRESH_SECS:
+            self._last_post = now
+            await send_typing()                   # degraded mode: keep typing alive
+
+    async def _post_draft(self, text: str) -> None:
+        try:
+            await asyncio.to_thread(
+                _telegram_post, "sendMessageDraft",
+                {"chat_id": self.chat_id, "draft_id": self.draft_id, "text": text},
+                10, 0)
+        except Exception as exc:  # noqa: BLE001 — drafts are cosmetic by contract
+            if self.draft_ok:
+                log.warning("sendMessageDraft failed (draft off this turn): %s", exc)
+            self.draft_ok = False
+        else:
+            self._last_draft_text = text
+            self._last_post = time.monotonic()
 
 
 def audit(direction: str, text: str) -> None:
@@ -533,6 +753,8 @@ def _build_options(resume_id: Optional[str]) -> ClaudeAgentOptions:
         opts["effort"] = AGENT_EFFORT
     if _current_model:
         opts["model"] = _current_model
+    if STREAM_ENABLED:
+        opts["include_partial_messages"] = True   # ripple: token deltas for the draft
     if ALLOWED_TOOLS:
         opts["allowed_tools"] = ALLOWED_TOOLS
     if DISALLOWED_TOOLS:
@@ -573,7 +795,7 @@ async def _disconnect_client() -> None:
         _client = None
 
 
-async def _query_once(text: str) -> str:
+async def _query_once(text: str, streamer: Optional[_TurnStreamer] = None) -> str:
     assert _client is not None
     parts: list[str] = []
     sid: Optional[str] = None
@@ -583,6 +805,9 @@ async def _query_once(text: str) -> str:
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     parts.append(block.text)
+        elif isinstance(msg, StreamEvent):
+            if streamer is not None:            # ripple: live deltas → draft bubble
+                streamer.feed(_stream_event_text(msg))
         elif isinstance(msg, SystemMessage):
             data = getattr(msg, "data", {}) or {}
             sid = sid or data.get("session_id")
@@ -593,19 +818,21 @@ async def _query_once(text: str) -> str:
     return "".join(parts).strip()
 
 
-async def run_turn(text: str) -> str:
+async def run_turn(text: str, streamer: Optional[_TurnStreamer] = None) -> str:
     """Run a turn, with a one-shot fresh fallback if a resume went stale."""
     resuming = _client is None and _session_id is not None
     await _ensure_client()
     try:
-        return await _query_once(text)
+        return await _query_once(text, streamer)
     except Exception as exc:  # noqa: BLE001
         if resuming:
             log.warning("resume turn failed (%s); retrying as a fresh session", exc)
             await _disconnect_client()
             _save_session(None)
             await _ensure_client()
-            out = await _query_once(text)
+            if streamer is not None:
+                streamer.reset()   # the dead attempt may have streamed a few deltas
+            out = await _query_once(text, streamer)
             return ("(couldn't resume the previous thread — started a fresh one)\n\n" + out)
         raise
 
@@ -706,8 +933,15 @@ async def _process_turn(text: str) -> None:
     global _last_activity
     _last_activity = time.monotonic()
     await send_typing()
+    # ripple: stream this turn into a draft bubble + early-finalized messages.
+    # On error/cancel/timeout paths the streamer is only STOPPED — chunks already
+    # finalized stay in the chat, the un-finalized draft tail just expires (the
+    # error text says the turn aborted; an aborted tail is not an answer).
+    streamer = _TurnStreamer(int(CHAT_ID_RAW)) if STREAM_ENABLED else None
+    if streamer is not None:
+        await streamer.start()
     try:
-        reply = await asyncio.wait_for(run_turn(text), timeout=TURN_TIMEOUT)
+        reply = await asyncio.wait_for(run_turn(text, streamer), timeout=TURN_TIMEOUT)
     except asyncio.CancelledError:
         await send("✋ cancelled")
         raise
@@ -720,10 +954,16 @@ async def _process_turn(text: str) -> None:
         await send(f"⚠️ error: {type(exc).__name__}: {exc}" + (f"\n\n{tail}" if tail else ""))
         return
     finally:
+        if streamer is not None:
+            await streamer.stop()   # the tick task never outlives the turn
         _last_activity = time.monotonic()
     audit("OUT", reply)
     _buffer.append("assistant", reply)
-    await send(reply or "(no text in reply)")
+    remainder = reply if streamer is None else await streamer.finish(reply)
+    if remainder:
+        await send(remainder)
+    elif not (streamer is not None and streamer.chunks_sent):
+        await send("(no text in reply)")
 
 
 async def _ingest_attachments(msg: dict) -> list[str]:
@@ -796,6 +1036,7 @@ async def handle_message(update: dict) -> None:
         await send(
             f"recall chat ok | locked={LOCK_FILE.exists()} | busy={_busy()} | "
             f"model={_current_model} | "
+            f"stream={'on' if STREAM_ENABLED else 'off'} | "
             f"session={'yes' if (_session_id or _client) else 'none'} | "
             f"{BOT_LABEL} | cwd={AGENT_CWD}"
         )
